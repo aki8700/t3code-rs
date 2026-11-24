@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/core",
+  "crates/store",
+  "crates/git",
+  "crates/providers",
+  "crates/mcp",
+  "crates/server",
+  "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws", "multipart", "macros"] }
+base64 = "0.22"
+blake3 = "1.8"
+bytes = "1.10"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+futures-util = "0.3"
+http = "1.3"
+jsonwebtoken = "9.3"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rust-embed = { version = "8.7", features = ["mime-guess"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.44", features = ["full"] }
+tokio-stream = "0.1"
+toml = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"
+uuid = { version = "1.16", features = ["v4", "serde"] }
+zstd = "0.13"
+
+t3-core = { path = "crates/core" }
+t3-store = { path = "crates/store" }
+t3-git = { path = "crates/git" }
+t3-providers = { path = "crates/providers" }
+t3-mcp = { path = "crates/mcp" }
+t3-server = { path = "crates/server" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3

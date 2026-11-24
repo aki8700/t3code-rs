@@ -1,0 +1,37 @@
+[package]
+name = "t3-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+getrandom = "0.4"
+http.workspace = true
+jsonwebtoken.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+rust-embed = { workspace = true, features = ["debug-embed"] }
+serde.workspace = true
+serde_json.workspace = true
+subtle = "2.6"
+t3-core.workspace = true
+t3-git.workspace = true
+t3-mcp.workspace = true
+t3-providers.workspace = true
+t3-store.workspace = true
+tokio.workspace = true
+tokio-stream = { workspace = true, features = ["sync"] }
+tower-http = { workspace = true, features = ["set-header"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true, features = ["util"] }
