@@ -54,6 +54,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/stats/db", get(db_stats))
         .route("/api/usage", get(crate::usage::get))
         .route("/api/usage/limits", get(crate::limits::get))
+        .route(
+            "/api/usage/limits/reset-credit",
+            post(crate::limits::consume_reset_credit),
+        )
         .route("/ws", get(ws::upgrade))
         .route_layer(middleware::from_fn_with_state(
             state.auth.clone(),

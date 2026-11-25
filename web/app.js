@@ -68,6 +68,10 @@ const ICONS = {
   alert: '<path d="M12 4l9.500 16h-19zM12 10v4M12 17v.01"/>',
   swarm: '<circle cx="12" cy="5.500" r="2.500"/><circle cx="5.500" cy="17.500" r="2.500"/><circle cx="18.500" cy="17.500" r="2.500"/><path d="M10.800 7.700l-4.100 7.600M13.200 7.700l4.100 7.600M8 17.500h8"/>',
   open: '<path d="M14 4h6v6M20 4l-9 9M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/>',
+  ticket: '<path d="M3 9a3 3 0 0 1 0 6v3a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1v-3a3 3 0 0 1 0-6V6a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1zM14 5v2.500M14 10.750v2.500M14 16.500V19"/>',
+  trendUp: '<path d="M16 7h6v6M22 7l-8.500 8.500-5-5L2 17"/>',
+  trendDown: '<path d="M16 17h6v-6M22 17l-8.500-8.500-5 5L2 7"/>',
+  gauge: '<path d="M12 14l4-4M3.340 19a10 10 0 1 1 17.320 0"/>',
 };
 const svg = (n) => `<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n] || ''}</svg>`;
 const iconEl = (n, cls = '') => { const s = h('span', { class: `iw ${cls}` }); s.innerHTML = svg(n); return s; };
@@ -276,7 +280,7 @@ const S = {
   ignoreWs: ls.get('t3.ws', '1') !== '0',
   dbStats: null,
   usage: { days: 7, metric: 'cost', tab: 'model', hidden: new Set(), cache: new Map(), errors: new Map(), pending: new Map(), seq: new Map(), refreshing: new Set(), onchange: null },
-  limits: { data: null, error: '', pending: null, refreshing: false, seq: 0, fetchedAt: 0, onchange: null },
+  limits: { data: null, error: '', pending: null, refreshing: false, redeeming: false, seq: 0, fetchedAt: 0, onchange: null },
   subscribed: new Set(),
   ws: null, wsOk: false,
   token: ls.get('t3.token', ''),
@@ -384,7 +388,7 @@ function openModal(title, build, { cls = '', onclose, head } = {}) {
   const close = () => { try { dlg.close(); } catch { dlg.remove(); } };
   const body = h('div', { class: 'modal-body' });
   dlg.append(head ? head(close) : h('div', { class: 'modal-head' }, h('h2', { text: title }), ibtn('close', '閉じる', close)), body);
-  dlg.addEventListener('close', () => { dlg.remove(); onclose?.(); });
+  dlg.addEventListener('close', () => { if (popover && dlg.contains(popover.el)) closePopover(); dlg.remove(); onclose?.(); });
   dlg.addEventListener('mousedown', (e) => { if (e.target === dlg) close(); });
   document.body.append(dlg);
   dlg.showModal();
@@ -401,21 +405,27 @@ function closePopover() {
   el.remove();
   anchor.setAttribute('aria-expanded', 'false');
 }
-/** Opens a floating panel above the anchor (bottom sheet on phones). Toggles when the same anchor is clicked again. */
+/**
+ * Opens a floating panel above the anchor (`below`: true = under it, 'auto' = whichever side has room; bottom sheet on phones).
+ * Toggles when the same anchor is clicked again.
+ */
 function openPopover(anchor, content, { cls = '', align = 'end', below = false } = {}) {
   const again = popover?.anchor === anchor;
   closePopover();
   if (again) return null;
   const el = h('div', { class: `popover ${cls}`, role: 'dialog' }, content);
-  document.body.append(el);
+  // a modal <dialog> sits in the top layer: anything mounted outside it is hidden behind it and inert
+  (anchor.closest('dialog') || document.body).append(el);
   const place = () => {
     if (matchMedia('(max-width: 640px)').matches) { el.classList.add('sheet'); el.style.cssText = ''; return; }
     el.classList.remove('sheet');
+    el.style.cssText = '';
     const r = anchor.getBoundingClientRect();
     const w = el.offsetWidth;
-    const left = align === 'end' ? r.right - w : r.left;
+    const left = align === 'end' ? r.right - w : align === 'center' ? r.left + (r.width - w) / 2 : r.left;
     el.style.left = `${Math.max(8, Math.min(left, innerWidth - w - 8))}px`;
-    if (below) {
+    const under = below === 'auto' ? el.offsetHeight <= innerHeight - r.bottom - 16 || innerHeight - r.bottom >= r.top : below;
+    if (under) {
       el.style.top = `${r.bottom + 6}px`;
       el.style.maxHeight = `${Math.max(160, Math.min(460, innerHeight - r.bottom - 16))}px`;
     } else {
@@ -2476,6 +2486,7 @@ const LIMIT_LOW = 15; // remaining %: amber in the Limits view
 const LIMIT_CRITICAL = 10; // remaining %: warned above the composer
 
 const uText = (v, max) => (typeof v === 'string' ? clip(v.trim(), max) : '');
+const uTime = (v) => (typeof v === 'string' && Date.parse(v)) || 0;
 const uPercent = (v) => {
   const n = typeof v === 'number' || (typeof v === 'string' && v.trim()) ? Number(v) : NaN;
   return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : null;
@@ -2490,10 +2501,15 @@ function uWindow(w) {
   const mins = Number(w.window_duration_mins);
   return {
     id: uText(w.id, 60), kind, used, remaining,
-    label: uText(w.label, 40) || (kind === 'session' ? 'セッション' : kind === 'weekly' ? '週間' : '上限'),
+    label: uText(w.label, 60) || (kind === 'session' ? 'セッション' : kind === 'weekly' ? '週間' : '上限'),
     durationMins: Number.isFinite(mins) && mins > 0 ? mins : 0,
-    resetsAt: (typeof w.resets_at === 'string' && Date.parse(w.resets_at)) || 0,
+    resetsAt: uTime(w.resets_at),
   };
+}
+/** Banked reset credits; null unless at least one can be spent. */
+function uCredits(c) {
+  const count = Math.floor(uNum(c?.available_count));
+  return count > 0 ? { count, nextExpiresAt: uTime(c.next_expires_at) } : null;
 }
 /** Makes the /api/usage/limits payload safe to render. */
 function normalizeLimits(raw) {
@@ -2501,10 +2517,11 @@ function normalizeLimits(raw) {
   const objects = (a) => (Array.isArray(a) ? a.filter((x) => x && typeof x === 'object') : []);
   const providers = objects(raw.providers).map((p) => ({
     ...uProvider(uId(p.provider), uText(p.label, 40)),
-    plan: uText(p.plan, 24), status: uText(p.status, 24), source: uText(p.source, 40), message: uText(p.message, 400),
+    rawProvider: uText(p.provider, 40), credits: uCredits(p.reset_credits),
+    plan: uText(p.plan, 60), status: uText(p.status, 24), source: uText(p.source, 40), message: uText(p.message, 400),
     windows: objects(p.windows).map(uWindow).filter(Boolean),
   }));
-  return { providers, checkedAt: (typeof raw.checked_at === 'string' && Date.parse(raw.checked_at)) || 0 };
+  return { providers, checkedAt: uTime(raw.checked_at) };
 }
 
 function loadUsageLimits({ refresh = false } = {}) {
@@ -2533,18 +2550,28 @@ function renderLimitSurfaces() { renderUsagePill(); syncLimitAlert(); S.limits.o
 const limitIsReset = (w, now) => w.resetsAt > 0 && w.resetsAt <= now;
 const limitIsOut = (w, now) => w.remaining <= 0 && !limitIsReset(w, now);
 const fmtLeft = (v) => (v > 0 && v < 1 ? '<1%' : `${Math.round(v)}%`);
+/** "6日2時間" / "2時間2分" / "45分"; `gap` spaces out the form without days ("1 時間 54 分"). */
+function fmtDurationJa(ms, gap = '') {
+  const mins = Math.floor(ms / 60000);
+  if (mins < 1) return '1分未満';
+  const d = Math.floor(mins / 1440); const hours = Math.floor((mins % 1440) / 60); const m = mins % 60;
+  if (d) return `${d}日${hours ? `${hours}時間` : ''}`;
+  return [...(hours ? [hours, '時間'] : []), ...(m ? [m, '分'] : [])].join(gap);
+}
 function fmtResetIn(resetsAt, now) {
   if (!resetsAt) return '';
   const ms = resetsAt - now;
   if (ms <= 0) return 'リセット済';
-  if (ms < 60000) return 'まもなくリセット';
-  const mins = Math.floor(ms / 60000);
-  const d = Math.floor(mins / 1440); const hours = Math.floor((mins % 1440) / 60); const m = mins % 60;
-  if (d) return `あと ${d}日${hours ? `${hours}時間` : ''}`;
-  if (hours) return `あと ${hours}時間${m ? `${m}分` : ''}`;
-  return `あと ${m}分`;
+  return ms < 60000 ? 'まもなくリセット' : `あと ${fmtDurationJa(ms)}`;
 }
-const fmtResetAt = (ts) => { const t = new Date(ts); return `${String(t.getMonth() + 1).padStart(2, '0')}/${String(t.getDate()).padStart(2, '0')} ${hhmm(t)}`; };
+/** "今日 17:04" / "明日 23:22" / "12/01 17:28" on the viewer's calendar. */
+function fmtResetAt(ts, now) {
+  const t = new Date(ts);
+  const day = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const ahead = Math.round((day(t) - day(new Date(now))) / 86400000);
+  const date = ahead === 0 ? '今日' : ahead === 1 ? '明日' : `${String(t.getMonth() + 1).padStart(2, '0')}/${String(t.getDate()).padStart(2, '0')}`;
+  return `${date} ${hhmm(t)}`;
+}
 
 /** The sidebar tooltip line (tightest live window per provider) and whether anything is used up. */
 function limitsSummary(now) {
@@ -2572,7 +2599,9 @@ function syncLimitAlert() {
   let text = '';
   if (w) {
     // a limit observed at run time has no quota name, only the fact that it was hit
-    const what = w.id === 'runtime' ? w.label : `${w.kind === 'session' ? 'セッション' : w.label}上限${out ? '到達' : 'が残りわずか'}`;
+    const pooled = p.windows.filter((x) => x.kind === w.kind).length > 1; // e.g. one 5-hour window per model pool
+    const name = pooled ? `${w.label} ` : w.kind === 'session' ? 'セッション' : w.label;
+    const what = w.id === 'runtime' ? w.label : `${name}上限${out ? '到達' : 'が残りわずか'}`;
     const left = fmtResetIn(w.resetsAt, now);
     const when = left.startsWith('あと') ? `${left}でリセット` : left;
     text = `${p.label} ${what}（残り ${fmtLeft(w.remaining)}${when ? ` · ${when}` : ''}）`;
@@ -2587,66 +2616,176 @@ function syncLimitAlert() {
   if (focused) $('button', box)?.focus();
 }
 
-const limitSource = (s) => {
-  const v = s.toLowerCase();
-  if (/log|rollout|jsonl|session-file/.test(v)) return 'ローカルログ';
-  if (/runtime|observed|detect/.test(v)) return '実行時検知';
-  return /cli|app-server/.test(v) ? 'CLI' : '';
+const LIMIT_SOURCES = {
+  'claude-cli': 'CLI', 'codex-app-server': 'CLI', 'codex-session-log': 'ローカルログ', 'antigravity-api': 'Antigravity API', runtime: '実行時検知',
 };
+const limitSource = (s) => (Object.hasOwn(LIMIT_SOURCES, s) ? LIMIT_SOURCES[s] : '');
 
-/** One quota window: label and remaining share, the pace-tick bar, and pace plus countdown. */
-function limitRow(p, w, now) {
-  const reset = limitIsReset(w, now);
+/** What one window says right now. Pace and refill only exist while its reset is still ahead. */
+function limitState(w, now) {
+  const expired = limitIsReset(w, now);
+  const upcoming = w.resetsAt > now;
   const length = w.durationMins * 60000;
-  const elapsed = !reset && length && w.resetsAt ? Math.min(1, Math.max(0, (length - (w.resetsAt - now)) / length)) : null;
-  const timeLeft = elapsed == null ? null : Math.round((1 - elapsed) * 100);
-  const countdown = fmtResetIn(w.resetsAt, now);
-  const detail = [
-    `残り ${fmtLeft(w.remaining)}`,
-    timeLeft == null ? null : `期間の残り ${timeLeft}%（縦線は均等消費の目安）`,
-    !w.resetsAt ? 'リセット時刻不明' : reset ? `リセット ${fmtResetAt(w.resetsAt)}（リセット済）` : `リセット ${fmtResetAt(w.resetsAt)} (${countdown})`,
-  ].filter(Boolean).join(' · ');
-
-  const fill = uTint(h('i'), p.color);
-  fill.style.width = w.remaining > 0 ? `max(2px, ${w.remaining}%)` : '0';
-  const bar = h('div', { class: `u-limit-bar${timeLeft == null ? '' : ' paced'}`, role: 'img', tabindex: '0', 'aria-label': `${p.label} ${w.label}: ${detail}`, dataset: { win: `${p.id}:${w.id || w.label}` } },
-    h('div', { class: 'u-limit-track' }, fill),
-    timeLeft == null ? null : h('span', { class: 'u-limit-tick' }),
-    h('span', { class: 'u-limit-tip', 'aria-hidden': 'true', text: detail }));
-  if (timeLeft != null) bar.style.setProperty('--tick', `clamp(3px, ${timeLeft}%, calc(100% - 3px))`);
-
+  const elapsed = upcoming && length ? Math.min(1, Math.max(0, (length - (w.resetsAt - now)) / length)) : null;
   let pace = null;
   if (elapsed != null) {
     const ahead = w.used - elapsed * 100;
-    const [mark, cls, title] = ahead > 5 ? ['↑', 'ahead', 'ペース超過: 時間経過より速く消費中']
-      : ahead < -5 ? ['↓', 'under', '余裕あり: 時間経過より緩やかに消費中'] : ['·', 'even', '適正ペース'];
-    pace = h('span', { class: `u-limit-pace ${cls}`, role: 'img', title, 'aria-label': title, text: mark });
+    pace = ahead > 5 ? { cls: 'ahead', icon: 'trendUp', title: 'ペース超過: 時間経過より速く消費中' }
+      : ahead < -5 ? { cls: 'under', icon: 'trendDown', title: '余裕あり: 時間経過より緩やかに消費中' }
+        : { cls: 'even', icon: 'gauge', title: '適正ペース' };
   }
-  const level = reset ? '' : w.remaining <= 0 ? ' out' : w.remaining <= LIMIT_LOW ? ' low' : '';
-  return h('div', { class: 'u-limit-row' },
-    h('div', { class: 'u-limit-label' }, h('span', { text: w.label }), h('b', { class: `u-limit-left${level}`, text: `残り ${fmtLeft(w.remaining)}` })),
-    bar,
-    h('div', { class: 'u-limit-side' }, pace, h('span', { class: 'u-limit-reset', text: countdown || 'リセット時刻不明' })));
+  return {
+    expired, upcoming, pace,
+    timeLeft: elapsed == null ? null : Math.round((1 - elapsed) * 100),
+    refill: upcoming && w.remaining < 100 ? 100 - w.remaining : 0,
+    level: expired ? '' : w.remaining <= 0 ? ' out' : w.remaining <= LIMIT_LOW ? ' low' : '',
+  };
 }
 
-function limitCard(p, now) {
+/** The thick bar: remaining fill, hatched refill region, even-pace tick, and the countdown / reset-credit pill. */
+function limitBar(p, w, st, now) {
+  const { upcoming, expired, timeLeft } = st;
+  const fill = h('span', { class: 'u-lwin-fill' });
+  fill.style.width = w.remaining > 0 ? `max(2px, ${w.remaining}%)` : '0';
+  let used = null;
+  if (st.refill) { used = h('span', { class: 'u-lwin-used' }); used.style.width = `${st.refill}%`; }
+  const pill = upcoming || p.credits ? h('span', { class: 'u-lwin-pill', 'aria-hidden': 'true' },
+    upcoming ? [iconEl('refresh'), h('span', { class: 'u-lwin-in', text: fmtDurationJa(w.resetsAt - now, ' ') })] : null,
+    upcoming && p.credits ? h('span', { text: '·' }) : null,
+    p.credits ? [iconEl('ticket'), h('span', { class: 'u-lwin-credits', text: String(p.credits.count) })] : null) : null;
+  const label = [
+    `${p.label} ${w.label}: 残り ${fmtLeft(w.remaining)}`,
+    timeLeft == null ? null : `均等なペースなら残り ${timeLeft}%`,
+    upcoming ? `${fmtDurationJa(w.resetsAt - now)}後にリセット` : expired ? 'リセット済' : 'リセット時刻不明',
+    p.credits ? `リセットクレジット ${p.credits.count} 件` : null,
+    '詳細を表示',
+  ].filter(Boolean).join(' · ');
+  const bar = h('button', {
+    type: 'button', class: `u-lwin-bar${timeLeft == null ? '' : ' paced'}`, 'aria-label': label, 'aria-haspopup': 'dialog', 'aria-expanded': 'false',
+    dataset: { win: `${p.id}:${w.id || w.label}` }, onclick: (e) => openLimitPopover(e.currentTarget, p, w),
+  },
+  h('span', { class: 'u-lwin-track', 'aria-hidden': 'true' }, h('span', { class: 'u-lwin-layers' }, fill, used)),
+  timeLeft == null ? null : h('span', { class: 'u-lwin-tick', 'aria-hidden': 'true' }),
+  pill);
+  if (timeLeft != null) bar.style.setProperty('--tick', `clamp(3px, ${timeLeft}%, calc(100% - 3px))`);
+  return bar;
+}
+
+/** One quota window as its own card: label and big remaining share on the left, the bar on the right. */
+function limitCard(p, w, now) {
+  const st = limitState(w, now);
+  let note = null;
+  if (st.pace) {
+    note = iconEl(st.pace.icon, `u-lwin-pace ${st.pace.cls}`);
+    for (const [k, v] of Object.entries({ role: 'img', title: st.pace.title, 'aria-label': st.pace.title })) note.setAttribute(k, v);
+  } else if (st.expired) note = h('span', { class: 'u-lwin-note', text: 'リセット済' });
+  return h('div', { class: 'u-lwin-card', dataset: { window: w.id || w.label } },
+    h('div', { class: 'u-lwin-meta' },
+      h('span', { class: 'u-lwin-label', text: w.label }),
+      h('div', { class: 'u-lwin-stat' }, h('b', { class: `u-lwin-pct${st.level}`, text: fmtLeft(w.remaining) }), h('span', { class: 'u-lwin-unit', text: '残り' }), note)),
+    limitBar(p, w, st, now));
+}
+
+/** A provider section: header, then one card per window. */
+function limitPool(p, now) {
   const source = limitSource(p.source);
-  return h('article', { class: 'u-limit-card', dataset: { provider: p.id } },
-    h('header', { class: 'u-limit-head' }, uDot(p.color), h('h3', { text: p.label }),
+  const pool = h('section', { class: 'u-lpool', 'aria-label': `${p.label} の上限`, dataset: { provider: p.id } },
+    h('header', { class: 'u-lpool-head' }, uDot(p.color), h('h3', { text: p.label }),
       p.plan ? h('span', { class: 'u-limit-plan', text: p.plan }) : null,
       source ? h('span', { class: 'u-limit-source', title: `取得元: ${p.source}`, text: source }) : null,
       p.windows.some((w) => limitIsOut(w, now)) ? h('span', { class: 'u-limit-status', text: '上限到達' }) : null),
-    p.windows.map((w) => limitRow(p, w, now)),
+    p.windows.map((w) => limitCard(p, w, now)),
     p.message ? h('p', { class: 'u-limit-msg', text: p.message }) : null);
+  pool.style.setProperty('--pc', p.color);
+  return pool;
+}
+
+/** Detail panel of one window (UsageLimitsPooled popover), with the reset-credit action when the provider holds any. */
+function limitDetail(p, w, now) {
+  const st = limitState(w, now);
+  const rows = (list) => h('dl', { class: 'u-lpop-rows' }, list.filter(Boolean).flatMap(([k, v]) => [h('dt', { text: k }), h('dd', { text: v })]));
+  const reset = !w.resetsAt ? null : st.upcoming
+    ? `${fmtResetAt(w.resetsAt, now)} · ${fmtDurationJa(w.resetsAt - now)}後` : `${fmtResetAt(w.resetsAt, now)}（リセット済）`;
+  const c = p.credits;
+  return [
+    h('header', { class: 'u-lpop-head' }, uDot(p.color), h('div', {}, h('b', { text: p.label }), h('small', { text: w.label }))),
+    p.plan ? rows([['プラン', p.plan]]) : null,
+    rows([
+      ['残り', fmtLeft(w.remaining)],
+      reset && ['リセット', reset],
+      st.timeLeft != null && ['均等なペース', `現時点で残り ${st.timeLeft}%`],
+      st.refill && ['回復量', `プールの +${Math.round(st.refill)}%`],
+    ]),
+    c ? h('footer', { class: 'u-lpop-foot' },
+      h('span', { text: `${c.count} 件を保有${c.nextExpiresAt > now ? ` · ${fmtDurationJa(c.nextExpiresAt - now)}後に期限切れ` : ''}` }),
+      h('button', {
+        type: 'button', class: 'btn sm', disabled: S.limits.redeeming, text: S.limits.redeeming ? '適用中…' : 'リセットを使用',
+        onclick: () => {
+          const anchor = popover?.anchor;
+          closePopover();
+          anchor?.focus(); // the confirm dialog hands focus back here when it closes
+          confirmResetCredit(p);
+        },
+      })) : null,
+  ].filter(Boolean);
+}
+
+function openLimitPopover(anchor, p, w, { focus = true } = {}) {
+  const el = openPopover(anchor, limitDetail(p, w, Date.now()), { cls: 'u-lpop', align: 'center', below: 'auto' });
+  if (!el) return;
+  el.setAttribute('aria-label', `${p.label} ${w.label} の詳細`);
+  el.tabIndex = -1;
+  if (focus) el.focus({ preventScroll: true });
+}
+
+function confirmResetCredit(p) {
+  openModal('リセットクレジットを使用しますか？', (body, close) => {
+    const cancel = h('button', { type: 'button', class: 'btn', text: 'キャンセル', onclick: close });
+    const ok = h('button', {
+      type: 'button', class: 'btn primary', text: 'リセットを使用',
+      onclick: () => {
+        if (S.limits.redeeming) return;
+        ok.disabled = true; cancel.disabled = true; ok.textContent = '適用中…';
+        redeemResetCredit(p, close);
+      },
+    });
+    body.append(h('div', { class: 'form' },
+      h('p', { text: `${p.label} のリセットクレジットを 1 件消費して、使用上限をリセットします。（保有: ${p.credits.count} 件）` }),
+      h('div', { class: 'actions' }, cancel, ok)));
+    cancel.focus();
+  }, { cls: 'limit-confirm' });
+}
+
+const RESET_OUTCOMES = {
+  reset: ['ok', 'リセットを適用しました。'],
+  nothingToReset: ['info', 'リセットする上限がありません。'],
+  noCredit: ['warn', '使用できるリセットクレジットがありません。'],
+  alreadyRedeemed: ['info', 'このリセットは適用済みです。'],
+};
+
+async function redeemResetCredit(p, close) {
+  const l = S.limits;
+  l.redeeming = true;
+  let res; let failure;
+  try { res = await api('/api/usage/limits/reset-credit', { method: 'POST', json: { provider: p.rawProvider || p.id } }); } catch (e) { failure = e; }
+  // a limits request that is still in flight may predate the redemption: drop its answer
+  l.seq += 1; l.pending = null; l.refreshing = false; l.redeeming = false;
+  close();
+  let data = null;
+  try { if (res?.limits) data = normalizeLimits(res.limits); } catch { /* unusable payload: fetch it again below */ }
+  if (data) { l.data = data; l.error = ''; l.fetchedAt = Date.now(); renderLimitSurfaces(); } else loadUsageLimits({ refresh: true });
+  if (failure) { toast(`リセットを適用できませんでした: ${failure.message || failure}`, 'err', 6000); return; }
+  const [kind, fallback] = Object.hasOwn(RESET_OUTCOMES, res?.outcome) ? RESET_OUTCOMES[res.outcome] : ['warn', 'リセットの結果を確認できませんでした。'];
+  toast(uText(res?.message, 400) || fallback, kind, 6000);
 }
 
 function limitsView(d) {
   const now = Date.now();
-  const cards = d.providers.filter((p) => p.windows.length);
+  const pools = d.providers.filter((p) => p.windows.length);
   const notes = d.providers.filter((p) => !p.windows.length);
   if (!d.providers.length) return uEmpty('上限を確認できるプロバイダがありません');
   return h('div', { class: 'u-limits' },
-    cards.map((p) => limitCard(p, now)),
+    pools.map((p) => limitPool(p, now)),
     notes.length ? h('section', { class: 'u-limit-notes', 'aria-label': '上限を表示できないプロバイダ' },
       h('h3', { text: '上限を表示できないプロバイダ' }),
       h('ul', {}, notes.map((p) => h('li', { dataset: { provider: p.id, status: p.status } },
@@ -3004,17 +3143,28 @@ function usageDialog(arg) {
     range.textContent = '';
     setBusy(busy, '上限を再取得');
     const checked = d ? new Date(d.checkedAt || l.fetchedAt) : null;
-    foot.textContent = `上限は各 CLI（Claude / Codex）の公式インターフェース経由で取得しています（認証ファイルの直接読取・テレメトリ送信なし）${checked ? ` · 最終確認 ${checked.toLocaleTimeString('ja-JP', { hour12: false })}` : ''}`;
+    const direct = d?.providers.some((p) => p.source === 'antigravity-api');
+    foot.textContent = `Claude / Codex の上限は各 CLI の公式インターフェース経由で取得しています（認証ファイルの直接読取なし）。${direct ? 'Antigravity は Antigravity API へ直接照会しています。' : ''}テレメトリ送信はありません${checked ? ` · 最終確認 ${checked.toLocaleTimeString('ja-JP', { hour12: false })}` : ''}`;
     // countdowns have minute resolution, so an unchanged minute needs no rebuild
-    const state = [d, l.error, u.metric, !d && busy, Math.floor(Date.now() / 60000)];
+    const state = [d, l.error, u.metric, !d && busy, l.redeeming, Math.floor(Date.now() / 60000)];
     if (state.every((v, i) => v === drawn[i])) return;
     drawn = state;
     chart = null;
     const focused = top.contains(document.activeElement) ? document.activeElement.dataset.win : null;
+    const open = popover && top.contains(popover.anchor) ? { win: popover.anchor.dataset.win, focus: popover.el.contains(document.activeElement) } : null;
+    if (open) closePopover();
     const banner = l.error && (d || !busy)
       ? errorBanner(`上限の${d ? '更新' : '取得'}に失敗しました: ${l.error}${d ? '（前回の結果を表示中）' : ''}`, () => loadUsageLimits({ refresh: true })) : null;
     top.replaceChildren(...[banner, d ? limitsView(d) : banner ? null : limitsSkeleton()].filter(Boolean));
-    if (focused) top.querySelector(`.u-limit-bar[data-win="${CSS.escape(focused)}"]`)?.focus();
+    const barOf = (win) => top.querySelector(`.u-lwin-bar[data-win="${CSS.escape(win)}"]`);
+    if (focused) barOf(focused)?.focus();
+    // an open detail panel follows its window into the rebuilt view, with the new numbers
+    const anchor = open && barOf(open.win);
+    if (anchor) {
+      const p = d.providers.find((x) => open.win.startsWith(`${x.id}:`) && x.windows.length);
+      const w = p?.windows.find((x) => open.win === `${p.id}:${x.id || x.label}`);
+      if (w) openLimitPopover(anchor, p, w, { focus: open.focus });
+    }
   };
 
   const renderTop = () => {
@@ -3044,6 +3194,7 @@ function usageDialog(arg) {
     const limits = inLimits();
     period.hidden = limits;
     breakdown.hidden = limits;
+    if (!limits && popover && top.contains(popover.anchor)) closePopover();
     if (limits) renderLimits(); else { renderTop(); renderBreakdown(); }
   };
   const onchange = (days) => { if (days === u.days && !inLimits()) render(); };
@@ -3065,6 +3216,7 @@ function usageDialog(arg) {
     breakdown = h('section', { class: 'u-section u-breakdown' }, h('div', { class: 'u-bhead' }, h('h3', { text: '内訳' }), tabs), panel);
     body.append(top, breakdown, foot);
     dlg.addEventListener('pointerdown', (e) => { if (chart && !chart.plot.contains(e.target)) chart.hide(); });
+    body.addEventListener('scroll', () => popover?.place(), { passive: true });
     dlg.tabIndex = -1; dlg.focus();
     u.onchange = onchange;
     l.onchange = onlimits;
@@ -3864,7 +4016,7 @@ function wire() {
     const mod = IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
     if (!mod || e.altKey || e.shiftKey) return;
     const k = e.key.toLowerCase();
-    const modal = $('dialog[open]');
+    const modal = $$('dialog[open]').at(-1); // the topmost one
     if (k === 'k') { if (modal && !modal.classList.contains('search')) return; e.preventDefault(); searchDialog(); return; }
     if (k === 'u') {
       if (!IS_MAC && typing) return; // ⌘U has no text-editing meaning on macOS, so it also works from the composer

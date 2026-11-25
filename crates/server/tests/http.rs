@@ -1413,17 +1413,77 @@ printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","req
     std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let fake_codex = tmp.0.join("fake-codex");
+    let reset_flag = tmp.0.join("codex-reset-applied");
+    let idempotency_log = tmp.0.join("codex-idempotency-key");
     std::fs::write(
         &fake_codex,
-        r#"#!/bin/sh
+        format!(
+            r#"#!/bin/sh
 read -r _init
-printf '%s\n' '{"id":1,"result":{}}'
-read -r _read
-printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","planType":"plus","primary":{"usedPercent":100,"windowDurationMins":300,"resetsAt":1795593846},"secondary":{"usedPercent":80,"windowDurationMins":10080,"resetsAt":1795702939}}}}'
+printf '%s\n' '{{"id":1,"result":{{}}}}'
+read -r req
+case "$req" in
+  *rateLimitResetCredit/consume*)
+    printf '%s\n' "$req" > "{}"
+    touch "{}"
+    printf '%s\n' '{{"id":2,"result":{{"outcome":"reset"}}}}'
+    ;;
+  *)
+    if [ -f "{}" ]; then
+      printf '%s\n' '{{"id":2,"result":{{"rateLimits":{{"limitId":"codex","planType":"plus","primary":{{"usedPercent":0,"windowDurationMins":300,"resetsAt":1795593846}},"secondary":{{"usedPercent":0,"windowDurationMins":10080,"resetsAt":1795702939}}}},"rateLimitResetCredits":{{"availableCount":2,"credits":[{{"id":"c2","status":"available","expiresAt":1796163165}}]}}}}}}'
+    else
+      printf '%s\n' '{{"id":2,"result":{{"rateLimits":{{"limitId":"codex","planType":"plus","primary":{{"usedPercent":100,"windowDurationMins":300,"resetsAt":1795593846}},"secondary":{{"usedPercent":80,"windowDurationMins":10080,"resetsAt":1795702939}}}},"rateLimitResetCredits":{{"availableCount":3,"credits":[{{"id":"c1","status":"available","expiresAt":1796071038}}]}}}}}}'
+    fi
+    ;;
+esac
 "#,
+            idempotency_log.display(),
+            reset_flag.display(),
+            reset_flag.display(),
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // Local mock server for Antigravity retrieveUserQuotaSummary
+    let agy_listener = tokio::net::TcpListener::bind((LOCAL, 0)).await.unwrap();
+    let agy_addr = agy_listener.local_addr().unwrap();
+    let agy_app = axum::Router::new().route(
+        "/v1internal:retrieveUserQuotaSummary",
+        axum::routing::post(|| async {
+            axum::Json(json!({
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            { "bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.8, "description": "used", "resetTime": "2026-12-01T08:28:09Z" },
+                            { "bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.58, "description": "used", "resetTime": "2026-11-25T08:00:23Z" }
+                        ]
+                    },
+                    {
+                        "displayName": "Claude and GPT models",
+                        "buckets": [
+                            { "bucketId": "3p-5h", "window": "5h", "remainingFraction": 1.0 },
+                            { "bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 1.0 }
+                        ]
+                    }
+                ]
+            }))
+        }),
+    );
+    let agy_task = tokio::spawn(async move {
+        let _ = axum::serve(agy_listener, agy_app).await;
+    });
+
+    let agy_dir = tmp.0.join("agy-data");
+    std::fs::create_dir_all(&agy_dir).unwrap();
+    let future_expiry = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    std::fs::write(
+        agy_dir.join("antigravity-oauth-token"),
+        json!({ "token": { "access_token": "fixture-token", "expiry": future_expiry } })
+            .to_string(),
+    )
+    .unwrap();
 
     let mut config = ServerConfig {
         data_dir: tmp.0.join("server"),
@@ -1433,10 +1493,13 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","planType":"plu
             ProviderId::Antigravity,
             ProviderId::OpenCode,
         ],
+        antigravity_quota_probe: true,
         ..Default::default()
     };
     config.providers.claude_bin = fake_claude;
     config.providers.codex_bin = fake_codex;
+    config.providers.antigravity_data_dir = Some(agy_dir);
+    config.providers.antigravity_quota_endpoints = Some(vec![format!("http://{agy_addr}")]);
     let state = ServerState::new(config, "http://127.0.0.1:3774".into()).unwrap();
     let app = router(state);
 
@@ -1450,11 +1513,22 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","planType":"plu
     assert_eq!(providers[0]["windows"][1]["remaining_percent"], 45.0);
     assert_eq!(providers[1]["provider"], "codex");
     assert_eq!(providers[1]["status"], "ok");
-    assert_eq!(providers[1]["plan"], "Plus");
+    assert_eq!(providers[1]["plan"], "ChatGPT Plus Subscription");
     assert_eq!(providers[1]["windows"][0]["remaining_percent"], 0.0);
     assert_eq!(providers[1]["windows"][1]["remaining_percent"], 20.0);
+    assert_eq!(providers[1]["reset_credits"]["available_count"], 3);
     assert_eq!(providers[2]["provider"], "antigravity");
-    assert_eq!(providers[2]["status"], "unsupported");
+    assert_eq!(providers[2]["status"], "ok");
+    assert_eq!(providers[2]["source"], "antigravity-api");
+    assert_eq!(providers[2]["windows"].as_array().unwrap().len(), 4);
+    assert_eq!(providers[2]["windows"][0]["label"], "Gemini · 5-hour");
+    assert_eq!(providers[2]["windows"][0]["remaining_percent"], 58.0);
+    assert_eq!(providers[2]["windows"][1]["label"], "Gemini · Weekly");
+    assert_eq!(providers[2]["windows"][1]["remaining_percent"], 80.0);
+    assert_eq!(
+        providers[2]["windows"][2]["label"],
+        "Claude & GPT (shared) · 5-hour"
+    );
     assert_eq!(providers[3]["provider"], "open-code");
     assert_eq!(providers[3]["status"], "unsupported");
 
@@ -1478,4 +1552,25 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","planType":"plu
             .count(),
         2
     );
+
+    // Redeem Codex reset credit via POST /api/usage/limits/reset-credit.
+    let redeemed = json_req(
+        &app,
+        Method::POST,
+        "/api/usage/limits/reset-credit",
+        Some(json!({ "provider": "codex" })),
+    )
+    .await;
+    assert_eq!(redeemed["outcome"], "reset");
+    assert_eq!(
+        redeemed["limits"]["providers"][1]["windows"][0]["remaining_percent"],
+        100.0
+    );
+    assert_eq!(
+        redeemed["limits"]["providers"][1]["reset_credits"]["available_count"],
+        2
+    );
+    let logged_req = std::fs::read_to_string(&idempotency_log).unwrap();
+    assert!(logged_req.contains("idempotencyKey"));
+    agy_task.abort();
 }

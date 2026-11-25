@@ -55,6 +55,9 @@ pub struct ProviderBinaryConfig {
     pub opencode_bin: PathBuf,
     /// Isolated data directory for Antigravity ACP/CLI (never touches official ~/.t3)
     pub antigravity_data_dir: Option<PathBuf>,
+    /// Optional override endpoints for Antigravity quota probe (primarily for tests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_quota_endpoints: Option<Vec<String>>,
 }
 
 impl Default for ProviderBinaryConfig {
@@ -65,6 +68,7 @@ impl Default for ProviderBinaryConfig {
             antigravity_bin: PathBuf::from("/opt/homebrew/bin/agy"),
             opencode_bin: PathBuf::from("/opt/homebrew/bin/opencode"),
             antigravity_data_dir: None,
+            antigravity_quota_endpoints: None,
         }
     }
 }
@@ -103,6 +107,9 @@ pub struct ServerConfig {
     pub rate_limit_max_retries: u32,
     pub rate_limit_initial_backoff_secs: u64,
     pub enabled_providers: Vec<ProviderId>,
+    /// Opt-in direct Antigravity Cloud Code quota query (`retrieveUserQuotaSummary`).
+    #[serde(default)]
+    pub antigravity_quota_probe: bool,
 }
 
 impl Default for ServerConfig {
@@ -129,6 +136,7 @@ impl Default for ServerConfig {
                 ProviderId::Antigravity,
                 ProviderId::OpenCode,
             ],
+            antigravity_quota_probe: false,
         }
     }
 }
@@ -201,9 +209,10 @@ impl ServerConfig {
     }
 
     /// Returns the exact set of outbound URL prefixes permitted by this configuration.
-    /// Strict zero-telemetry invariant: empty unless Cloudflare Access auth is enabled.
+    /// Strict zero-telemetry invariant: empty unless Cloudflare Access auth or opt-in
+    /// Antigravity quota probing is enabled.
     pub fn allowed_outbound_urls(&self) -> Vec<String> {
-        match &self.auth {
+        let mut urls = match &self.auth {
             AuthConfig::CloudflareAccess {
                 team_domain,
                 jwks_url_override,
@@ -220,7 +229,32 @@ impl ServerConfig {
                 }
             }
             _ => Vec::new(),
+        };
+        if self.antigravity_quota_probe {
+            let endpoints = self
+                .providers
+                .antigravity_quota_endpoints
+                .as_deref()
+                .unwrap_or(&[]);
+            if endpoints.is_empty() {
+                urls.push(
+                    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+                        .into(),
+                );
+                urls.push(
+                    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+                        .into(),
+                );
+            } else {
+                for ep in endpoints {
+                    urls.push(format!(
+                        "{}/v1internal:retrieveUserQuotaSummary",
+                        ep.trim_end_matches('/')
+                    ));
+                }
+            }
         }
+        urls
     }
 }
 
