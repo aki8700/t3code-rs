@@ -5,6 +5,7 @@ mod attachments;
 pub mod auth;
 pub mod coordinator;
 mod database;
+mod limits;
 pub mod privacy;
 pub mod routes;
 mod swarm;
@@ -41,6 +42,7 @@ pub struct ServerState {
     auth: AuthLayer,
     usage_home: Option<PathBuf>,
     usage_cache: Arc<Mutex<usage::UsageScanCache>>,
+    limits_cache: Arc<limits::UsageLimitsCache>,
     mcp: Arc<McpServer<RunCoordinator>>,
     daemon_lock: Arc<DaemonLock>,
 }
@@ -59,8 +61,14 @@ impl ServerState {
             internal_token: String::new(),
             thread_id: Uuid::nil(),
         };
-        let coordinator =
-            RunCoordinator::with_tokens(config.clone(), store.clone(), injection, tokens);
+        let limits_cache = Arc::new(limits::UsageLimitsCache::default());
+        let coordinator = RunCoordinator::with_tokens_and_limits(
+            config.clone(),
+            store.clone(),
+            injection,
+            tokens,
+            limits_cache.clone(),
+        );
         Ok(Self {
             mcp: Arc::new(McpServer::new(coordinator.clone())),
             coordinator,
@@ -70,6 +78,7 @@ impl ServerState {
             config: Arc::new(config),
             usage_home: std::env::home_dir(),
             usage_cache: Arc::new(Mutex::new(usage::UsageScanCache::default())),
+            limits_cache,
         })
     }
 }

@@ -53,6 +53,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/stats/orch", get(orch_stats))
         .route("/api/stats/db", get(db_stats))
         .route("/api/usage", get(crate::usage::get))
+        .route("/api/usage/limits", get(crate::limits::get))
         .route("/ws", get(ws::upgrade))
         .route_layer(middleware::from_fn_with_state(
             state.auth.clone(),

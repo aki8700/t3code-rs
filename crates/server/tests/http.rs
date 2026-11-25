@@ -1390,3 +1390,92 @@ async fn swarm_mock_workers_post_results_and_wake_the_coordinator() {
     let detail = json_req(&app, Method::GET, &worker_path, None).await;
     assert_eq!(detail["runs"].as_array().unwrap().len(), 1);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn usage_limits_probes_claude_and_codex_clis_with_cache_and_refresh() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new();
+    let claude_counter = tmp.0.join("claude-count");
+    let fake_claude = tmp.0.join("fake-claude");
+    std::fs::write(
+        &fake_claude,
+        format!(
+            r#"#!/bin/sh
+printf '1\n' >> "{}"
+read -r _line
+printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"t3_limits","response":{{"subscription_type":"pro","rate_limits_available":true,"rate_limits":{{"five_hour":{{"utilization":40,"resets_at":"2026-11-25T08:00:00Z"}},"seven_day":{{"utilization":55,"resets_at":"2026-11-27T00:00:00Z"}}}}}}}}}}'
+"#,
+            claude_counter.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let fake_codex = tmp.0.join("fake-codex");
+    std::fs::write(
+        &fake_codex,
+        r#"#!/bin/sh
+read -r _init
+printf '%s\n' '{"id":1,"result":{}}'
+read -r _read
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","planType":"plus","primary":{"usedPercent":100,"windowDurationMins":300,"resetsAt":1795593846},"secondary":{"usedPercent":80,"windowDurationMins":10080,"resetsAt":1795702939}}}}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut config = ServerConfig {
+        data_dir: tmp.0.join("server"),
+        enabled_providers: vec![
+            ProviderId::Claude,
+            ProviderId::Codex,
+            ProviderId::Antigravity,
+            ProviderId::OpenCode,
+        ],
+        ..Default::default()
+    };
+    config.providers.claude_bin = fake_claude;
+    config.providers.codex_bin = fake_codex;
+    let state = ServerState::new(config, "http://127.0.0.1:3774".into()).unwrap();
+    let app = router(state);
+
+    let first = json_req(&app, Method::GET, "/api/usage/limits", None).await;
+    let providers = first["providers"].as_array().unwrap();
+    assert_eq!(providers.len(), 4);
+    assert_eq!(providers[0]["provider"], "claude");
+    assert_eq!(providers[0]["status"], "ok");
+    assert_eq!(providers[0]["plan"], "Pro");
+    assert_eq!(providers[0]["windows"][0]["remaining_percent"], 60.0);
+    assert_eq!(providers[0]["windows"][1]["remaining_percent"], 45.0);
+    assert_eq!(providers[1]["provider"], "codex");
+    assert_eq!(providers[1]["status"], "ok");
+    assert_eq!(providers[1]["plan"], "Plus");
+    assert_eq!(providers[1]["windows"][0]["remaining_percent"], 0.0);
+    assert_eq!(providers[1]["windows"][1]["remaining_percent"], 20.0);
+    assert_eq!(providers[2]["provider"], "antigravity");
+    assert_eq!(providers[2]["status"], "unsupported");
+    assert_eq!(providers[3]["provider"], "open-code");
+    assert_eq!(providers[3]["status"], "unsupported");
+
+    // Cached call should not re-spawn the CLI probe.
+    let second = json_req(&app, Method::GET, "/api/usage/limits", None).await;
+    assert_eq!(second["checked_at"], first["checked_at"]);
+    assert_eq!(
+        std::fs::read_to_string(&claude_counter)
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    // Explicit refresh re-runs the probe.
+    let _refreshed = json_req(&app, Method::GET, "/api/usage/limits?refresh=1", None).await;
+    assert_eq!(
+        std::fs::read_to_string(&claude_counter)
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}

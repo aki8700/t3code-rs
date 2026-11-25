@@ -213,7 +213,7 @@ impl UsageScanCache {
 }
 
 #[cfg(unix)]
-fn transcript_open_flags() -> io::Result<i32> {
+pub(crate) fn transcript_open_flags() -> io::Result<i32> {
     // The server has no libc dependency. Use the O_NOFOLLOW | O_NONBLOCK
     // values from the supported platforms' fcntl.h to reject symlinks and FIFOs.
     if cfg!(any(

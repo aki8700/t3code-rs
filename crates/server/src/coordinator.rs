@@ -31,6 +31,7 @@ pub(crate) struct Coordinator {
     shutting_down: AtomicBool,
     injection: McpInjectionSpec,
     tokens: McpTokens,
+    limits: Arc<crate::limits::UsageLimitsCache>,
 }
 
 pub(crate) struct ActiveRun {
@@ -81,6 +82,22 @@ impl RunCoordinator {
         injection: McpInjectionSpec,
         tokens: McpTokens,
     ) -> Self {
+        Self::with_tokens_and_limits(
+            cfg,
+            store,
+            injection,
+            tokens,
+            Arc::new(crate::limits::UsageLimitsCache::default()),
+        )
+    }
+
+    pub(crate) fn with_tokens_and_limits(
+        cfg: ServerConfig,
+        store: SqliteStore,
+        injection: McpInjectionSpec,
+        tokens: McpTokens,
+        limits: Arc<crate::limits::UsageLimitsCache>,
+    ) -> Self {
         let (events, _) = broadcast::channel(512);
         Self(Arc::new(Coordinator {
             git: GitManager::new(cfg.worktrees_dir()),
@@ -89,6 +106,7 @@ impl RunCoordinator {
             store,
             injection,
             tokens,
+            limits,
             events,
             active: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
@@ -819,6 +837,18 @@ impl RunCoordinator {
                 retry_after_secs,
                 message,
             } => {
+                if let Some(provider) = self
+                    .0
+                    .active
+                    .lock()
+                    .await
+                    .get(&thread_id)
+                    .map(|run| run.model.provider)
+                {
+                    self.0
+                        .limits
+                        .record_runtime_limit(provider, Some(retry_after_secs), &message);
+                }
                 self.append(NewTurnItem {
                     thread_id,
                     run_id,

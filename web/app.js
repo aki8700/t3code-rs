@@ -276,6 +276,7 @@ const S = {
   ignoreWs: ls.get('t3.ws', '1') !== '0',
   dbStats: null,
   usage: { days: 7, metric: 'cost', tab: 'model', hidden: new Set(), cache: new Map(), errors: new Map(), pending: new Map(), seq: new Map(), refreshing: new Set(), onchange: null },
+  limits: { data: null, error: '', pending: null, refreshing: false, seq: 0, fetchedAt: 0, onchange: null },
   subscribed: new Set(),
   ws: null, wsOk: false,
   token: ls.get('t3.token', ''),
@@ -1959,10 +1960,12 @@ function renderComposer() {
   send.title = label; send.setAttribute('aria-label', label);
   send.disabled = sending || (!ta().value.trim() && !S.atts.length);
   $('#btn-stop').disabled = !t || !busy;
+  syncLimitAlert();
 }
 const syncSendEnabled = () => { $('#btn-send').disabled = sending || (!ta().value.trim() && !S.atts.length); syncSwarmHint(); };
 
 const SWARM_COMMAND = /^\s*\/swarm(\s|$)/;
+const LIMITS_COMMAND = /^\/(usage-limits|limits)$/i; // answered locally, never sent to a provider
 /** Pill above the textarea while the message is a /swarm command. Touches the DOM only on a change (it is a live region). */
 function syncSwarmHint() {
   const box = $('#swarm-hint');
@@ -2020,6 +2023,11 @@ async function send() {
   const input = ta();
   const text = input.value.trim();
   if (!text && !S.atts.length) return;
+  if (LIMITS_COMMAND.test(text)) { // attachments stay in the composer
+    input.value = ''; autosize(); syncSendEnabled();
+    usageDialog({ metric: 'limits' });
+    return;
+  }
   if (S.atts.some((a) => a.uploading)) { toast('添付のアップロード完了を待っています…'); return; }
   let t = curThread();
   if (S.threadId && !t) return; // still loading
@@ -2351,7 +2359,7 @@ const U_PROVIDERS = {
   opencode: { label: 'OpenCode', color: 'var(--p-opencode)' },
 };
 const U_PERIODS = [['1', '過去24時間'], ['7', '7日間'], ['30', '30日間'], ['90', '90日間']];
-const U_METRICS = [['cost', 'コスト'], ['tokens', 'トークン']];
+const U_METRICS = [['cost', 'コスト'], ['tokens', 'トークン'], ['limits', '上限']];
 const U_KINDS = [
   { key: 'input_tokens', label: '入力', color: 'var(--text)' },
   { key: 'output_tokens', label: '出力', color: 'var(--accent)' },
@@ -2449,16 +2457,207 @@ function renderUsagePill() {
   const pill = $('#usage-pill');
   const btn = $('#btn-usage');
   const hint = `使用量を開く (${kbd('U')})`;
+  const limits = limitsSummary(Date.now());
+  btn.classList.toggle('limit-out', limits.exhausted);
+  const tooltip = (head) => [head, limits.text, hint].filter(Boolean).join('\n');
   if (!d) {
     const err = S.usage.errors.get(7);
     pill.textContent = err ? '–' : '…';
-    btn.title = err ? `使用量を取得できません: ${err}\n${hint}` : hint;
+    btn.title = tooltip(err ? `使用量を取得できません: ${err}` : '');
     return;
   }
   const t = d.totals;
   pill.textContent = `${t.cost_usd > 0 || !t.total_tokens ? fmtUsd(t.cost_usd) : `${fmtCompact(t.total_tokens)} tok`} · 7日`;
-  btn.title = `過去7日間: ${fmtUsd(t.cost_usd)}（API 推定）· ${fmtCompact(t.total_tokens)} トークン · ${fmtNum(t.sessions)} セッション\n${hint}`;
+  btn.title = tooltip(`過去7日間: ${fmtUsd(t.cost_usd)}（API 推定）· ${fmtCompact(t.total_tokens)} トークン · ${fmtNum(t.sessions)} セッション`);
 }
+
+// ───────────────────────── usage: limits (T3 Code UsageLimits) ─────────────────────────
+const LIMIT_LOW = 15; // remaining %: amber in the Limits view
+const LIMIT_CRITICAL = 10; // remaining %: warned above the composer
+
+const uText = (v, max) => (typeof v === 'string' ? clip(v.trim(), max) : '');
+const uPercent = (v) => {
+  const n = typeof v === 'number' || (typeof v === 'string' && v.trim()) ? Number(v) : NaN;
+  return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : null;
+};
+function uWindow(w) {
+  let used = uPercent(w.used_percent);
+  let remaining = uPercent(w.remaining_percent);
+  if (used == null && remaining == null) return null;
+  remaining ??= 100 - used;
+  used ??= 100 - remaining;
+  const kind = uText(w.kind, 24);
+  const mins = Number(w.window_duration_mins);
+  return {
+    id: uText(w.id, 60), kind, used, remaining,
+    label: uText(w.label, 40) || (kind === 'session' ? 'セッション' : kind === 'weekly' ? '週間' : '上限'),
+    durationMins: Number.isFinite(mins) && mins > 0 ? mins : 0,
+    resetsAt: (typeof w.resets_at === 'string' && Date.parse(w.resets_at)) || 0,
+  };
+}
+/** Makes the /api/usage/limits payload safe to render. */
+function normalizeLimits(raw) {
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.providers)) throw new Error('応答の形式が不正です');
+  const objects = (a) => (Array.isArray(a) ? a.filter((x) => x && typeof x === 'object') : []);
+  const providers = objects(raw.providers).map((p) => ({
+    ...uProvider(uId(p.provider), uText(p.label, 40)),
+    plan: uText(p.plan, 24), status: uText(p.status, 24), source: uText(p.source, 40), message: uText(p.message, 400),
+    windows: objects(p.windows).map(uWindow).filter(Boolean),
+  }));
+  return { providers, checkedAt: (typeof raw.checked_at === 'string' && Date.parse(raw.checked_at)) || 0 };
+}
+
+function loadUsageLimits({ refresh = false } = {}) {
+  const l = S.limits;
+  if (l.pending && (!refresh || l.refreshing)) return l.pending;
+  const seq = ++l.seq;
+  const latest = () => l.seq === seq; // an older response must never overwrite a newer one
+  l.refreshing = refresh;
+  l.pending = api(`/api/usage/limits${refresh ? '?refresh=1' : ''}`)
+    .then(normalizeLimits)
+    .then((d) => { if (latest()) { l.data = d; l.error = ''; l.fetchedAt = Date.now(); } })
+    .catch((e) => { if (latest()) l.error = e.message || String(e); })
+    .finally(() => {
+      if (!latest()) return;
+      l.pending = null; l.refreshing = false;
+      renderLimitSurfaces();
+    });
+  l.onchange?.();
+  return l.pending;
+}
+const loadUsageLimitsSoon = debounce(() => loadUsageLimits(), 5000);
+/** Everything that shows limits; also run on a timer so countdowns and passed resets stay current. */
+function renderLimitSurfaces() { renderUsagePill(); syncLimitAlert(); S.limits.onchange?.(); }
+
+/** A window whose reset time has passed no longer limits anything, whatever its last reading said. */
+const limitIsReset = (w, now) => w.resetsAt > 0 && w.resetsAt <= now;
+const limitIsOut = (w, now) => w.remaining <= 0 && !limitIsReset(w, now);
+const fmtLeft = (v) => (v > 0 && v < 1 ? '<1%' : `${Math.round(v)}%`);
+function fmtResetIn(resetsAt, now) {
+  if (!resetsAt) return '';
+  const ms = resetsAt - now;
+  if (ms <= 0) return 'リセット済';
+  if (ms < 60000) return 'まもなくリセット';
+  const mins = Math.floor(ms / 60000);
+  const d = Math.floor(mins / 1440); const hours = Math.floor((mins % 1440) / 60); const m = mins % 60;
+  if (d) return `あと ${d}日${hours ? `${hours}時間` : ''}`;
+  if (hours) return `あと ${hours}時間${m ? `${m}分` : ''}`;
+  return `あと ${m}分`;
+}
+const fmtResetAt = (ts) => { const t = new Date(ts); return `${String(t.getMonth() + 1).padStart(2, '0')}/${String(t.getDate()).padStart(2, '0')} ${hhmm(t)}`; };
+
+/** The sidebar tooltip line (tightest live window per provider) and whether anything is used up. */
+function limitsSummary(now) {
+  const parts = []; let exhausted = false;
+  for (const p of S.limits.data?.providers || []) {
+    const live = p.windows.filter((w) => !limitIsReset(w, now));
+    if (!live.length) continue;
+    const least = Math.min(...live.map((w) => w.remaining));
+    exhausted ||= least <= 0;
+    parts.push(`${p.label} ${fmtLeft(least)}`);
+  }
+  return { text: parts.length ? `上限の残り: ${parts.join(' · ')}` : '', exhausted };
+}
+
+/** Pill above the textarea while the selected provider is out of quota or nearly so. A live region: touched only on change. */
+function syncLimitAlert() {
+  const box = $('#limit-alert');
+  const id = uId(S.compose.sel?.provider || curThread()?.model_selection?.provider);
+  const p = S.limits.data?.providers.find((x) => x.id === id);
+  const now = Date.now();
+  const live = p?.windows.filter((w) => !limitIsReset(w, now)) || [];
+  // among used-up windows the one that blocks longest matters; otherwise the tightest one
+  const out = live.filter((w) => w.remaining <= 0).sort((a, b) => b.resetsAt - a.resetsAt)[0];
+  const w = out || live.filter((x) => x.remaining <= LIMIT_CRITICAL).sort((a, b) => a.remaining - b.remaining)[0];
+  let text = '';
+  if (w) {
+    // a limit observed at run time has no quota name, only the fact that it was hit
+    const what = w.id === 'runtime' ? w.label : `${w.kind === 'session' ? 'セッション' : w.label}上限${out ? '到達' : 'が残りわずか'}`;
+    const left = fmtResetIn(w.resetsAt, now);
+    const when = left.startsWith('あと') ? `${left}でリセット` : left;
+    text = `${p.label} ${what}（残り ${fmtLeft(w.remaining)}${when ? ` · ${when}` : ''}）`;
+  }
+  const key = text && `${out ? 'out' : 'low'}:${text}`;
+  if ((box.dataset.key || '') === key) return;
+  box.dataset.key = key;
+  const focused = box.contains(document.activeElement);
+  box.replaceChildren(...(text ? [h('button', {
+    type: 'button', class: `limit-pill${out ? ' out' : ''}`, title: '使用量の「上限」を開く', onclick: () => usageDialog({ metric: 'limits' }),
+  }, iconEl('alert'), h('span', { class: 'limit-pill-text', text }), h('span', { class: 'limit-pill-more', text: '— 詳細' }))] : []));
+  if (focused) $('button', box)?.focus();
+}
+
+const limitSource = (s) => {
+  const v = s.toLowerCase();
+  if (/log|rollout|jsonl|session-file/.test(v)) return 'ローカルログ';
+  if (/runtime|observed|detect/.test(v)) return '実行時検知';
+  return /cli|app-server/.test(v) ? 'CLI' : '';
+};
+
+/** One quota window: label and remaining share, the pace-tick bar, and pace plus countdown. */
+function limitRow(p, w, now) {
+  const reset = limitIsReset(w, now);
+  const length = w.durationMins * 60000;
+  const elapsed = !reset && length && w.resetsAt ? Math.min(1, Math.max(0, (length - (w.resetsAt - now)) / length)) : null;
+  const timeLeft = elapsed == null ? null : Math.round((1 - elapsed) * 100);
+  const countdown = fmtResetIn(w.resetsAt, now);
+  const detail = [
+    `残り ${fmtLeft(w.remaining)}`,
+    timeLeft == null ? null : `期間の残り ${timeLeft}%（縦線は均等消費の目安）`,
+    !w.resetsAt ? 'リセット時刻不明' : reset ? `リセット ${fmtResetAt(w.resetsAt)}（リセット済）` : `リセット ${fmtResetAt(w.resetsAt)} (${countdown})`,
+  ].filter(Boolean).join(' · ');
+
+  const fill = uTint(h('i'), p.color);
+  fill.style.width = w.remaining > 0 ? `max(2px, ${w.remaining}%)` : '0';
+  const bar = h('div', { class: `u-limit-bar${timeLeft == null ? '' : ' paced'}`, role: 'img', tabindex: '0', 'aria-label': `${p.label} ${w.label}: ${detail}`, dataset: { win: `${p.id}:${w.id || w.label}` } },
+    h('div', { class: 'u-limit-track' }, fill),
+    timeLeft == null ? null : h('span', { class: 'u-limit-tick' }),
+    h('span', { class: 'u-limit-tip', 'aria-hidden': 'true', text: detail }));
+  if (timeLeft != null) bar.style.setProperty('--tick', `clamp(3px, ${timeLeft}%, calc(100% - 3px))`);
+
+  let pace = null;
+  if (elapsed != null) {
+    const ahead = w.used - elapsed * 100;
+    const [mark, cls, title] = ahead > 5 ? ['↑', 'ahead', 'ペース超過: 時間経過より速く消費中']
+      : ahead < -5 ? ['↓', 'under', '余裕あり: 時間経過より緩やかに消費中'] : ['·', 'even', '適正ペース'];
+    pace = h('span', { class: `u-limit-pace ${cls}`, role: 'img', title, 'aria-label': title, text: mark });
+  }
+  const level = reset ? '' : w.remaining <= 0 ? ' out' : w.remaining <= LIMIT_LOW ? ' low' : '';
+  return h('div', { class: 'u-limit-row' },
+    h('div', { class: 'u-limit-label' }, h('span', { text: w.label }), h('b', { class: `u-limit-left${level}`, text: `残り ${fmtLeft(w.remaining)}` })),
+    bar,
+    h('div', { class: 'u-limit-side' }, pace, h('span', { class: 'u-limit-reset', text: countdown || 'リセット時刻不明' })));
+}
+
+function limitCard(p, now) {
+  const source = limitSource(p.source);
+  return h('article', { class: 'u-limit-card', dataset: { provider: p.id } },
+    h('header', { class: 'u-limit-head' }, uDot(p.color), h('h3', { text: p.label }),
+      p.plan ? h('span', { class: 'u-limit-plan', text: p.plan }) : null,
+      source ? h('span', { class: 'u-limit-source', title: `取得元: ${p.source}`, text: source }) : null,
+      p.windows.some((w) => limitIsOut(w, now)) ? h('span', { class: 'u-limit-status', text: '上限到達' }) : null),
+    p.windows.map((w) => limitRow(p, w, now)),
+    p.message ? h('p', { class: 'u-limit-msg', text: p.message }) : null);
+}
+
+function limitsView(d) {
+  const now = Date.now();
+  const cards = d.providers.filter((p) => p.windows.length);
+  const notes = d.providers.filter((p) => !p.windows.length);
+  if (!d.providers.length) return uEmpty('上限を確認できるプロバイダがありません');
+  return h('div', { class: 'u-limits' },
+    cards.map((p) => limitCard(p, now)),
+    notes.length ? h('section', { class: 'u-limit-notes', 'aria-label': '上限を表示できないプロバイダ' },
+      h('h3', { text: '上限を表示できないプロバイダ' }),
+      h('ul', {}, notes.map((p) => h('li', { dataset: { provider: p.id, status: p.status } },
+        h('div', { class: 'u-limit-note-head' }, uDot(p.color), h('b', { text: p.label }),
+          h('span', { class: 'u-limit-source', text: p.status === 'unsupported' ? '非対応' : p.status === 'unavailable' ? '取得不可' : '情報なし' })),
+        p.message ? h('p', { text: p.message }) : null,
+        p.status === 'unavailable' ? h('p', { text: '更新ボタンで再試行できます。' }) : null)))) : null);
+}
+
+const limitsSkeleton = () => h('div', { class: 'u-limits u-skel', 'aria-busy': 'true', 'aria-label': '上限を取得中' },
+  h('i', { class: 'card' }), h('i', { class: 'card' }), h('p', { class: 'muted', text: '上限を取得中…' }));
 
 // ───────────────────────── usage: view ─────────────────────────
 const uMetricKey = () => (S.usage.metric === 'cost' ? 'cost_usd' : 'total_tokens');
@@ -2748,11 +2947,16 @@ const usageSkeleton = () => h('div', { class: 'u-hero u-skel', 'aria-busy': 'tru
   h('div', { class: 'u-summary' }, ['big', 'sub', 'row', 'row', 'row', 'row'].map((c) => h('i', { class: c }))),
   h('div', {}, h('i', { class: 'chart' }), h('p', { class: 'muted', text: '使用量を集計しています…' })));
 
-function usageDialog(tab) {
-  if (tab) S.usage.tab = tab;
+/** Opens the usage modal. A string selects a breakdown tab; { metric: 'limits' } opens the Limits view. */
+function usageDialog(arg) {
+  const { tab, metric } = typeof arg === 'string' ? { tab: arg } : arg || {};
+  const u = S.usage;
+  const l = S.limits;
+  if (tab) u.tab = tab;
   if ($('dialog.usage[open]')) return;
   closeDrawer();
-  const u = S.usage;
+  if (metric) u.metric = metric;
+  else if (tab && u.metric === 'limits') u.metric = 'cost'; // breakdown tabs do not exist in the Limits view
   const range = h('span', { class: 'u-range' });
   const top = h('div', { class: 'u-top' });
   const tabs = h('div', { class: 'u-tabs' });
@@ -2761,8 +2965,12 @@ function usageDialog(tab) {
   let system = null; // the DB / privacy panel loads on first use
   let chart = null;
   let drawn = []; // what the top half currently shows
+  let breakdown = null;
+  let period = null;
+  const inLimits = () => u.metric === 'limits';
 
   const refresh = ibtn('refresh', '使用量を再スキャン', () => {
+    if (inLimits()) { loadUsageLimits({ refresh: true }); return; }
     if (u.refreshing.has(u.days)) return;
     loadUsage(u.days, { refresh: true });
     if (u.tab === 'system') system?.load();
@@ -2782,16 +2990,40 @@ function usageDialog(tab) {
     else panel.replaceChildren(uEmpty(u.errors.has(u.days) ? '使用量を取得できないため表示できません' : '読み込み中…'));
   };
 
+  const setBusy = (busy, label) => {
+    refresh.classList.toggle('busy', busy);
+    refresh.setAttribute('aria-busy', String(busy));
+    refresh.title = label; refresh.setAttribute('aria-label', label);
+  };
+  const errorBanner = (text, retry) => h('div', { class: 'u-error', role: 'alert' }, h('span', { text }),
+    h('button', { type: 'button', class: 'btn xs', text: '再試行', onclick: retry }));
+
+  const renderLimits = () => {
+    const d = l.data;
+    const busy = !!l.pending;
+    range.textContent = '';
+    setBusy(busy, '上限を再取得');
+    const checked = d ? new Date(d.checkedAt || l.fetchedAt) : null;
+    foot.textContent = `上限は各 CLI（Claude / Codex）の公式インターフェース経由で取得しています（認証ファイルの直接読取・テレメトリ送信なし）${checked ? ` · 最終確認 ${checked.toLocaleTimeString('ja-JP', { hour12: false })}` : ''}`;
+    // countdowns have minute resolution, so an unchanged minute needs no rebuild
+    const state = [d, l.error, u.metric, !d && busy, Math.floor(Date.now() / 60000)];
+    if (state.every((v, i) => v === drawn[i])) return;
+    drawn = state;
+    chart = null;
+    const focused = top.contains(document.activeElement) ? document.activeElement.dataset.win : null;
+    const banner = l.error && (d || !busy)
+      ? errorBanner(`上限の${d ? '更新' : '取得'}に失敗しました: ${l.error}${d ? '（前回の結果を表示中）' : ''}`, () => loadUsageLimits({ refresh: true })) : null;
+    top.replaceChildren(...[banner, d ? limitsView(d) : banner ? null : limitsSkeleton()].filter(Boolean));
+    if (focused) top.querySelector(`.u-limit-bar[data-win="${CSS.escape(focused)}"]`)?.focus();
+  };
+
   const renderTop = () => {
     const d = u.cache.get(u.days);
     const error = u.errors.get(u.days);
     range.textContent = d ? rangeText(d.window) : '';
-    refresh.classList.toggle('busy', u.pending.has(u.days));
-    refresh.setAttribute('aria-busy', String(u.pending.has(u.days)));
+    setBusy(u.pending.has(u.days), '使用量を再スキャン');
     foot.textContent = d ? `コストは API 料金からの推定です${d.scannedAt ? ` · 最終スキャン ${new Date(d.scannedAt).toLocaleString('ja-JP')}` : ''}` : '';
-    const banner = error ? h('div', { class: 'u-error', role: 'alert' },
-      h('span', { text: `使用量の${d ? '更新' : '取得'}に失敗しました: ${error}${d ? '（前回の結果を表示中）' : ''}` }),
-      h('button', { type: 'button', class: 'btn xs', text: '再試行', onclick: () => loadUsage(u.days) })) : null;
+    const banner = error ? errorBanner(`使用量の${d ? '更新' : '取得'}に失敗しました: ${error}${d ? '（前回の結果を表示中）' : ''}`, () => loadUsage(u.days)) : null;
     // starting a re-fetch changes nothing here; rebuilding would drop the tooltip under the pointer
     const state = [d, error, u.metric, [...u.hidden].join()];
     if (state.every((v, i) => v === drawn[i])) return;
@@ -2808,25 +3040,38 @@ function usageDialog(tab) {
       ...usageTotals(view)].filter(Boolean));
     if (focused) top.querySelector(`.u-prov[data-provider="${CSS.escape(focused)}"]`)?.focus();
   };
-  const render = () => { renderTop(); renderBreakdown(); };
-  const onchange = (days) => { if (days === u.days) render(); };
+  const render = () => {
+    const limits = inLimits();
+    period.hidden = limits;
+    breakdown.hidden = limits;
+    if (limits) renderLimits(); else { renderTop(); renderBreakdown(); }
+  };
+  const onchange = (days) => { if (days === u.days && !inLimits()) render(); };
+  const onlimits = () => { if (inLimits()) render(); };
+  const selectMetric = (v) => {
+    u.metric = v;
+    render();
+    if (v === 'limits') loadUsageLimits(); else if (!u.cache.has(u.days)) loadUsage(u.days);
+  };
 
   const head = (close) => h('div', { class: 'u-head' },
     h('div', { class: 'u-title' }, h('h2', { text: '使用量' }), range),
     h('div', { class: 'u-controls' },
-      segmented(U_PERIODS, String(u.days), (v) => { u.days = Number(v); render(); loadUsage(u.days); }, { label: '期間', cls: 'mini u-period' }),
-      segmented(U_METRICS, u.metric, (v) => { u.metric = v; render(); }, { label: '指標', cls: 'mini u-metric' })),
+      period = segmented(U_PERIODS, String(u.days), (v) => { u.days = Number(v); render(); loadUsage(u.days); }, { label: '期間', cls: 'mini u-period' }),
+      segmented(U_METRICS, u.metric, selectMetric, { label: '指標', cls: 'mini u-metric' })),
     h('div', { class: 'u-actions' }, refresh, ibtn('close', '閉じる (Esc)', close, 'sm u-close')));
 
   openModal('使用量', (body, _close, dlg) => {
-    body.append(top, h('section', { class: 'u-section u-breakdown' }, h('div', { class: 'u-bhead' }, h('h3', { text: '内訳' }), tabs), panel), foot);
+    breakdown = h('section', { class: 'u-section u-breakdown' }, h('div', { class: 'u-bhead' }, h('h3', { text: '内訳' }), tabs), panel);
+    body.append(top, breakdown, foot);
     dlg.addEventListener('pointerdown', (e) => { if (chart && !chart.plot.contains(e.target)) chart.hide(); });
     dlg.tabIndex = -1; dlg.focus();
     u.onchange = onchange;
+    l.onchange = onlimits;
     render();
-    loadUsage(u.days);
+    if (inLimits()) loadUsageLimits(); else loadUsage(u.days);
     if (tab === 'system') system.ready.then(() => tabs.parentElement.scrollIntoView({ block: 'start' })); // deep link from the stat pill
-  }, { cls: 'usage', head, onclose: () => { if (u.onchange === onchange) u.onchange = null; } });
+  }, { cls: 'usage', head, onclose: () => { if (u.onchange === onchange) u.onchange = null; if (l.onchange === onlimits) l.onchange = null; } });
 }
 
 // ───────────────────────── usage: DB / privacy tab ─────────────────────────
@@ -3353,6 +3598,7 @@ function handleWs(m) {
       const prev = threadById(m.thread_id)?.status;
       setThreadStatus(m.thread_id, m.status);
       syncSubscriptions(); renderSidebarSoon();
+      if (m.status === 'rate-limited') loadUsageLimitsSoon();
       if (m.thread_id === cur) {
         renderHeader(); renderComposer(); renderLive();
         if (isBusy(prev) && !isBusy(m.status)) { loadDetailSoon(); refreshDiffSoon(); }
@@ -3378,7 +3624,7 @@ function handleWs(m) {
         S.live.delete(m.thread_id);
         if (m.status === 'failed' && m.error) toast(`実行失敗: ${m.error}`, 'err', 6000);
         if (m.thread_id === cur) { loadDetailSoon(); refreshDiffSoon(); loadSwarm(cur); }
-        loadThreadsSoon(); loadDbStatsSoon(); loadUsageSoon();
+        loadThreadsSoon(); loadDbStatsSoon(); loadUsageSoon(); loadUsageLimitsSoon();
       } else if (m.thread_id === cur) { renderHeader(); renderLive(); }
       break;
     }
@@ -3534,6 +3780,7 @@ function wire() {
   }, { passive: true });
 
   // composer
+  $('#swarm-hint').after(h('div', { id: 'limit-alert', class: 'limit-alert', role: 'status' }));
   const input = ta();
   input.addEventListener('input', () => { autosize(); syncSendEnabled(); });
   input.addEventListener('keydown', (e) => {
@@ -3671,9 +3918,11 @@ async function boot() {
   if (hashId) await openThread(hashId, { push: false });
   else if (!isCoarse() && !$('dialog[open]')) ta().focus();
   $('#app').classList.add('ready');
+  setTimeout(loadUsageLimits, 600); // background only: the CLIs behind it can be slow
   setInterval(() => { if (!document.hidden) loadThreads().catch(() => {}); }, 15000);
   setInterval(() => { if (!document.hidden) loadUsage(7); }, 5 * 60000);
   setInterval(tickSwarmTimes, 30000);
+  setInterval(() => { if (!document.hidden) renderLimitSurfaces(); }, 30000);
 }
 
 boot();
