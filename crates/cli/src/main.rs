@@ -10,7 +10,8 @@ use std::{
     process::ExitCode,
 };
 use t3_core::{
-    AuthConfig, DbStats, ModelSelection, OrchModelStat, ProviderId, ServerConfig, Store,
+    AuthConfig, DbStats, DiffSummary, ModelSelection, OrchModelStat, ProviderId, ServerConfig,
+    Store,
 };
 use t3_store::SqliteStore;
 use uuid::Uuid;
@@ -96,6 +97,62 @@ enum Command {
         token: Option<String>,
         #[arg(long)]
         refresh: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show changed files and optional unified patches for a thread workspace.
+    Diff {
+        thread_id: Uuid,
+        #[arg(long, default_value = DEFAULT_URL)]
+        url: String,
+        #[arg(long, env = "T3_BEARER_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        /// Include whitespace-only changes in the diff.
+        #[arg(long)]
+        no_ignore_whitespace: bool,
+        /// Print unified patch hunks below the changed files table.
+        #[arg(long)]
+        patch: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Merge a child worktree thread into its parent thread.
+    Merge {
+        parent_id: Uuid,
+        child_id: Uuid,
+        #[arg(long, default_value = DEFAULT_URL)]
+        url: String,
+        #[arg(long, env = "T3_BEARER_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        /// Optional commit message for the merge.
+        #[arg(long)]
+        message: Option<String>,
+        /// Retain the child worktree and branch after merging.
+        #[arg(long)]
+        no_cleanup: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show active runs, pending approval requests, queued threads, and active shells.
+    Monitor {
+        #[arg(long, default_value = DEFAULT_URL)]
+        url: String,
+        #[arg(long, env = "T3_BEARER_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export a thread transcript as Markdown (or raw JSON with --json).
+    Export {
+        thread_id: Uuid,
+        #[arg(long, default_value = DEFAULT_URL)]
+        url: String,
+        #[arg(long, env = "T3_BEARER_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -283,6 +340,80 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
                 println!("{}", serde_json::to_string_pretty(&limits)?);
             } else {
                 print!("{}", format_limits_table(&limits));
+            }
+        }
+        Command::Diff {
+            thread_id,
+            url,
+            token,
+            no_ignore_whitespace,
+            patch,
+            json,
+        } => {
+            let diff =
+                client::get_thread_diff(&url, token.as_deref(), thread_id, !no_ignore_whitespace)
+                    .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&diff)?);
+            } else {
+                print!("{}", format_diff_output(&diff, patch));
+            }
+        }
+        Command::Merge {
+            parent_id,
+            child_id,
+            url,
+            token,
+            message,
+            no_cleanup,
+            json,
+        } => {
+            let result = client::merge_child_worktree(
+                &url,
+                token.as_deref(),
+                parent_id,
+                child_id,
+                message.as_deref(),
+                !no_cleanup,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                print!("{}", format_merge_result(&result));
+            }
+            if merge_has_conflict(&result) {
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::Monitor { url, token, json } => {
+            let snapshot = client::get_monitor(&url, token.as_deref()).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            } else {
+                print!("{}", format_monitor_table(&snapshot));
+            }
+        }
+        Command::Export {
+            thread_id,
+            url,
+            token,
+            limit,
+            output,
+            json,
+        } => {
+            let rendered = if json {
+                let detail =
+                    client::get_thread_detail(&url, token.as_deref(), thread_id, limit).await?;
+                format!("{}\n", serde_json::to_string_pretty(&detail)?)
+            } else {
+                client::export_thread_markdown(&url, token.as_deref(), thread_id).await?
+            };
+            if let Some(path) = output {
+                write_private_file(&path, rendered.as_bytes())?;
+                println!("Exported thread {thread_id} to {}", path.display());
+            } else {
+                print!("{rendered}");
             }
         }
         Command::Stats { data_dir } => {
@@ -870,6 +1001,201 @@ fn truncate_single_line(input: &str, max_chars: usize) -> String {
     format!("{prefix}...")
 }
 
+fn format_diff_output(diff: &DiffSummary, include_patch: bool) -> String {
+    let mut out = String::new();
+    let branch = diff.branch.as_deref().unwrap_or("-");
+    if diff.clean || diff.files.is_empty() {
+        let _ = writeln!(out, "Workspace clean (branch: {branch}).");
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "Branch: {}  Files: {}  +{} -{}",
+        branch,
+        diff.files.len(),
+        diff.total_additions,
+        diff.total_deletions
+    );
+    let _ = writeln!(out, "{:<10}  {:>6}  {:>6}  Path", "Status", "+Add", "-Del");
+    for file in &diff.files {
+        let adds = format!("+{}", file.additions);
+        let dels = format!("-{}", file.deletions);
+        let _ = writeln!(
+            out,
+            "{:<10}  {:>6}  {:>6}  {}",
+            truncate_single_line(&file.status, 10),
+            adds,
+            dels,
+            file.path
+        );
+    }
+    if include_patch {
+        for file in &diff.files {
+            if file.patch.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "\n--- {} ({}) ---", file.path, file.status);
+            out.push_str(&file.patch);
+            if !file.patch.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+fn merge_has_conflict(value: &Value) -> bool {
+    value["merged"].as_bool() != Some(true)
+        || value["conflict_files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty())
+}
+
+fn format_merge_result(value: &Value) -> String {
+    let mut out = String::new();
+    let merged = value["merged"].as_bool().unwrap_or(false);
+    let branch = value["branch"].as_str().unwrap_or("-");
+    let child_id = value["child_thread_id"].as_str().unwrap_or("-");
+    let summary = value["summary"].as_str().unwrap_or("");
+    let cleaned_up = value["cleaned_up"].as_bool().unwrap_or(false);
+    let conflicts: Vec<&str> = value["conflict_files"]
+        .as_array()
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    if merged && conflicts.is_empty() {
+        let _ = writeln!(out, "Merged branch {branch} (child {child_id})");
+        if !summary.is_empty() {
+            let _ = writeln!(out, "Summary: {summary}");
+        }
+        let _ = writeln!(
+            out,
+            "Cleanup: {}",
+            if cleaned_up { "cleaned up" } else { "retained" }
+        );
+    } else {
+        let _ = writeln!(out, "Merge conflict on branch {branch} (child {child_id})");
+        if !summary.is_empty() {
+            let _ = writeln!(out, "Summary: {summary}");
+        }
+        if !conflicts.is_empty() {
+            let _ = writeln!(out, "Conflict files:");
+            for path in conflicts {
+                let _ = writeln!(out, "  - {path}");
+            }
+        }
+    }
+    out
+}
+
+fn format_monitor_table(value: &Value) -> String {
+    let active_runs = value["active_runs"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let pending_requests = value["pending_requests"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let queued_threads = value["queued_thread_ids"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let active_shells = value["active_shells"].as_u64().unwrap_or(0);
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Active runs: {}  Pending approvals: {}  Queued threads: {}  Active shells: {}",
+        active_runs.len(),
+        pending_requests.len(),
+        queued_threads.len(),
+        active_shells
+    );
+
+    if !active_runs.is_empty() {
+        let _ = writeln!(out, "\nActive runs:");
+        let _ = writeln!(
+            out,
+            "{:<36}  {:<36}  {:<12}  {:<24}  {:>7}  Title",
+            "Thread", "Run", "Status", "Model", "Pending"
+        );
+        for run in active_runs {
+            let thread_id = run["thread_id"].as_str().unwrap_or("-");
+            let run_id = run["run_id"].as_str().unwrap_or("-");
+            let status = run["status"].as_str().unwrap_or("-");
+            let model = format_model_label(&run["model_selection"]);
+            let pending = run["pending_count"].as_u64().unwrap_or(0);
+            let title = truncate_single_line(run["title"].as_str().unwrap_or(""), 40);
+            let _ = writeln!(
+                out,
+                "{:<36}  {:<36}  {:<12}  {:<24}  {:>7}  {}",
+                truncate_single_line(thread_id, 36),
+                truncate_single_line(run_id, 36),
+                truncate_single_line(status, 12),
+                truncate_single_line(&model, 24),
+                pending,
+                title
+            );
+        }
+    }
+
+    if !pending_requests.is_empty() {
+        let _ = writeln!(out, "\nPending approvals:");
+        let _ = writeln!(
+            out,
+            "{:<36}  {:<36}  {:<16}  {:<19}  Title",
+            "Request", "Thread", "Kind", "Created"
+        );
+        for req in pending_requests {
+            let id = req["id"].as_str().unwrap_or("-");
+            let thread_id = req["thread_id"].as_str().unwrap_or("-");
+            let kind = req["kind"].as_str().unwrap_or("-");
+            let created = format_timestamp(req["created_at"].as_str().unwrap_or("-"));
+            let title = truncate_single_line(req["title"].as_str().unwrap_or(""), 44);
+            let _ = writeln!(
+                out,
+                "{:<36}  {:<36}  {:<16}  {:<19}  {}",
+                truncate_single_line(id, 36),
+                truncate_single_line(thread_id, 36),
+                truncate_single_line(kind, 16),
+                created,
+                title
+            );
+        }
+    }
+
+    if !queued_threads.is_empty() {
+        let _ = writeln!(out, "\nQueued threads:");
+        for thread_id in queued_threads {
+            let label = thread_id.as_str().unwrap_or("-");
+            let _ = writeln!(out, "  - {label}");
+        }
+    }
+
+    out
+}
+
+fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(contents)?;
+    file.flush()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,5 +1507,502 @@ mod tests {
 
         let remove_args = setup_agy_mcp_args(Path::new("/usr/local/bin/t3d"), None, true);
         assert_eq!(format_agy_mcp_command(&remove_args), "agy mcp remove t3rs");
+    }
+
+    #[test]
+    fn parse_tier5_commands_defaults_and_flags() {
+        let parent_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let parent_str = parent_id.to_string();
+        let child_str = child_id.to_string();
+
+        // diff defaults
+        let cli = Cli::try_parse_from(["t3d", "diff", &parent_str]).unwrap();
+        match cli.command {
+            Command::Diff {
+                thread_id,
+                url,
+                token,
+                no_ignore_whitespace,
+                patch,
+                json,
+            } => {
+                assert_eq!(thread_id, parent_id);
+                assert_eq!(url, DEFAULT_URL);
+                assert_eq!(token, None);
+                assert!(!no_ignore_whitespace);
+                assert!(!patch);
+                assert!(!json);
+            }
+            _ => panic!("expected Diff command"),
+        }
+
+        // diff with flags
+        let cli = Cli::try_parse_from([
+            "t3d",
+            "diff",
+            &parent_str,
+            "--url",
+            "http://localhost:4000",
+            "--token",
+            "tok-diff",
+            "--no-ignore-whitespace",
+            "--patch",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Diff {
+                url,
+                token,
+                no_ignore_whitespace,
+                patch,
+                json,
+                ..
+            } => {
+                assert_eq!(url, "http://localhost:4000");
+                assert_eq!(token.as_deref(), Some("tok-diff"));
+                assert!(no_ignore_whitespace);
+                assert!(patch);
+                assert!(json);
+            }
+            _ => panic!("expected Diff command"),
+        }
+
+        // merge defaults & flags
+        let cli = Cli::try_parse_from(["t3d", "merge", &parent_str, &child_str]).unwrap();
+        match cli.command {
+            Command::Merge {
+                parent_id: p,
+                child_id: c,
+                url,
+                token,
+                message,
+                no_cleanup,
+                json,
+            } => {
+                assert_eq!(p, parent_id);
+                assert_eq!(c, child_id);
+                assert_eq!(url, DEFAULT_URL);
+                assert_eq!(token, None);
+                assert_eq!(message, None);
+                assert!(!no_cleanup);
+                assert!(!json);
+            }
+            _ => panic!("expected Merge command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "t3d",
+            "merge",
+            &parent_str,
+            &child_str,
+            "--message",
+            "Merge child task",
+            "--no-cleanup",
+            "--token",
+            "tok-merge",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Merge {
+                message,
+                no_cleanup,
+                token,
+                json,
+                ..
+            } => {
+                assert_eq!(message.as_deref(), Some("Merge child task"));
+                assert!(no_cleanup);
+                assert_eq!(token.as_deref(), Some("tok-merge"));
+                assert!(json);
+            }
+            _ => panic!("expected Merge command"),
+        }
+
+        // monitor defaults & flags
+        let cli = Cli::try_parse_from(["t3d", "monitor"]).unwrap();
+        match cli.command {
+            Command::Monitor { url, token, json } => {
+                assert_eq!(url, DEFAULT_URL);
+                assert_eq!(token, None);
+                assert!(!json);
+            }
+            _ => panic!("expected Monitor command"),
+        }
+        let cli = Cli::try_parse_from([
+            "t3d",
+            "monitor",
+            "--url",
+            "http://127.0.0.1:4555",
+            "--token",
+            "tok-mon",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Monitor { url, token, json } => {
+                assert_eq!(url, "http://127.0.0.1:4555");
+                assert_eq!(token.as_deref(), Some("tok-mon"));
+                assert!(json);
+            }
+            _ => panic!("expected Monitor command"),
+        }
+
+        // export defaults & flags
+        let cli = Cli::try_parse_from(["t3d", "export", &parent_str]).unwrap();
+        match cli.command {
+            Command::Export {
+                thread_id,
+                url,
+                token,
+                limit,
+                output,
+                json,
+            } => {
+                assert_eq!(thread_id, parent_id);
+                assert_eq!(url, DEFAULT_URL);
+                assert_eq!(token, None);
+                assert_eq!(limit, 500);
+                assert_eq!(output, None);
+                assert!(!json);
+            }
+            _ => panic!("expected Export command"),
+        }
+        let cli = Cli::try_parse_from([
+            "t3d",
+            "export",
+            &parent_str,
+            "--limit",
+            "150",
+            "--output",
+            "/tmp/transcript.md",
+            "--token",
+            "tok-exp",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Export {
+                limit,
+                output,
+                token,
+                json,
+                ..
+            } => {
+                assert_eq!(limit, 150);
+                assert_eq!(output, Some(PathBuf::from("/tmp/transcript.md")));
+                assert_eq!(token.as_deref(), Some("tok-exp"));
+                assert!(json);
+            }
+            _ => panic!("expected Export command"),
+        }
+    }
+
+    #[test]
+    fn format_diff_table_patch_and_json_output() {
+        use t3_core::DiffFile;
+
+        let clean = DiffSummary {
+            workspace_path: PathBuf::from("/repo"),
+            branch: Some("main".into()),
+            clean: true,
+            total_additions: 0,
+            total_deletions: 0,
+            files: vec![],
+        };
+        assert_eq!(
+            format_diff_output(&clean, false),
+            "Workspace clean (branch: main).\n"
+        );
+
+        let dirty = DiffSummary {
+            workspace_path: PathBuf::from("/repo"),
+            branch: Some("feat/cli".into()),
+            clean: false,
+            total_additions: 12,
+            total_deletions: 3,
+            files: vec![
+                DiffFile {
+                    path: "crates/cli/src/main.rs".into(),
+                    status: "modified".into(),
+                    additions: 10,
+                    deletions: 3,
+                    patch: "@@ -1,3 +1,10 @@\n-old\n+new\n".into(),
+                },
+                DiffFile {
+                    path: "README.md".into(),
+                    status: "added".into(),
+                    additions: 2,
+                    deletions: 0,
+                    patch: String::new(),
+                },
+            ],
+        };
+
+        let table_only = format_diff_output(&dirty, false);
+        assert!(table_only.contains("Branch: feat/cli  Files: 2  +12 -3"));
+        assert!(table_only.contains("modified"));
+        assert!(table_only.contains("+10"));
+        assert!(table_only.contains("-3"));
+        assert!(table_only.contains("crates/cli/src/main.rs"));
+        assert!(table_only.contains("README.md"));
+        assert!(!table_only.contains("@@ -1,3 +1,10 @@"));
+
+        let with_patch = format_diff_output(&dirty, true);
+        assert!(with_patch.contains("--- crates/cli/src/main.rs (modified) ---"));
+        assert!(with_patch.contains("@@ -1,3 +1,10 @@"));
+        assert!(!with_patch.contains("--- README.md"));
+
+        let json_str = serde_json::to_string_pretty(&dirty).unwrap();
+        let parsed: Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["branch"], "feat/cli");
+        assert_eq!(parsed["total_additions"], 12);
+        assert_eq!(parsed["files"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn format_merge_result_handles_success_and_conflicts() {
+        let ok_payload = json!({
+            "merged": true,
+            "child_thread_id": "00000000-0000-0000-0000-000000000002",
+            "branch": "t3rs/child-1",
+            "summary": "Merged feature (abc1234)",
+            "conflict_files": [],
+            "cleaned_up": true
+        });
+        assert!(!merge_has_conflict(&ok_payload));
+        let ok_text = format_merge_result(&ok_payload);
+        assert!(ok_text.contains("Merged branch t3rs/child-1"));
+        assert!(ok_text.contains("Summary: Merged feature (abc1234)"));
+        assert!(ok_text.contains("Cleanup: cleaned up"));
+
+        let conflict_payload = json!({
+            "merged": false,
+            "child_thread_id": "00000000-0000-0000-0000-000000000002",
+            "branch": "t3rs/child-2",
+            "summary": "merge conflicted in 2 files",
+            "conflict_files": ["src/lib.rs", "Cargo.toml"],
+            "cleaned_up": false
+        });
+        assert!(merge_has_conflict(&conflict_payload));
+        let conflict_text = format_merge_result(&conflict_payload);
+        assert!(conflict_text.contains("Merge conflict on branch t3rs/child-2"));
+        assert!(conflict_text.contains("Conflict files:"));
+        assert!(conflict_text.contains("- src/lib.rs"));
+        assert!(conflict_text.contains("- Cargo.toml"));
+
+        let conflict_json = serde_json::to_string_pretty(&conflict_payload).unwrap();
+        let parsed: Value = serde_json::from_str(&conflict_json).unwrap();
+        assert_eq!(parsed["merged"], false);
+        assert_eq!(parsed["conflict_files"][0], "src/lib.rs");
+    }
+
+    #[test]
+    fn format_monitor_table_handles_idle_and_populated_snapshots() {
+        let idle = json!({
+            "active_runs": [],
+            "pending_requests": [],
+            "queued_thread_ids": [],
+            "active_shells": 0
+        });
+        assert_eq!(
+            format_monitor_table(&idle),
+            "Active runs: 0  Pending approvals: 0  Queued threads: 0  Active shells: 0\n"
+        );
+
+        let busy = json!({
+            "active_runs": [{
+                "thread_id": "00000000-0000-0000-0000-000000000001",
+                "project_id": "00000000-0000-0000-0000-000000000009",
+                "run_id": "00000000-0000-0000-0000-000000000010",
+                "title": "Refactor CLI commands",
+                "model_selection": { "provider": "claude", "model": "claude-sonnet-4-5" },
+                "status": "running",
+                "pending_count": 1
+            }],
+            "pending_requests": [{
+                "id": "00000000-0000-0000-0000-000000000020",
+                "thread_id": "00000000-0000-0000-0000-000000000001",
+                "run_id": "00000000-0000-0000-0000-000000000010",
+                "kind": "command_approval",
+                "title": "Run cargo test",
+                "payload": {},
+                "created_at": "2026-11-25T10:30:00Z"
+            }],
+            "queued_thread_ids": [
+                "00000000-0000-0000-0000-000000000030"
+            ],
+            "active_shells": 2
+        });
+        let out = format_monitor_table(&busy);
+        assert!(
+            out.contains(
+                "Active runs: 1  Pending approvals: 1  Queued threads: 1  Active shells: 2"
+            )
+        );
+        assert!(out.contains("claude/claude-sonnet-4-5"));
+        assert!(out.contains("Refactor CLI commands"));
+        assert!(out.contains("command_approval"));
+        assert!(out.contains("Run cargo test"));
+        assert!(out.contains("2026-11-25 10:30:00"));
+        assert!(out.contains("00000000-0000-0000-0000-000000000030"));
+
+        let json_str = serde_json::to_string_pretty(&busy).unwrap();
+        let parsed: Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["active_shells"], 2);
+        assert_eq!(parsed["queued_thread_ids"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn export_write_private_file_enforces_0600_and_truncates() {
+        let dir = std::env::temp_dir().join(format!("t3-cli-export-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("transcript.md");
+
+        write_private_file(&path, b"# Redacted Export\n\nSecret: [REDACTED]\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# Redacted Export\n\nSecret: [REDACTED]\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+
+            // Simulate a pre-existing file with looser permissions and verify tightening + truncation.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        write_private_file(&path, b"# Shorter\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# Shorter\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_export_markdown_calls_server_export_endpoint_and_writes_private_file() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let thread_id = Uuid::from_u128(7);
+        let expected_path = format!("/api/threads/{thread_id}/export");
+        let redacted_md = "# Server Export\n\n- Key: [REDACTED]\n";
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/markdown; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                redacted_md.len(),
+                redacted_md
+            );
+            stream.write_all(resp.as_bytes()).await.unwrap();
+            req
+        });
+
+        let dir = std::env::temp_dir().join(format!("t3-cli-run-export-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let out_path = dir.join("out.md");
+
+        let cli = Cli::try_parse_from([
+            "t3d",
+            "export",
+            &thread_id.to_string(),
+            "--url",
+            &format!("http://{addr}"),
+            "--token",
+            "export-tok",
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let code = run(cli).await.unwrap();
+        let req = server.await.unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(req.starts_with(&format!("GET {expected_path} HTTP/1.1\r\n")));
+        assert_eq!(fs::read_to_string(&out_path).unwrap(), redacted_md);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&out_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_export_json_calls_thread_detail_endpoint_and_writes_private_file() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let thread_id = Uuid::from_u128(8);
+        let expected_path = format!("/api/threads/{thread_id}?limit=25");
+        let detail_body = r#"{"thread":{"id":"00000000-0000-0000-0000-000000000008","title":"JSON Test"},"items":[]}"#;
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                detail_body.len(),
+                detail_body
+            );
+            stream.write_all(resp.as_bytes()).await.unwrap();
+            req
+        });
+
+        let dir = std::env::temp_dir().join(format!("t3-cli-run-export-json-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let out_path = dir.join("out.json");
+
+        let cli = Cli::try_parse_from([
+            "t3d",
+            "export",
+            &thread_id.to_string(),
+            "--url",
+            &format!("http://{addr}"),
+            "--limit",
+            "25",
+            "--json",
+            "-o",
+            out_path.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let code = run(cli).await.unwrap();
+        let req = server.await.unwrap();
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(req.starts_with(&format!("GET {expected_path} HTTP/1.1\r\n")));
+        let written: Value = serde_json::from_str(&fs::read_to_string(&out_path).unwrap()).unwrap();
+        assert_eq!(written["thread"]["title"], "JSON Test");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&out_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

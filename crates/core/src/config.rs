@@ -16,6 +16,8 @@ pub enum ConfigError {
     InvalidBearerToken,
     #[error("Non-loopback bind ({host}) is not allowed with auth mode '{mode}'")]
     UnsafeBindForAuth { host: String, mode: String },
+    #[error("Invalid runtime setting '{field}': {reason}")]
+    InvalidRuntimeSetting { field: &'static str, reason: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -93,8 +95,142 @@ impl Default for StorageConfig {
     }
 }
 
+pub const MAX_VERIFY_AUTO_FIXES: u32 = 10;
+pub const MAX_RATE_LIMIT_RETRIES: u32 = 10;
+pub const MAX_RATE_LIMIT_INITIAL_BACKOFF_SECS: u64 = 3600;
+
 fn default_verify_max_auto_fixes() -> u32 {
     2
+}
+
+/// Safe subset of `ServerConfig` that may be mutated live at runtime via the API/UI.
+/// Security-critical fields (`auth`, `host`, `port`, `data_dir`, `providers`, `storage`,
+/// `enabled_providers`) are intentionally excluded and require editing `config.toml` + restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RuntimeSettings {
+    pub default_model: ModelSelection,
+    pub follow_up_behavior: FollowUpBehavior,
+    pub auto_resume_limited_threads: bool,
+    pub rate_limit_max_retries: u32,
+    pub rate_limit_initial_backoff_secs: u64,
+    pub fallback_models: Vec<ModelSelection>,
+    pub verify_max_auto_fixes: u32,
+    pub antigravity_mcp_enabled: bool,
+    pub antigravity_quota_probe: bool,
+}
+
+impl Default for RuntimeSettings {
+    fn default() -> Self {
+        Self {
+            default_model: ModelSelection::default(),
+            follow_up_behavior: FollowUpBehavior::Steer,
+            auto_resume_limited_threads: true,
+            rate_limit_max_retries: 3,
+            rate_limit_initial_backoff_secs: 15,
+            fallback_models: Vec::new(),
+            verify_max_auto_fixes: default_verify_max_auto_fixes(),
+            antigravity_mcp_enabled: false,
+            antigravity_quota_probe: false,
+        }
+    }
+}
+
+/// Partial update payload for `RuntimeSettings`. Only `Some(...)` fields are modified.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeSettingsPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<ModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up_behavior: Option<FollowUpBehavior>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_resume_limited_threads: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_max_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_initial_backoff_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_models: Option<Vec<ModelSelection>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_max_auto_fixes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_mcp_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_quota_probe: Option<bool>,
+}
+
+impl RuntimeSettings {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.default_model.model.trim().is_empty() {
+            return Err(ConfigError::InvalidRuntimeSetting {
+                field: "default_model.model",
+                reason: "must not be empty".into(),
+            });
+        }
+        for (idx, fallback) in self.fallback_models.iter().enumerate() {
+            if fallback.model.trim().is_empty() {
+                return Err(ConfigError::InvalidRuntimeSetting {
+                    field: "fallback_models",
+                    reason: format!("entry {idx} model must not be empty"),
+                });
+            }
+        }
+        if self.verify_max_auto_fixes > MAX_VERIFY_AUTO_FIXES {
+            return Err(ConfigError::InvalidRuntimeSetting {
+                field: "verify_max_auto_fixes",
+                reason: format!("must be <= {MAX_VERIFY_AUTO_FIXES}"),
+            });
+        }
+        if self.rate_limit_max_retries > MAX_RATE_LIMIT_RETRIES {
+            return Err(ConfigError::InvalidRuntimeSetting {
+                field: "rate_limit_max_retries",
+                reason: format!("must be <= {MAX_RATE_LIMIT_RETRIES}"),
+            });
+        }
+        if self.rate_limit_initial_backoff_secs > MAX_RATE_LIMIT_INITIAL_BACKOFF_SECS {
+            return Err(ConfigError::InvalidRuntimeSetting {
+                field: "rate_limit_initial_backoff_secs",
+                reason: format!("must be <= {MAX_RATE_LIMIT_INITIAL_BACKOFF_SECS}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Atomically applies `patch` after validating all updated fields.
+    /// On error, `self` is left completely unchanged.
+    pub fn apply_patch(&mut self, patch: RuntimeSettingsPatch) -> Result<(), ConfigError> {
+        let mut candidate = self.clone();
+        if let Some(default_model) = patch.default_model {
+            candidate.default_model = default_model;
+        }
+        if let Some(follow_up_behavior) = patch.follow_up_behavior {
+            candidate.follow_up_behavior = follow_up_behavior;
+        }
+        if let Some(auto_resume_limited_threads) = patch.auto_resume_limited_threads {
+            candidate.auto_resume_limited_threads = auto_resume_limited_threads;
+        }
+        if let Some(rate_limit_max_retries) = patch.rate_limit_max_retries {
+            candidate.rate_limit_max_retries = rate_limit_max_retries;
+        }
+        if let Some(rate_limit_initial_backoff_secs) = patch.rate_limit_initial_backoff_secs {
+            candidate.rate_limit_initial_backoff_secs = rate_limit_initial_backoff_secs;
+        }
+        if let Some(fallback_models) = patch.fallback_models {
+            candidate.fallback_models = fallback_models;
+        }
+        if let Some(verify_max_auto_fixes) = patch.verify_max_auto_fixes {
+            candidate.verify_max_auto_fixes = verify_max_auto_fixes;
+        }
+        if let Some(antigravity_mcp_enabled) = patch.antigravity_mcp_enabled {
+            candidate.antigravity_mcp_enabled = antigravity_mcp_enabled;
+        }
+        if let Some(antigravity_quota_probe) = patch.antigravity_quota_probe {
+            candidate.antigravity_quota_probe = antigravity_quota_probe;
+        }
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +304,36 @@ impl ServerConfig {
 
     pub fn worktrees_dir(&self) -> PathBuf {
         self.data_dir.join("worktrees")
+    }
+
+    pub fn runtime_settings_path(&self) -> PathBuf {
+        self.data_dir.join("runtime_settings.json")
+    }
+
+    pub fn runtime_settings(&self) -> RuntimeSettings {
+        RuntimeSettings {
+            default_model: self.default_model.clone(),
+            follow_up_behavior: self.follow_up_behavior,
+            auto_resume_limited_threads: self.auto_resume_limited_threads,
+            rate_limit_max_retries: self.rate_limit_max_retries,
+            rate_limit_initial_backoff_secs: self.rate_limit_initial_backoff_secs,
+            fallback_models: self.fallback_models.clone(),
+            verify_max_auto_fixes: self.verify_max_auto_fixes,
+            antigravity_mcp_enabled: self.antigravity_mcp_enabled,
+            antigravity_quota_probe: self.antigravity_quota_probe,
+        }
+    }
+
+    pub fn apply_runtime_settings(&mut self, s: &RuntimeSettings) {
+        self.default_model = s.default_model.clone();
+        self.follow_up_behavior = s.follow_up_behavior;
+        self.auto_resume_limited_threads = s.auto_resume_limited_threads;
+        self.rate_limit_max_retries = s.rate_limit_max_retries;
+        self.rate_limit_initial_backoff_secs = s.rate_limit_initial_backoff_secs;
+        self.fallback_models = s.fallback_models.clone();
+        self.verify_max_auto_fixes = s.verify_max_auto_fixes;
+        self.antigravity_mcp_enabled = s.antigravity_mcp_enabled;
+        self.antigravity_quota_probe = s.antigravity_quota_probe;
     }
 
     pub fn antigravity_dir(&self) -> PathBuf {
@@ -403,5 +569,177 @@ mod tests {
         assert!(defaults.fallback_models.is_empty());
         assert_eq!(defaults.verify_max_auto_fixes, 2);
         assert!(!defaults.antigravity_mcp_enabled);
+    }
+
+    #[test]
+    fn server_config_runtime_settings_roundtrip_preserves_immutable_fields() {
+        let mut cfg = ServerConfig {
+            host: "0.0.0.0".into(),
+            port: 9001,
+            data_dir: PathBuf::from("/tmp/custom-t3-data"),
+            auth: AuthConfig::Bearer {
+                token: "super-secret-token-123456".into(),
+            },
+            ..Default::default()
+        };
+        let orig_claude_bin = cfg.providers.claude_bin.clone();
+        let orig_enabled = cfg.enabled_providers.clone();
+
+        let mut rt = cfg.runtime_settings();
+        assert_eq!(rt, RuntimeSettings::default());
+
+        rt.apply_patch(RuntimeSettingsPatch {
+            default_model: Some(ModelSelection {
+                provider: ProviderId::Codex,
+                model: "gpt-6.2-sol".into(),
+                effort: Some("medium".into()),
+                agent: None,
+            }),
+            follow_up_behavior: Some(FollowUpBehavior::Queue),
+            auto_resume_limited_threads: Some(false),
+            rate_limit_max_retries: Some(10),
+            rate_limit_initial_backoff_secs: Some(0),
+            fallback_models: Some(vec![ModelSelection {
+                provider: ProviderId::Antigravity,
+                model: "gemini-4-neon".into(),
+                effort: None,
+                agent: None,
+            }]),
+            verify_max_auto_fixes: Some(10),
+            antigravity_mcp_enabled: Some(true),
+            antigravity_quota_probe: Some(true),
+        })
+        .unwrap();
+
+        cfg.apply_runtime_settings(&rt);
+        assert_eq!(cfg.runtime_settings(), rt);
+        // Security-sensitive / static fields must remain completely untouched.
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.port, 9001);
+        assert_eq!(cfg.data_dir, PathBuf::from("/tmp/custom-t3-data"));
+        assert!(matches!(
+            cfg.auth,
+            AuthConfig::Bearer { ref token } if token == "super-secret-token-123456"
+        ));
+        assert_eq!(cfg.providers.claude_bin, orig_claude_bin);
+        assert_eq!(cfg.enabled_providers, orig_enabled);
+    }
+
+    #[test]
+    fn runtime_settings_apply_patch_validates_bounds_and_models_atomically() {
+        let mut rt = RuntimeSettings::default();
+        let initial = rt.clone();
+
+        // verify_max_auto_fixes > 10 rejected atomically
+        let err = rt
+            .apply_patch(RuntimeSettingsPatch {
+                verify_max_auto_fixes: Some(MAX_VERIFY_AUTO_FIXES + 1),
+                antigravity_mcp_enabled: Some(true),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidRuntimeSetting {
+                field: "verify_max_auto_fixes",
+                ..
+            }
+        ));
+        assert_eq!(rt, initial);
+
+        // rate_limit_max_retries > 10 rejected atomically
+        let err = rt
+            .apply_patch(RuntimeSettingsPatch {
+                rate_limit_max_retries: Some(MAX_RATE_LIMIT_RETRIES + 1),
+                antigravity_quota_probe: Some(true),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidRuntimeSetting {
+                field: "rate_limit_max_retries",
+                ..
+            }
+        ));
+        assert_eq!(rt, initial);
+
+        // rate_limit_initial_backoff_secs > max rejected
+        let err = rt
+            .apply_patch(RuntimeSettingsPatch {
+                rate_limit_initial_backoff_secs: Some(MAX_RATE_LIMIT_INITIAL_BACKOFF_SECS + 1),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidRuntimeSetting {
+                field: "rate_limit_initial_backoff_secs",
+                ..
+            }
+        ));
+        assert_eq!(rt, initial);
+
+        // Empty / whitespace default_model.model rejected
+        let err = rt
+            .apply_patch(RuntimeSettingsPatch {
+                default_model: Some(ModelSelection {
+                    provider: ProviderId::Claude,
+                    model: "   ".into(),
+                    effort: None,
+                    agent: None,
+                }),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidRuntimeSetting {
+                field: "default_model.model",
+                ..
+            }
+        ));
+        assert_eq!(rt, initial);
+
+        // Empty fallback_models entry rejected
+        let err = rt
+            .apply_patch(RuntimeSettingsPatch {
+                fallback_models: Some(vec![
+                    ModelSelection {
+                        provider: ProviderId::Codex,
+                        model: "gpt-6.2-sol".into(),
+                        effort: None,
+                        agent: None,
+                    },
+                    ModelSelection {
+                        provider: ProviderId::Antigravity,
+                        model: "".into(),
+                        effort: None,
+                        agent: None,
+                    },
+                ]),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidRuntimeSetting {
+                field: "fallback_models",
+                ..
+            }
+        ));
+        assert_eq!(rt, initial);
+    }
+
+    #[test]
+    fn runtime_settings_json_defaults_missing_fields() {
+        let parsed: RuntimeSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed, RuntimeSettings::default());
+        assert_eq!(
+            ServerConfig::default().runtime_settings_path(),
+            ServerConfig::default()
+                .data_dir
+                .join("runtime_settings.json")
+        );
     }
 }

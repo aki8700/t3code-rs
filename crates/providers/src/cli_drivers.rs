@@ -189,10 +189,11 @@ impl ProviderDriver for AntigravityDriver {
         req: TurnRequest,
         tx: mpsc::UnboundedSender<StreamEvent>,
     ) -> CoreResult<()> {
-        let mcp_enabled = self.mcp_enabled;
+        // Inject per-run MCP env vars whenever the coordinator supplies `req.mcp_injection`,
+        // allowing `antigravity_mcp_enabled` to toggle live without restarting the server.
         self.cli
             .run(self.provider_id(), req, tx, |cmd, req| {
-                antigravity_args(cmd, req, mcp_enabled)
+                antigravity_args(cmd, req, req.mcp_injection.is_some())
             })
             .await
     }

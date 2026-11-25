@@ -173,6 +173,7 @@ kbd { font: 500 11px/1 var(--font); color: var(--text-muted); border: 1px solid 
 .inp:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
 textarea.inp { resize: vertical; line-height: 1.6; }
 .inp.sm { min-height: 28px; padding: 3px 9px; font-size: 12.5px; }
+.inp.num { width: 120px; }
 
 /* segmented control */
 .seg { display: inline-flex; gap: 2px; padding: 2px; border-radius: 9px; background: color-mix(in srgb, var(--text) 6%, transparent); max-width: 100%; }
@@ -730,6 +731,14 @@ details[open] > summary > .s-chev .ic { transform: rotate(90deg); }
 .mp-embed .mp { height: 320px; }
 .form > .perm-panel { border: 1px solid var(--input); border-radius: 12px; }
 
+/* runtime settings: ordered fallback models */
+.fb-list { display: flex; flex-direction: column; gap: 6px; }
+.fb-row { display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 4px 8px; border: 1px solid var(--input); border-radius: 8px; background: var(--canvas); }
+.fb-row .fb-model { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; }
+.fb-add { display: flex; gap: 6px; }
+.fb-add select { flex: 0 0 128px; min-width: 0; }
+.fb-add .inp { flex: 1; min-width: 0; }
+
 .plist { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
 .pl-row { display: flex; align-items: center; gap: 11px; padding: 7px 0; }
 .pl-row + .pl-row { border-top: 1px solid var(--border); }
@@ -1079,6 +1088,7 @@ body.resizing-rail { cursor: col-resize !important; user-select: none; -webkit-u
 .ctx-stat b { font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .ctx-quick-acts { display: flex; gap: 6px; }
+.ctx-quick-acts + .ctx-quick-acts { margin-top: 6px; }
 .ctx-quick-acts .btn { flex: 1; font-size: 11.5px; }
 .ctx-quick-acts .btn .ic { width: 13px; height: 13px; }
 

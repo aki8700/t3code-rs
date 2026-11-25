@@ -23,6 +23,7 @@ pub struct RunCoordinator(pub(crate) Arc<Coordinator>);
 
 pub(crate) struct Coordinator {
     pub(crate) cfg: ServerConfig,
+    pub(crate) settings: crate::settings::SettingsStore,
     pub(crate) store: SqliteStore,
     pub(crate) git: GitManager,
     pub(crate) providers: ProviderRegistry,
@@ -137,12 +138,14 @@ impl RunCoordinator {
         injection: McpInjectionSpec,
         tokens: McpTokens,
     ) -> Self {
+        let settings = crate::settings::SettingsStore::in_memory(cfg.runtime_settings());
         Self::with_tokens_and_limits(
             cfg,
             store,
             injection,
             tokens,
             Arc::new(crate::limits::UsageLimitsCache::default()),
+            settings,
         )
     }
 
@@ -152,12 +155,14 @@ impl RunCoordinator {
         injection: McpInjectionSpec,
         tokens: McpTokens,
         limits: Arc<crate::limits::UsageLimitsCache>,
+        settings: crate::settings::SettingsStore,
     ) -> Self {
         let (events, _) = broadcast::channel(512);
         Self(Arc::new(Coordinator {
             git: GitManager::new(cfg.worktrees_dir()),
             providers: ProviderRegistry::from_config(&cfg),
             cfg,
+            settings,
             store,
             injection,
             tokens,
@@ -446,7 +451,10 @@ impl RunCoordinator {
         }
         if !swarm_command
             && let Some(run) = active.get(&id)
-            && message.behavior.unwrap_or(self.0.cfg.follow_up_behavior) == FollowUpBehavior::Steer
+            && message
+                .behavior
+                .unwrap_or(self.0.settings.get().follow_up_behavior)
+                == FollowUpBehavior::Steer
             && message.attachment_ids.is_empty()
             && message
                 .model_selection
@@ -733,7 +741,13 @@ impl RunCoordinator {
             .await?
             .map(|board| SwarmTurn::prepare(&board, thread.id, selection.provider, &mut prompt))
             .transpose()?;
-        let (mcp_token, mcp_injection) = if driver.supports_mcp() {
+        let live = self.0.settings.get();
+        let enable_mcp = if selection.provider == ProviderId::Antigravity {
+            live.antigravity_mcp_enabled
+        } else {
+            driver.supports_mcp()
+        };
+        let (mcp_token, mcp_injection) = if enable_mcp {
             let token = self.0.tokens.register(ActiveMcpToken {
                 thread_id: thread.id,
                 run_id,
@@ -971,13 +985,14 @@ impl RunCoordinator {
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         let result = {
+            let live = self.0.settings.get();
             let worker = run_turn_with_retry(
                 driver.clone(),
                 request,
                 tx,
-                self.0.cfg.auto_resume_limited_threads,
-                self.0.cfg.rate_limit_max_retries,
-                self.0.cfg.rate_limit_initial_backoff_secs,
+                live.auto_resume_limited_threads,
+                live.rate_limit_max_retries,
+                live.rate_limit_initial_backoff_secs,
             );
             tokio::pin!(worker);
             loop {
@@ -1144,7 +1159,7 @@ impl RunCoordinator {
             && let Some((fix_prompt, sig)) = verify_failure
         {
             verify_passed = false;
-            let max_fixes = self.0.cfg.verify_max_auto_fixes.min(10) as u8;
+            let max_fixes = self.0.settings.get().verify_max_auto_fixes.min(10) as u8;
             let made_progress = last_verify_signature.as_deref() != Some(sig.as_str());
             if verify_fix_depth < max_fixes && made_progress {
                 let next_depth = verify_fix_depth + 1;
@@ -1711,16 +1726,17 @@ impl RunCoordinator {
         start_index: u8,
     ) -> Option<(ModelSelection, u8)> {
         self.0
-            .cfg
+            .settings
+            .get()
             .fallback_models
-            .iter()
+            .into_iter()
             .enumerate()
             .skip(start_index as usize)
             .find(|(_, m)| {
                 !(m.provider == current.provider && m.model == current.model)
                     && self.0.providers.get(m.provider).is_some()
             })
-            .map(|(idx, m)| (m.clone(), (idx + 1).min(u8::MAX as usize) as u8))
+            .map(|(idx, m)| (m, (idx + 1).min(u8::MAX as usize) as u8))
     }
 }
 

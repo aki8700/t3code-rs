@@ -26,6 +26,7 @@ use uuid::Uuid;
 pub fn router(state: ServerState) -> Router {
     let api = Router::new()
         .route("/api/meta", get(meta))
+        .route("/api/settings", get(get_settings).patch(patch_settings))
         .route("/api/monitor", get(monitor))
         .route("/api/providers", get(providers))
         .route("/api/projects", get(projects).post(create_project))
@@ -41,6 +42,7 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/api/threads", get(threads).post(create_thread))
         .route("/api/threads/{id}", get(thread_detail).patch(patch_thread))
+        .route("/api/threads/{id}/export", get(export_thread))
         .route("/api/threads/{id}/messages", post(send_message))
         .route("/api/threads/{id}/exec", post(thread_exec))
         .route("/api/threads/{id}/exec/stream", post(thread_exec_stream))
@@ -161,11 +163,34 @@ async fn meta(
     State(state): State<ServerState>,
     Extension(identity): Extension<AuthIdentity>,
 ) -> Json<Value> {
+    let settings = state.settings.get();
+    let mut effective_cfg = (*state.config).clone();
+    effective_cfg.apply_runtime_settings(&settings);
     Json(json!({
         "version": VERSION, "auth_identity": identity, "telemetry_enabled": TELEMETRY_ENABLED,
-        "privacy": audit_privacy(&state.config), "follow_up_behavior": state.config.follow_up_behavior,
-        "default_model": state.config.default_model,
+        "privacy": audit_privacy(&effective_cfg), "follow_up_behavior": settings.follow_up_behavior,
+        "default_model": settings.default_model,
     }))
+}
+
+async fn get_settings(State(state): State<ServerState>) -> Json<Value> {
+    Json(json!({
+        "settings": state.settings.get(),
+        "enabled_providers": &state.config.enabled_providers,
+    }))
+}
+
+async fn patch_settings(
+    State(state): State<ServerState>,
+    Json(patch): Json<RuntimeSettingsPatch>,
+) -> ApiResult<Json<Value>> {
+    let settings = state
+        .settings
+        .patch(patch, &state.config.enabled_providers)?;
+    Ok(Json(json!({
+        "settings": settings,
+        "enabled_providers": &state.config.enabled_providers,
+    })))
 }
 
 async fn monitor(
@@ -382,6 +407,25 @@ async fn thread_detail(
         "queue": queue_items,
         "live": live,
     })))
+}
+
+async fn export_thread(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Response> {
+    let store = &state.store;
+    let thread = store.get_thread(id).await?;
+    let (runs, items) = tokio::try_join!(store.list_runs(id), store.list_turn_items(id, 5000, 0))?;
+    let markdown = crate::export::render_thread_markdown(&thread, &runs, &items);
+    let disposition = format!("attachment; filename=\"thread-{id}.md\"");
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/markdown; charset=utf-8"),
+            (header::CONTENT_DISPOSITION, disposition.as_str()),
+        ],
+        markdown,
+    )
+        .into_response())
 }
 
 async fn build_thread_context(

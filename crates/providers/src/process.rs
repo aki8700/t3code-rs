@@ -34,8 +34,11 @@ use uuid::Uuid;
 const STDERR_LIMIT: usize = 16 * 1024;
 const STDOUT_LINE_LIMIT: usize = 4 * 1024 * 1024;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_IDLE_STDOUT_TIMEOUT: Duration = Duration::from_secs(600);
-const IDLE_STDOUT_TIMEOUT_ENV: &str = "T3_IDLE_STDOUT_TIMEOUT_SECS";
+const DEFAULT_IDLE_STDOUT_TIMEOUT: Duration = Duration::from_secs(900);
+const MIN_IDLE_TIMEOUT_SECS: u64 = 60;
+const MAX_IDLE_TIMEOUT_SECS: u64 = 3600;
+const IDLE_TIMEOUT_ENV: &str = "T3_IDLE_TIMEOUT_SECS";
+const LEGACY_IDLE_STDOUT_TIMEOUT_ENV: &str = "T3_IDLE_STDOUT_TIMEOUT_SECS";
 
 /// Messages written to a streaming provider's stdin while the turn is open.
 enum StdinMsg {
@@ -361,13 +364,17 @@ fn send_stdin(active: &ActiveRunMap, run_id: Uuid, msg: StdinMsg) -> bool {
         .is_some_and(|tx| tx.send(msg).is_ok())
 }
 
-fn configured_idle_stdout_timeout() -> Duration {
-    std::env::var(IDLE_STDOUT_TIMEOUT_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|&secs| secs > 0)
-        .map(Duration::from_secs)
+fn parse_idle_timeout(val: Option<&str>) -> Duration {
+    val.and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|secs| Duration::from_secs(secs.clamp(MIN_IDLE_TIMEOUT_SECS, MAX_IDLE_TIMEOUT_SECS)))
         .unwrap_or(DEFAULT_IDLE_STDOUT_TIMEOUT)
+}
+
+fn configured_idle_timeout() -> Duration {
+    let raw = std::env::var(IDLE_TIMEOUT_ENV)
+        .ok()
+        .or_else(|| std::env::var(LEGACY_IDLE_STDOUT_TIMEOUT_ENV).ok());
+    parse_idle_timeout(raw.as_deref())
 }
 
 pub(crate) async fn run_turn(
@@ -387,7 +394,7 @@ pub(crate) async fn run_turn(
         input,
         secret,
         tx,
-        configured_idle_stdout_timeout(),
+        configured_idle_timeout(),
     )
     .await
 }
@@ -1588,5 +1595,50 @@ fi
             payload: json!({}),
         };
         assert!(!send_control_response(&active, Uuid::new_v4(), &resp));
+    }
+}
+
+#[cfg(test)]
+mod idle_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn default_idle_timeout_is_fifteen_minutes() {
+        assert_eq!(DEFAULT_IDLE_STDOUT_TIMEOUT, Duration::from_secs(900));
+    }
+
+    #[test]
+    fn parse_idle_timeout_falls_back_when_unset_or_invalid() {
+        for raw in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("not-a-number"),
+            Some("-60"),
+            Some("120.5"),
+            Some("18446744073709551616"),
+        ] {
+            assert_eq!(
+                parse_idle_timeout(raw),
+                DEFAULT_IDLE_STDOUT_TIMEOUT,
+                "expected default for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_idle_timeout_parses_and_clamps_range() {
+        assert_eq!(parse_idle_timeout(Some("0")), Duration::from_secs(60));
+        assert_eq!(parse_idle_timeout(Some("15")), Duration::from_secs(60));
+        assert_eq!(parse_idle_timeout(Some("59")), Duration::from_secs(60));
+        assert_eq!(parse_idle_timeout(Some("60")), Duration::from_secs(60));
+        assert_eq!(parse_idle_timeout(Some("300")), Duration::from_secs(300));
+        assert_eq!(
+            parse_idle_timeout(Some(" 1200 \n")),
+            Duration::from_secs(1200)
+        );
+        assert_eq!(parse_idle_timeout(Some("3600")), Duration::from_secs(3600));
+        assert_eq!(parse_idle_timeout(Some("3601")), Duration::from_secs(3600));
+        assert_eq!(parse_idle_timeout(Some("99999")), Duration::from_secs(3600));
     }
 }

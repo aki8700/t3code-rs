@@ -23,7 +23,7 @@ A zero-telemetry, privacy-hardened Rust rewrite of [T3 Code](https://github.com/
   - Type `@` for workspace file path completion, or `!<command>` (or `/sh <command>`) to stream shell output live over WebSocket (`POST /api/threads/{id}/exec/stream`) with instant cancel (`POST /api/exec/{exec_id}/cancel`), zero-telemetry env isolation, bounded output, process-group timeout cleanup, and persistent timeline recording.
 - **Safe Harness Guardrails, Auto-Fix Verification, Worktree Merge & Multi-Thread Monitor**
   - Automatic pre-turn Git tree checkpoints with one-click per-turn **Rollback**, **Stage / Discard / Commit** actions inside the Diff panel, worktree child thread **Diff-vs-Parent & Merge** (`task_diff` / `task_merge` MCP tools + HTTP + UI), and post-turn `verify_command` **auto-fix loops** (detecting changes via Git tree diff, cancelling cleanly, stopping on no-progress).
-  - Interactive Claude `stream-json` tool approval relay (`control_request` / `control_response`), quota-exhausted automatic provider fallback (`fallback_models`), `compaction_econ` context compaction advisor, zero-secret Antigravity (`agy`) native MCP (`t3d setup-agy-mcp` + per-run env vars), multi-thread active monitor (`/monitor` & `GET /api/monitor`), repeated tool-loop & idle-turn watchdogs, native macOS notifications & Dock bounce, and CLI thread control (`t3d threads / send / interrupt / limits`).
+  - Interactive Claude `stream-json` tool approval relay (`control_request` / `control_response`), quota-exhausted automatic provider fallback (`fallback_models`), `compaction_econ` context compaction advisor, zero-secret Antigravity (`agy`) native MCP (`t3d setup-agy-mcp` + per-run env vars), multi-thread active monitor (`/monitor` & `GET /api/monitor`), repeated tool-loop & configurable idle-turn watchdogs (`T3_IDLE_TIMEOUT_SECS`, default `900s`), live runtime settings (`GET/PATCH /api/settings`), redacted thread Markdown export (`GET /api/threads/{id}/export`), native macOS notifications & Dock bounce, and CLI thread & workspace operations (`t3d threads / send / interrupt / limits / diff / merge / monitor / export`).
 - **Usage & Quota Limits Dashboard (`⌘U`)**
   - Interactive daily/hourly cost & token charts, cache hit rates, model rankings, DB compression stats, and pooled provider quota limits (Claude, Codex with reset-credit redemption, and Antigravity).
 - **Ultra-Low Memory & Storage Footprint**
@@ -116,6 +116,7 @@ t3d import-history                          # Full read-only thread history impo
 t3d mcp                                     # Stdio MCP bridge to running t3d server (supports T3_SERVER_URL / T3_THREAD_ID env)
 t3d setup-agy-mcp [--url ...] [--dry-run]   # Register/remove zero-secret static MCP entry in Antigravity (`agy`)
 t3d threads / send / interrupt / limits     # Inspect threads, send messages, interrupt runs, and view provider quota limits
+t3d diff / merge / monitor / export         # Inspect workspace diffs, merge child worktrees, monitor active runs, and export redacted Markdown (`-o` writes 0600)
 t3d launchd-plist --port 3774               # Generate macOS LaunchAgent plist
 ```
 

@@ -8,7 +8,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use t3_core::{CoreError, CoreResult};
+use t3_core::{CoreError, CoreResult, DiffSummary};
 use tokio::{
     io::AsyncWriteExt,
     sync::{Mutex, mpsc},
@@ -86,6 +86,64 @@ pub async fn usage_limits(
     send_json(req).await
 }
 
+/// Fetches the workspace diff summary for a thread from `GET /api/threads/{id}/diff`.
+pub async fn get_thread_diff(
+    server_url: &str,
+    token: Option<&str>,
+    thread_id: Uuid,
+    ignore_whitespace: bool,
+) -> CliResult<DiffSummary> {
+    let url = thread_diff_url(server_url, thread_id, ignore_whitespace)?;
+    let req = with_bearer_auth(http_client()?.get(url).timeout(API_TIMEOUT), token);
+    let response = ensure_success(req.send().await?).await?;
+    Ok(response.json().await?)
+}
+
+/// Merges a child worktree thread into its parent via `POST /api/threads/{parent_id}/children/{child_id}/merge`.
+pub async fn merge_child_worktree(
+    server_url: &str,
+    token: Option<&str>,
+    parent_id: Uuid,
+    child_id: Uuid,
+    commit_message: Option<&str>,
+    cleanup: bool,
+) -> CliResult<Value> {
+    let url = merge_child_worktree_url(server_url, parent_id, child_id)?;
+    let body = merge_child_worktree_body(commit_message, cleanup);
+    let req = with_bearer_auth(http_client()?.post(url).timeout(LIMITS_TIMEOUT), token).json(&body);
+    send_json(req).await
+}
+
+/// Queries active runs, pending approvals, queued threads, and active shells from `GET /api/monitor`.
+pub async fn get_monitor(server_url: &str, token: Option<&str>) -> CliResult<Value> {
+    let url = monitor_url(server_url)?;
+    let req = with_bearer_auth(http_client()?.get(url).timeout(API_TIMEOUT), token);
+    send_json(req).await
+}
+
+/// Fetches thread metadata and transcript items from `GET /api/threads/{id}`.
+pub async fn get_thread_detail(
+    server_url: &str,
+    token: Option<&str>,
+    thread_id: Uuid,
+    limit: usize,
+) -> CliResult<Value> {
+    let url = thread_detail_url(server_url, thread_id, limit)?;
+    let req = with_bearer_auth(http_client()?.get(url).timeout(API_TIMEOUT), token);
+    send_json(req).await
+}
+
+/// Exports a redacted Markdown transcript for a thread from `GET /api/threads/{id}/export`.
+pub async fn export_thread_markdown(
+    server_url: &str,
+    token: Option<&str>,
+    thread_id: Uuid,
+) -> CliResult<String> {
+    let url = thread_export_url(server_url, thread_id)?;
+    let req = with_bearer_auth(http_client()?.get(url).timeout(API_TIMEOUT), token);
+    send_text(req).await
+}
+
 fn with_bearer_auth(req: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
     match resolve_token(token, env::var(BEARER_TOKEN_ENV).ok().as_deref()) {
         Some(token) => req.bearer_auth(token),
@@ -107,9 +165,24 @@ fn send_message_body(prompt: &str, behavior: Option<&str>) -> Value {
     }
 }
 
+fn merge_child_worktree_body(commit_message: Option<&str>, cleanup: bool) -> Value {
+    match commit_message {
+        Some(commit_message) => json!({
+            "commit_message": commit_message,
+            "cleanup": cleanup,
+        }),
+        None => json!({ "cleanup": cleanup }),
+    }
+}
+
 async fn send_json(req: reqwest::RequestBuilder) -> CliResult<Value> {
     let response = ensure_success(req.send().await?).await?;
     Ok(response.json().await?)
+}
+
+async fn send_text(req: reqwest::RequestBuilder) -> CliResult<String> {
+    let response = ensure_success(req.send().await?).await?;
+    Ok(response.text().await?)
 }
 
 async fn send_empty(req: reqwest::RequestBuilder) -> CliResult<()> {
@@ -159,6 +232,37 @@ fn usage_limits_url(server_url: &str, refresh: bool) -> CliResult<Url> {
         url.query_pairs_mut().append_pair("refresh", "true");
     }
     Ok(url)
+}
+
+fn thread_diff_url(server_url: &str, thread_id: Uuid, ignore_whitespace: bool) -> CliResult<Url> {
+    let mut url = endpoint(server_url, &format!("api/threads/{thread_id}/diff"))?;
+    url.query_pairs_mut().append_pair(
+        "ignore_whitespace",
+        if ignore_whitespace { "true" } else { "false" },
+    );
+    Ok(url)
+}
+
+fn merge_child_worktree_url(server_url: &str, parent_id: Uuid, child_id: Uuid) -> CliResult<Url> {
+    endpoint(
+        server_url,
+        &format!("api/threads/{parent_id}/children/{child_id}/merge"),
+    )
+}
+
+fn monitor_url(server_url: &str) -> CliResult<Url> {
+    endpoint(server_url, "api/monitor")
+}
+
+fn thread_detail_url(server_url: &str, thread_id: Uuid, limit: usize) -> CliResult<Url> {
+    let mut url = endpoint(server_url, &format!("api/threads/{thread_id}"))?;
+    url.query_pairs_mut()
+        .append_pair("limit", &limit.to_string());
+    Ok(url)
+}
+
+fn thread_export_url(server_url: &str, thread_id: Uuid) -> CliResult<Url> {
+    endpoint(server_url, &format!("api/threads/{thread_id}/export"))
 }
 
 pub async fn run_stdio_bridge(
@@ -485,6 +589,177 @@ mod tests {
         assert_eq!(
             send_message_body("hi", Some("queue")),
             json!({ "prompt": "hi", "behavior": "queue" })
+        );
+    }
+
+    #[test]
+    fn tier5_urls_format_paths_and_queries() {
+        let parent_id = Uuid::nil();
+        let child_id = Uuid::from_u128(1);
+
+        assert_eq!(
+            thread_diff_url("http://127.0.0.1:3774", parent_id, true)
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3774/api/threads/00000000-0000-0000-0000-000000000000/diff?ignore_whitespace=true"
+        );
+        assert_eq!(
+            thread_diff_url("https://example.com/t3/", parent_id, false)
+                .unwrap()
+                .as_str(),
+            "https://example.com/t3/api/threads/00000000-0000-0000-0000-000000000000/diff?ignore_whitespace=false"
+        );
+        assert_eq!(
+            merge_child_worktree_url("http://127.0.0.1:3774", parent_id, child_id)
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3774/api/threads/00000000-0000-0000-0000-000000000000/children/00000000-0000-0000-0000-000000000001/merge"
+        );
+        assert_eq!(
+            merge_child_worktree_url("http://127.0.0.1:3774/prefix/", parent_id, child_id)
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3774/prefix/api/threads/00000000-0000-0000-0000-000000000000/children/00000000-0000-0000-0000-000000000001/merge"
+        );
+        assert_eq!(
+            monitor_url("http://127.0.0.1:3774").unwrap().as_str(),
+            "http://127.0.0.1:3774/api/monitor"
+        );
+        assert_eq!(
+            monitor_url("https://example.com/t3/").unwrap().as_str(),
+            "https://example.com/t3/api/monitor"
+        );
+        assert_eq!(
+            thread_detail_url("http://127.0.0.1:3774", parent_id, 500)
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3774/api/threads/00000000-0000-0000-0000-000000000000?limit=500"
+        );
+        assert_eq!(
+            thread_detail_url("http://127.0.0.1:3774/sub", child_id, 120)
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3774/sub/api/threads/00000000-0000-0000-0000-000000000001?limit=120"
+        );
+        assert_eq!(
+            thread_export_url("http://127.0.0.1:3774", parent_id)
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3774/api/threads/00000000-0000-0000-0000-000000000000/export"
+        );
+        assert_eq!(
+            thread_export_url("https://example.com/t3/", child_id)
+                .unwrap()
+                .as_str(),
+            "https://example.com/t3/api/threads/00000000-0000-0000-0000-000000000001/export"
+        );
+
+        assert!(thread_diff_url("ftp://127.0.0.1:3774", parent_id, true).is_err());
+        assert!(
+            merge_child_worktree_url("http://user:pw@127.0.0.1:3774", parent_id, child_id).is_err()
+        );
+        assert!(monitor_url("http://127.0.0.1:3774?x=1").is_err());
+        assert!(thread_detail_url("http://127.0.0.1:3774#frag", parent_id, 50).is_err());
+        assert!(thread_export_url("http://user:pw@127.0.0.1:3774", parent_id).is_err());
+        assert!(thread_export_url("http://127.0.0.1:3774?x=1", parent_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn export_thread_markdown_sends_bearer_auth_and_returns_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let thread_id = Uuid::from_u128(42);
+        let expected_path = format!("/api/threads/{thread_id}/export");
+        let expected_body = "# Exported Thread\n\n- Token: [REDACTED]\n";
+        let secret_token = "t3-super-secret-token";
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let req_text = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/markdown; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                expected_body.len(),
+                expected_body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            req_text
+        });
+
+        let server_url = format!("http://{addr}");
+        let markdown = export_thread_markdown(&server_url, Some(secret_token), thread_id)
+            .await
+            .unwrap();
+        let req_text = server.await.unwrap();
+
+        assert_eq!(markdown, expected_body);
+        assert!(req_text.starts_with(&format!("GET {expected_path} HTTP/1.1\r\n")));
+        assert!(req_text.lines().any(|line| {
+            line.eq_ignore_ascii_case(&format!("authorization: Bearer {secret_token}"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn export_thread_markdown_errors_without_leaking_bearer_token() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let thread_id = Uuid::from_u128(99);
+        let secret_token = "t3-do-not-log-this-token";
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await.unwrap();
+            let body = r#"{"error":"unauthorized"}"#;
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let err = export_thread_markdown(&format!("http://{addr}"), Some(secret_token), thread_id)
+            .await
+            .unwrap_err()
+            .to_string();
+        server.await.unwrap();
+
+        assert!(err.contains("401"));
+        assert!(err.contains("unauthorized"));
+        assert!(!err.contains(secret_token));
+    }
+
+    #[test]
+    fn merge_child_worktree_body_serializes_optional_commit_message_and_cleanup() {
+        assert_eq!(
+            merge_child_worktree_body(None, true),
+            json!({ "cleanup": true })
+        );
+        assert_eq!(
+            merge_child_worktree_body(None, false),
+            json!({ "cleanup": false })
+        );
+        assert_eq!(
+            merge_child_worktree_body(Some("Merge feature branch"), true),
+            json!({
+                "commit_message": "Merge feature branch",
+                "cleanup": true
+            })
+        );
+        assert_eq!(
+            merge_child_worktree_body(Some("Keep worktree"), false),
+            json!({
+                "commit_message": "Keep worktree",
+                "cleanup": false
+            })
         );
     }
 }

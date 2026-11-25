@@ -2298,6 +2298,10 @@ async function executeSlashCommand(parsed) {
       else { S.compose.mode = next; renderComposer(); toast(`実行権限を「${MODE_LABEL[next]}」に変更しました`, 'ok', 2000); }
       return { handled: true };
     }
+    case 'settings':
+      clearInput();
+      settingsDialog();
+      return { handled: true };
     case 'diff': {
       clearInput();
       const v = arg.toLowerCase();
@@ -2358,6 +2362,10 @@ async function executeSlashCommand(parsed) {
       clearInput();
       await patchThread(t.id, { archived: !t.archived });
       toast(t.archived ? 'アーカイブを解除しました' : 'アーカイブしました', 'ok', 1800);
+      return { handled: true };
+    case 'export':
+      clearInput();
+      downloadThreadMarkdown(t);
       return { handled: true };
     case 'search':
       clearInput();
@@ -2754,6 +2762,119 @@ function projectEditDialog(p, refreshList) {
     field('編集後の自動検証コマンド', verify, '編集ターン完了後に自動実行します。空欄で無効。'),
     h('div', { class: 'actions' }, go)));
     setTimeout(() => title.focus(), 0);
+  }, { cls: 'form-modal' });
+}
+
+/** Runtime settings (GET/PATCH /api/settings). Opened from the sidebar and `/settings`. */
+async function settingsDialog() {
+  let data;
+  try {
+    data = await api('/api/settings');
+  } catch (e) {
+    toast(`設定を読み込めません: ${e.message}`, 'err');
+    return;
+  }
+  const orig = data?.settings || data || {};
+  const enabled = Array.isArray(data?.enabled_providers) && data.enabled_providers.length
+    ? data.enabled_providers
+    : (S.providers.length ? S.providers.map((p) => p.provider) : PROVIDER_FALLBACK);
+  // Normalize once so the "changed?" comparison below is not fooled by null effort/agent.
+  const normFallback = (m) => ({ provider: m.provider, model: m.model, ...(m.effort ? { effort: m.effort } : {}), ...(m.agent ? { agent: m.agent } : {}) });
+  const origFallbacks = Array.isArray(orig.fallback_models) ? orig.fallback_models.map(normFallback) : [];
+  const normNum = (v, fb) => { const n = Math.round(Number(v)); return Number.isFinite(n) ? Math.min(10, Math.max(0, n)) : fb; };
+  const origBehavior = orig.follow_up_behavior === 'queue' ? 'queue' : 'steer';
+  const origFixes = normNum(orig.verify_max_auto_fixes, 2);
+  const origResume = orig.auto_resume_limited_threads !== false;
+  const origRetries = normNum(orig.rate_limit_max_retries, 3);
+  const origMcp = orig.antigravity_mcp_enabled === true;
+  const origProbe = orig.antigravity_quota_probe === true;
+
+  let behavior = origBehavior;
+  let modelChanged = false;
+  let fallbacks = origFallbacks.map((m) => ({ ...m }));
+  const picker = modelPanel({ value: orig.default_model || defaultSelection(S.projectId), onChange: () => { modelChanged = true; } });
+  const behaviorSeg = segmented([
+    ['steer', '割り込み', '実行中のターンに割り込んで指示を送る'],
+    ['queue', 'キュー', '現在のターン終了後に送る'],
+  ], behavior, (v) => { behavior = v; }, { label: '実行中メッセージの既定動作' });
+  const fixesInp = h('input', { class: 'inp num', type: 'number', min: 0, max: 10, step: 1, inputmode: 'numeric', value: String(origFixes), 'aria-label': '検証失敗時の自動修正上限' });
+  const retriesInp = h('input', { class: 'inp num', type: 'number', min: 0, max: 10, step: 1, inputmode: 'numeric', value: String(origRetries), 'aria-label': '最大リトライ回数' });
+  const resumeChk = h('input', { type: 'checkbox', checked: origResume, 'aria-label': 'レート制限時の自動再開' });
+  const mcpChk = h('input', { type: 'checkbox', checked: origMcp, 'aria-label': 'Antigravity ネイティブ MCP 注入' });
+  const probeChk = h('input', { type: 'checkbox', checked: origProbe, 'aria-label': 'Antigravity クォータ直接照会' });
+
+  // Ordered fallback models: provider select + model id input to add, ↑ / ↓ / 削除 per row.
+  const fbList = h('div', { class: 'fb-list' });
+  const renderFallbacks = () => {
+    fbList.replaceChildren(
+      ...fallbacks.map((m, i) => h('div', { class: 'fb-row' },
+        provDot(m.provider),
+        h('span', { class: 'fb-model', text: `${provLabel(m.provider)} / ${m.model}` }),
+        h('button', { type: 'button', class: 'btn xs', text: '↑', title: '上に移動', 'aria-label': `${m.model} を上に移動`, disabled: i === 0, onclick: () => { [fallbacks[i - 1], fallbacks[i]] = [fallbacks[i], fallbacks[i - 1]]; renderFallbacks(); } }),
+        h('button', { type: 'button', class: 'btn xs', text: '↓', title: '下に移動', 'aria-label': `${m.model} を下に移動`, disabled: i === fallbacks.length - 1, onclick: () => { [fallbacks[i], fallbacks[i + 1]] = [fallbacks[i + 1], fallbacks[i]]; renderFallbacks(); } }),
+        h('button', { type: 'button', class: 'btn xs danger-ghost', text: '削除', 'aria-label': `${m.model} を削除`, onclick: () => { fallbacks.splice(i, 1); renderFallbacks(); } }))),
+      fallbacks.length ? null : h('p', { class: 'muted', text: 'フォールバックモデルはありません' }));
+  };
+  renderFallbacks();
+  const fbProv = h('select', { class: 'inp sm', 'aria-label': 'フォールバックのプロバイダ' }, enabled.map((id) => h('option', { value: id, text: provLabel(id) })));
+  const fbModel = h('input', { class: 'inp sm mono', placeholder: 'モデル ID（例: gpt-6-sol）', autocapitalize: 'off', spellcheck: false, 'aria-label': 'フォールバックのモデル' });
+  const fbAdd = h('button', {
+    type: 'button', class: 'btn sm', text: '追加',
+    onclick: () => {
+      const model = fbModel.value.trim();
+      if (!model) { fbModel.focus(); return; }
+      fallbacks.push({ provider: fbProv.value, model });
+      fbModel.value = '';
+      renderFallbacks();
+    },
+  });
+
+  openModal('ランタイム設定', (body, close) => {
+    const go = h('button', { class: 'btn primary', type: 'submit', text: '保存' });
+    body.append(h('form', {
+      class: 'form',
+      onsubmit: async (e) => {
+        e.preventDefault(); if (e.submitter !== go) return;
+        go.disabled = true;
+        // Partial update: only fields that changed from the loaded values are sent.
+        const patch = {};
+        if (modelChanged) patch.default_model = picker.get();
+        if (behavior !== origBehavior) patch.follow_up_behavior = behavior;
+        const fixes = normNum(fixesInp.value, origFixes);
+        if (fixes !== origFixes) patch.verify_max_auto_fixes = fixes;
+        if (resumeChk.checked !== origResume) patch.auto_resume_limited_threads = resumeChk.checked;
+        const retries = normNum(retriesInp.value, origRetries);
+        if (retries !== origRetries) patch.rate_limit_max_retries = retries;
+        if (JSON.stringify(fallbacks) !== JSON.stringify(origFallbacks)) patch.fallback_models = fallbacks;
+        if (mcpChk.checked !== origMcp) patch.antigravity_mcp_enabled = mcpChk.checked;
+        if (probeChk.checked !== origProbe) patch.antigravity_quota_probe = probeChk.checked;
+        if (!Object.keys(patch).length) { close(); toast('変更はありません', '', 1800); return; }
+        try {
+          await api('/api/settings', { method: 'PATCH', json: patch });
+          if (patch.default_model !== undefined || patch.follow_up_behavior !== undefined) {
+            S.meta = {
+              ...(S.meta || {}),
+              ...(patch.default_model !== undefined ? { default_model: patch.default_model } : {}),
+              ...(patch.follow_up_behavior !== undefined ? { follow_up_behavior: patch.follow_up_behavior } : {}),
+            };
+          }
+          if (patch.follow_up_behavior !== undefined && !ls.get('t3.behavior', '')) S.behavior = patch.follow_up_behavior;
+          close();
+          toast('設定を保存しました（即時反映）', 'ok');
+          renderComposer();
+        } catch (err) { go.disabled = false; toast(`保存に失敗: ${err.message}`, 'err'); }
+      },
+    },
+    field('既定モデル', h('div', { class: 'mp-embed' }, picker.el)),
+    field('実行中メッセージの既定動作', behaviorSeg, '実行中に新しいメッセージを送ったときの動作。割り込みは現在のターンを止めて指示を送り、キューはターン終了後に送ります。'),
+    field('検証失敗時の自動修正上限', fixesInp, '検証が失敗したときに自動で修正を試みる回数の上限（0〜10）。'),
+    field('レート制限時の自動再開', h('label', { class: 'switch' }, resumeChk, h('i'), h('span', { text: 'レート制限で停止したスレッドを自動で再開する' }))),
+    field('最大リトライ回数', retriesInp, 'レート制限時の自動再開の回数上限（0〜10）。'),
+    field('クォータ枯渇時のフォールバックモデル', h('div', { class: 'stack' }, fbList, h('div', { class: 'fb-add' }, fbProv, fbModel, fbAdd)), 'プロバイダのクォータが枯渇したときに上から順に試します。'),
+    field('Antigravity MCP', h('label', { class: 'switch' }, mcpChk, h('i'), h('span', { text: 'ネイティブ MCP 注入を有効にする' })), '有効にする前に `t3d setup-agy-mcp` で MCP 連携を設定してください。'),
+    field('Antigravity クォータ照会', h('label', { class: 'switch' }, probeChk, h('i'), h('span', { text: 'Antigravity のクォータを直接照会する' }))),
+    h('div', { class: 'actions' }, go)));
+    setTimeout(() => picker.search.focus(), 0);
   }, { cls: 'form-modal' });
 }
 
@@ -3813,6 +3934,42 @@ function renderContextChanges(t) {
       files.length > shown.length ? h('button', { type: 'button', class: 'ctx-more-btn', text: `他 ${files.length - shown.length} 件を差分で表示 →`, onclick: () => setRail('diff') }) : null));
 }
 
+/** Thread title -> safe `.md` download name (falls back to the thread id prefix). */
+function safeMdFilename(title, id) {
+  const s = cleanTitle(title || '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '').trim()
+    .replace(/\s+/g, '-').replace(/-+/g, '-').slice(0, 80).replace(/^[.-]+|[.-]+$/g, '');
+  return `${s || `thread-${String(id).slice(0, 8)}`}.md`;
+}
+
+/** GET /api/threads/:id/export (server redacts credentials) and download it as Markdown. */
+async function downloadThreadMarkdown(t) {
+  if (!t) return;
+  try {
+    const md = await api(`/api/threads/${t.id}/export`);
+    const url = URL.createObjectURL(new Blob([md], { type: 'text/markdown; charset=utf-8' }));
+    const a = h('a', { href: url, download: safeMdFilename(t.title, t.id) });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    toast('Markdown をダウンロードしました', 'ok', 2000);
+  } catch (e) {
+    toast(`Markdown 出力に失敗: ${e.message}`, 'err');
+  }
+}
+
+/** GET /api/threads/:id/export and copy the Markdown to the clipboard. */
+async function copyThreadMarkdown(t) {
+  if (!t) return;
+  try {
+    const md = await api(`/api/threads/${t.id}/export`);
+    await copyText(md, 'Markdown をコピーしました');
+  } catch (e) {
+    toast(`Markdown コピーに失敗: ${e.message}`, 'err');
+  }
+}
+
 function renderContextPanel() {
   const body = $('#context-body');
   if (!body) return;
@@ -3920,7 +4077,10 @@ function renderContextPanel() {
     statsGrid,
     h('div', { class: 'ctx-quick-acts' },
       h('button', { type: 'button', class: 'btn xs', onclick: forkDialog }, iconEl('fork'), h('span', { text: '文脈を分岐' })),
-      h('button', { type: 'button', class: 'btn xs', onclick: () => usageDialog('model') }, iconEl('chart'), h('span', { text: '使用量詳細' })))));
+      h('button', { type: 'button', class: 'btn xs', onclick: () => usageDialog('model') }, iconEl('chart'), h('span', { text: '使用量詳細' }))),
+    h('div', { class: 'ctx-quick-acts' },
+      h('button', { type: 'button', class: 'btn xs', onclick: () => downloadThreadMarkdown(t) }, iconEl('file'), h('span', { text: 'Markdown 出力' })),
+      h('button', { type: 'button', class: 'btn xs', onclick: () => copyThreadMarkdown(t) }, iconEl('copy'), h('span', { text: 'MD コピー' })))));
 
   // ── 1b. Compaction recommendation (Tier 4 Item 4)
   {
@@ -4766,6 +4926,7 @@ function wire() {
   $('#btn-search').onclick = searchDialog;
   $('#btn-sb-search').onclick = searchDialog;
   $('#btn-usage').onclick = () => usageDialog();
+  $('#btn-settings').onclick = () => settingsDialog();
   $('#btn-top-usage').onclick = () => usageDialog();
   $('#btn-monitor').onclick = () => monitorDialog();
   $('#stat-pill').onclick = (e) => usageDialog(e.target.closest('[data-utab]')?.dataset.utab || 'model');

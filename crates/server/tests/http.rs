@@ -2410,3 +2410,249 @@ esac
     assert_eq!(fb_runs[1]["provider"], "mock");
     assert_eq!(fb_runs[1]["status"], "completed");
 }
+
+#[tokio::test]
+async fn tier5_settings_get_patch_persistence_validation_and_live_meta() {
+    let tmp = TempDir::new();
+    let make_cfg = || ServerConfig {
+        data_dir: tmp.0.join("server"),
+        enabled_providers: vec![ProviderId::Mock, ProviderId::Claude],
+        default_model: t3_core::ModelSelection {
+            provider: ProviderId::Mock,
+            model: "mock".into(),
+            effort: None,
+            agent: None,
+        },
+        auth: AuthConfig::LocalOnly,
+        ..Default::default()
+    };
+
+    {
+        let state = ServerState::new(make_cfg(), "http://127.0.0.1:3774".into()).unwrap();
+        let app = router(state);
+
+        // Initial GET /api/settings returns defaults and enabled_providers.
+        let initial = json_req(&app, Method::GET, "/api/settings", None).await;
+        assert_eq!(initial["settings"]["default_model"]["provider"], "mock");
+        assert_eq!(initial["settings"]["default_model"]["model"], "mock");
+        assert_eq!(initial["settings"]["follow_up_behavior"], "steer");
+        assert_eq!(initial["settings"]["verify_max_auto_fixes"], 2);
+        assert_eq!(initial["settings"]["antigravity_mcp_enabled"], false);
+        assert_eq!(initial["settings"]["antigravity_quota_probe"], false);
+        assert_eq!(initial["enabled_providers"], json!(["mock", "claude"]));
+
+        // Reject disabled provider atomically without mutating state.
+        let bad_provider = request(
+            &app,
+            Request::builder()
+                .method(Method::PATCH)
+                .uri("/api/settings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "default_model": {"provider": "codex", "model": "gpt-6.2-sol"},
+                        "verify_max_auto_fixes": 5
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(bad_provider.status(), StatusCode::BAD_REQUEST);
+
+        let after_bad = json_req(&app, Method::GET, "/api/settings", None).await;
+        assert_eq!(after_bad["settings"]["default_model"]["provider"], "mock");
+        assert_eq!(after_bad["settings"]["verify_max_auto_fixes"], 2);
+
+        // Valid PATCH updates settings live.
+        let patched = json_req(
+            &app,
+            Method::PATCH,
+            "/api/settings",
+            Some(json!({
+                "default_model": {"provider": "claude", "model": "claude-sonnet-5-5", "effort": "medium"},
+                "follow_up_behavior": "queue",
+                "auto_resume_limited_threads": false,
+                "rate_limit_max_retries": 5,
+                "rate_limit_initial_backoff_secs": 30,
+                "fallback_models": [{"provider": "mock", "model": "mock-fallback"}],
+                "verify_max_auto_fixes": 4,
+                "antigravity_mcp_enabled": true,
+                "antigravity_quota_probe": true
+            })),
+        )
+        .await;
+        assert_eq!(patched["settings"]["default_model"]["provider"], "claude");
+        assert_eq!(
+            patched["settings"]["default_model"]["model"],
+            "claude-sonnet-5-5"
+        );
+        assert_eq!(patched["settings"]["follow_up_behavior"], "queue");
+        assert_eq!(patched["settings"]["auto_resume_limited_threads"], false);
+        assert_eq!(patched["settings"]["rate_limit_max_retries"], 5);
+        assert_eq!(patched["settings"]["rate_limit_initial_backoff_secs"], 30);
+        assert_eq!(patched["settings"]["verify_max_auto_fixes"], 4);
+        assert_eq!(patched["settings"]["antigravity_mcp_enabled"], true);
+        assert_eq!(patched["settings"]["antigravity_quota_probe"], true);
+        assert_eq!(patched["enabled_providers"], json!(["mock", "claude"]));
+
+        // GET /api/meta reflects live follow_up_behavior and default_model immediately.
+        let meta = json_req(&app, Method::GET, "/api/meta", None).await;
+        assert_eq!(meta["follow_up_behavior"], "queue");
+        assert_eq!(meta["default_model"]["provider"], "claude");
+        assert_eq!(meta["default_model"]["model"], "claude-sonnet-5-5");
+        assert_eq!(meta["default_model"]["effort"], "medium");
+
+        // Creating a new thread without explicit model_selection uses the live default_model.
+        let proj = json_req(
+            &app,
+            Method::POST,
+            "/api/projects",
+            Some(json!({"title": "Live Defaults", "workspace_root": tmp.0})),
+        )
+        .await;
+        let thread = json_req(
+            &app,
+            Method::POST,
+            "/api/threads",
+            Some(json!({"project_id": proj["id"], "title": "Default Model Thread"})),
+        )
+        .await;
+        assert_eq!(thread["model_selection"]["provider"], "claude");
+        assert_eq!(thread["model_selection"]["model"], "claude-sonnet-5-5");
+    }
+
+    // Reopen ServerState from the same data_dir and confirm persistence across restart.
+    {
+        let reopened = ServerState::new(make_cfg(), "http://127.0.0.1:3774".into()).unwrap();
+        let app = router(reopened);
+
+        let persisted = json_req(&app, Method::GET, "/api/settings", None).await;
+        assert_eq!(persisted["settings"]["default_model"]["provider"], "claude");
+        assert_eq!(
+            persisted["settings"]["default_model"]["model"],
+            "claude-sonnet-5-5"
+        );
+        assert_eq!(persisted["settings"]["follow_up_behavior"], "queue");
+        assert_eq!(persisted["settings"]["auto_resume_limited_threads"], false);
+        assert_eq!(persisted["settings"]["rate_limit_max_retries"], 5);
+        assert_eq!(persisted["settings"]["rate_limit_initial_backoff_secs"], 30);
+        assert_eq!(persisted["settings"]["verify_max_auto_fixes"], 4);
+        assert_eq!(persisted["settings"]["antigravity_mcp_enabled"], true);
+        assert_eq!(persisted["settings"]["antigravity_quota_probe"], true);
+
+        let meta = json_req(&app, Method::GET, "/api/meta", None).await;
+        assert_eq!(meta["follow_up_behavior"], "queue");
+        assert_eq!(meta["default_model"]["model"], "claude-sonnet-5-5");
+    }
+}
+
+#[tokio::test]
+async fn tier5_thread_export_markdown_headers_and_credential_redaction() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let store = state.store.clone();
+    let app = router(state);
+
+    let thread_id = create_parent(&app, &tmp.0).await;
+    let run_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let sk_secret = "sk-fixture_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let ghp_secret = "ghp_1234567890abcdef1234";
+    let bearer_secret = "Bearer abcdefgh012345._~+/-";
+
+    store
+        .create_run(Run {
+            id: run_id,
+            thread_id,
+            ordinal: 1,
+            provider: ProviderId::Mock,
+            model: "mock".into(),
+            effort: None,
+            status: RunStatus::Completed,
+            prompt: "Export test".into(),
+            provider_session_id: None,
+            input_tokens: Some(120),
+            output_tokens: Some(45),
+            duration_ms: Some(300),
+            error_message: Some(format!("transient auth warning {ghp_secret}")),
+            started_at: now,
+            completed_at: Some(now),
+        })
+        .await
+        .unwrap();
+
+    store
+        .append_turn_item(NewTurnItem {
+            thread_id,
+            run_id,
+            kind: TurnItemKind::UserMessage,
+            summary: Some("user prompt".into()),
+            payload: json!({"text": format!("Please rotate {sk_secret}")}),
+            searchable_text: None,
+        })
+        .await
+        .unwrap();
+    store
+        .append_turn_item(NewTurnItem {
+            thread_id,
+            run_id,
+            kind: TurnItemKind::AssistantMessage,
+            summary: Some("assistant reply".into()),
+            payload: json!({"text": format!("Checked header {bearer_secret} and completed.")}),
+            searchable_text: None,
+        })
+        .await
+        .unwrap();
+
+    let response = request(
+        &app,
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/threads/{thread_id}/export"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/markdown; charset=utf-8")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok()),
+        Some(format!("attachment; filename=\"thread-{thread_id}.md\"").as_str())
+    );
+
+    let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let md = String::from_utf8(body.to_vec()).unwrap();
+    assert!(md.starts_with("# Parent\n"));
+    assert!(md.contains("- **Runs**: 1"));
+    assert!(md.contains("- **Total Tokens**: 165 (120 input / 45 output)"));
+    assert!(md.contains("Please rotate [REDACTED]"));
+    assert!(md.contains("Checked header [REDACTED] and completed."));
+    assert!(md.contains("transient auth warning [REDACTED]"));
+    assert!(!md.contains(sk_secret));
+    assert!(!md.contains(ghp_secret));
+    assert!(!md.contains(bearer_secret));
+
+    // Missing thread returns 404.
+    let missing = request(
+        &app,
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/threads/{}/export", Uuid::new_v4()))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}

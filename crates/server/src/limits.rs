@@ -61,9 +61,15 @@ pub(crate) async fn get(
     Query(query): Query<LimitsQuery>,
 ) -> ApiResult<Json<UsageLimitsResponse>> {
     let refresh = query.refresh.unwrap_or(false);
+    let antigravity_quota_probe = state.settings.get().antigravity_quota_probe;
     let response = state
         .limits_cache
-        .fetch(&state.config, state.usage_home.as_deref(), refresh)
+        .fetch(
+            &state.config,
+            antigravity_quota_probe,
+            state.usage_home.as_deref(),
+            refresh,
+        )
         .await;
     Ok(Json(response))
 }
@@ -90,9 +96,14 @@ pub(crate) async fn consume_reset_credit(
         )
         .into());
     }
+    let antigravity_quota_probe = state.settings.get().antigravity_quota_probe;
     let response = state
         .limits_cache
-        .consume_codex_reset_credit(&state.config, state.usage_home.as_deref())
+        .consume_codex_reset_credit(
+            &state.config,
+            antigravity_quota_probe,
+            state.usage_home.as_deref(),
+        )
         .await?;
     Ok(Json(response))
 }
@@ -181,6 +192,7 @@ struct RuntimeRateLimit {
 
 struct CachedLimits {
     stamp: Instant,
+    antigravity_quota_probe: bool,
     response: UsageLimitsResponse,
 }
 
@@ -219,19 +231,22 @@ impl UsageLimitsCache {
     pub(crate) async fn fetch(
         &self,
         config: &ServerConfig,
+        antigravity_quota_probe: bool,
         home: Option<&Path>,
         refresh: bool,
     ) -> UsageLimitsResponse {
         let mut guard = self.cached.lock().await;
         if !refresh
             && let Some(cached) = guard.as_ref()
+            && cached.antigravity_quota_probe == antigravity_quota_probe
             && cached.stamp.elapsed() < LIMITS_CACHE_TTL
         {
             return self.overlay_runtime(cached.response.clone());
         }
-        let response = probe_all(config, home, &self.runtime).await;
+        let response = probe_all(config, antigravity_quota_probe, home, &self.runtime).await;
         *guard = Some(CachedLimits {
             stamp: Instant::now(),
+            antigravity_quota_probe,
             response: response.clone(),
         });
         response
@@ -240,6 +255,7 @@ impl UsageLimitsCache {
     pub(crate) async fn consume_codex_reset_credit(
         &self,
         config: &ServerConfig,
+        antigravity_quota_probe: bool,
         home: Option<&Path>,
     ) -> Result<ConsumeResetCreditResponse, CoreError> {
         let mut pending = self.codex_reset_key.lock().await;
@@ -272,7 +288,9 @@ impl UsageLimitsCache {
         {
             map.remove(&ProviderId::Codex);
         }
-        let limits = self.fetch(config, home, true).await;
+        let limits = self
+            .fetch(config, antigravity_quota_probe, home, true)
+            .await;
         let message = match outcome.as_str() {
             "reset" => "リセットを適用しました。上限枠が回復しました。",
             "nothingToReset" => "現在リセットが必要な上限枠はありません。",
@@ -341,6 +359,7 @@ fn runtime_window(rt: &RuntimeRateLimit) -> UsageLimitWindow {
 
 async fn probe_all(
     config: &ServerConfig,
+    antigravity_quota_probe: bool,
     home: Option<&Path>,
     runtime: &StdMutex<HashMap<ProviderId, RuntimeRateLimit>>,
 ) -> UsageLimitsResponse {
@@ -378,7 +397,7 @@ async fn probe_all(
         },
         async {
             if wants_antigravity {
-                Some(probe_antigravity(config, now).await)
+                Some(probe_antigravity(config, antigravity_quota_probe, now).await)
             } else {
                 None
             }
@@ -496,8 +515,12 @@ struct ResolvedAntigravityAuth {
     project_id: Option<String>,
 }
 
-async fn probe_antigravity(config: &ServerConfig, now: DateTime<Utc>) -> ProviderUsageLimits {
-    if !config.antigravity_quota_probe {
+async fn probe_antigravity(
+    config: &ServerConfig,
+    antigravity_quota_probe: bool,
+    now: DateTime<Utc>,
+) -> ProviderUsageLimits {
+    if !antigravity_quota_probe {
         return ProviderUsageLimits {
             provider: provider_key(ProviderId::Antigravity).into(),
             label: provider_label(ProviderId::Antigravity).into(),

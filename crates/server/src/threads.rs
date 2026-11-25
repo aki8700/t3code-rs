@@ -373,7 +373,7 @@ impl RunCoordinator {
         let model_selection = input
             .model_selection
             .or(project.default_model)
-            .unwrap_or_else(|| self.0.cfg.default_model.clone());
+            .unwrap_or_else(|| self.0.settings.get().default_model);
         self.driver(&model_selection)?;
         let shared = parent.and_then(|(parent, _)| parent.worktree_path.clone());
         let workspace = shared.as_deref().unwrap_or(&project.workspace_root);

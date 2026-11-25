@@ -5,9 +5,11 @@ mod attachments;
 pub mod auth;
 pub mod coordinator;
 mod database;
+mod export;
 mod limits;
 pub mod privacy;
 pub mod routes;
+mod settings;
 mod shell;
 mod swarm;
 mod threads;
@@ -41,6 +43,7 @@ pub struct ServerState {
     pub coordinator: RunCoordinator,
     pub store: SqliteStore,
     pub config: Arc<ServerConfig>,
+    settings: settings::SettingsStore,
     auth: AuthLayer,
     usage_home: Option<PathBuf>,
     usage_cache: Arc<Mutex<usage::UsageScanCache>>,
@@ -58,6 +61,7 @@ impl ServerState {
         let daemon_lock = Arc::new(acquire_daemon_lock(&config.data_dir)?);
         let store = SqliteStore::open(config.db_path(), config.storage.clone())?;
         store.recover_interrupted_runs()?;
+        let settings = settings::SettingsStore::load_or_init(&config);
         let injection = McpInjectionSpec {
             binary_path: std::env::current_exe().map_err(internal_io)?,
             server_url,
@@ -71,6 +75,7 @@ impl ServerState {
             injection,
             tokens,
             limits_cache.clone(),
+            settings.clone(),
         );
         Ok(Self {
             mcp: Arc::new(McpServer::new(coordinator.clone())),
@@ -79,6 +84,7 @@ impl ServerState {
             store,
             auth,
             config: Arc::new(config),
+            settings,
             usage_home: std::env::home_dir(),
             usage_cache: Arc::new(Mutex::new(usage::UsageScanCache::default())),
             limits_cache,
