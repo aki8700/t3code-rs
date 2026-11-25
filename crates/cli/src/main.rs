@@ -61,6 +61,13 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Import history from a read-only legacy T3 SQLite database.
+    ImportHistory {
+        #[arg(long)]
+        from: Option<PathBuf>,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// Print the configured privacy policy and validation result as JSON.
     AuditPrivacy {
         #[arg(long)]
@@ -171,15 +178,20 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::ImportProjects { from, data_dir } => {
-            let from = from.unwrap_or_else(|| home().join(".t3/userdata/statev2.sqlite"));
             let cfg = local_config(data_dir);
-            if cfg.db_path().exists() && from.canonicalize()? == cfg.db_path().canonicalize()? {
-                return Err("source and destination databases must differ".into());
-            }
+            let from = legacy_source(from, &cfg.db_path())?;
             let count = local_store(Some(cfg.data_dir))?
                 .import_projects_from_t3_sqlite(&from)
                 .await?;
             println!("Imported {count} project(s).");
+        }
+        Command::ImportHistory { from, data_dir } => {
+            let cfg = local_config(data_dir);
+            let from = legacy_source(from, &cfg.db_path())?;
+            let report = local_store(Some(cfg.data_dir))?
+                .import_history_from_t3_sqlite(&from)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::AuditPrivacy { config } => {
             let report = t3_server::audit_privacy(&read_config(config.as_deref())?);
@@ -305,6 +317,26 @@ fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn legacy_source(from: Option<PathBuf>, destination: &Path) -> CliResult<PathBuf> {
+    let source = from
+        .unwrap_or_else(|| home().join(".t3/userdata/statev2.sqlite"))
+        .canonicalize()?;
+    if let Ok(destination) = destination.canonicalize() {
+        let same_path = source == destination;
+        #[cfg(unix)]
+        let same_path = {
+            use std::os::unix::fs::MetadataExt;
+            let source = std::fs::metadata(&source)?;
+            let destination = std::fs::metadata(&destination)?;
+            same_path || (source.dev(), source.ino()) == (destination.dev(), destination.ino())
+        };
+        if same_path {
+            return Err("source and destination databases must differ".into());
+        }
+    }
+    Ok(source)
 }
 
 fn local_config(data_dir: Option<PathBuf>) -> ServerConfig {

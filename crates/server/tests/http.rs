@@ -985,3 +985,25 @@ async fn queue_and_delegated_cancellation() {
     .await;
     assert_eq!(detail["runs"][0]["status"], "cancelled");
 }
+
+#[tokio::test]
+async fn usage_route_requires_authentication_and_valid_window() {
+    let dir = TempDir::new();
+    let app = router(dir.state(AuthConfig::Bearer {
+        token: TOKEN.into(),
+    }));
+    assert_eq!(
+        status(&app, "/api/usage?days=7", REMOTE, &[]).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        status(
+            &app,
+            "/api/usage?days=2",
+            REMOTE,
+            &[("authorization", &format!("Bearer {TOKEN}"))],
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+}

@@ -893,3 +893,161 @@ async fn legacy_import_reads_active_projects_and_leaves_source_unchanged() {
     );
     assert!(!missing.exists());
 }
+
+#[tokio::test]
+async fn imports_legacy_history_with_lineage_runs_and_search() {
+    let dir = TempDir::new();
+    let path = dir.0.join("legacy.sqlite");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         CREATE TABLE projection_projects (project_id TEXT, title TEXT, workspace_root TEXT,
+            created_at TEXT, updated_at TEXT, deleted_at TEXT);
+         INSERT INTO projection_projects VALUES
+            ('legacy-project', 'Legacy project', '/legacy', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', NULL),
+            ('deleted', 'Deleted project', '/deleted', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'yes');
+         CREATE TABLE orchestration_v2_projection_threads (thread_id TEXT, project_id TEXT,
+            title TEXT, default_provider TEXT, runtime_mode TEXT, interaction_mode TEXT,
+            active_provider_thread_id TEXT, created_at TEXT, updated_at TEXT, archived_at TEXT,
+            deleted_at TEXT, payload_json TEXT);
+         INSERT INTO orchestration_v2_projection_threads VALUES
+            ('parent', 'legacy-project', '日本語タイトル', 'codex', 'full-access', 'plan',
+             'native', '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z', NULL, NULL,
+             '{\"modelSelection\": {\"model\": \"sol\", \"options\": [{\"id\": \"effort\", \"value\": \"high\"}]}, \"status\": \"running\"}'),
+            ('child', 'legacy-project', 'Child', 'claudeAgent', 'approval-required', 'default',
+             NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:02:00Z', NULL, NULL,
+             '{\"pinnedAt\": \"2026-01-01T00:01:00Z\", \"status\": \"interrupted\"}');
+         CREATE TABLE orchestration_v2_projection_provider_threads (provider_thread_id TEXT,
+            thread_id TEXT, updated_at TEXT, payload_json TEXT);
+         INSERT INTO orchestration_v2_projection_provider_threads VALUES
+            ('native', 'parent', '2026-01-01T00:00:00Z', '{\"providerSessionId\": \"session\"}'),
+            ('older', 'parent', '2025-12-31T00:00:00Z', '{\"nativeThreadRef\": \"old\"}');
+         CREATE TABLE orchestration_v2_projection_subagents (thread_id TEXT, child_thread_id TEXT);
+         INSERT INTO orchestration_v2_projection_subagents VALUES ('parent', 'child');
+         CREATE TABLE orchestration_v2_projection_runs (run_id TEXT, thread_id TEXT,
+            ordinal INTEGER, provider TEXT, provider_thread_id TEXT, status TEXT,
+            requested_at TEXT, completed_at TEXT, payload_json TEXT);
+         INSERT INTO orchestration_v2_projection_runs VALUES
+            ('legacy-run', 'parent', 1, 'codex', 'native', 'completed', '2026-01-01T00:00:00Z',
+             '2026-01-01T00:01:00Z', '{\"userMessageId\": \"message-1\", \"modelSelection\": {\"model\": \"astra\"}}');
+         CREATE TABLE orchestration_v2_projection_turn_items (turn_item_id TEXT, thread_id TEXT,
+            run_id TEXT, ordinal INTEGER, type TEXT, updated_at TEXT, payload_json TEXT);
+         INSERT INTO orchestration_v2_projection_turn_items VALUES
+            ('notice', 'parent', NULL, 3, 'assistant_message', '2026-01-01T00:00:00Z',
+             '{\"text\": \"履歴検索できます\"}'),
+            ('prompt', 'parent', 'legacy-run', 4, 'user_message', '2026-01-01T00:00:00Z',
+             '{\"messageId\": \"message-1\", \"text\": \"テスト依頼\"}');",
+    )
+    .unwrap();
+    let output = format!("HEAD{}TAIL", "出力".repeat(20_000));
+    for (id, ordinal) in [("command-1", 8), ("command-2", 9)] {
+        db.execute(
+            "INSERT INTO orchestration_v2_projection_turn_items VALUES
+                 (?1, 'parent', 'legacy-run', ?2, 'command_execution', '2026-01-01T00:00:00Z', ?3)",
+            params![
+                id,
+                ordinal,
+                json!({"input":"example\nrest", "output":output, "exitCode":0}).to_string()
+            ],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let source = fs::read(&path).unwrap();
+    let store = SqliteStore::open(dir.0.join("imported.sqlite"), StorageConfig::default()).unwrap();
+    let report = store.import_history_from_t3_sqlite(&path).await.unwrap();
+    assert_eq!(
+        (
+            report.projects_imported,
+            report.threads_imported,
+            report.runs_imported,
+            report.items_imported
+        ),
+        (1, 2, 2, 4)
+    );
+    assert_eq!(
+        report.db_bytes_after,
+        store.db_stats().await.unwrap().db_size_bytes
+    );
+    let project = store.list_projects().await.unwrap().pop().unwrap();
+    let threads = store
+        .list_threads(Some(project.id), true, 10)
+        .await
+        .unwrap();
+    let parent = threads
+        .iter()
+        .find(|t| t.title == "日本語タイトル")
+        .unwrap();
+    let child = threads.iter().find(|t| t.title == "Child").unwrap();
+    assert_eq!(
+        parent.id.to_string(),
+        "7ec8b607-55e7-574d-bbd4-9ccf1b1521a8"
+    );
+    assert_eq!(child.parent_thread_id, Some(parent.id));
+    assert_eq!(child.relationship.as_deref(), Some("subagent"));
+    assert_eq!(child.status, ThreadStatus::Interrupted);
+    assert!(child.pinned);
+    assert_eq!(parent.status, ThreadStatus::Completed);
+    assert_eq!(parent.provider_session_id.as_deref(), Some("session"));
+    assert_eq!(parent.model_selection.effort.as_deref(), Some("high"));
+    let runs = store.list_runs(parent.id).await.unwrap();
+    assert_eq!(
+        runs[0].id.to_string(),
+        "521f35c6-b1cf-5b2c-bed4-571b0c532844"
+    );
+    assert_eq!(
+        runs[1].id.to_string(),
+        "f53f850e-5c80-5e30-8f62-ec48d86ab009"
+    );
+    assert_eq!(runs[0].model, "astra");
+    assert_eq!(runs[0].prompt, "テスト依頼");
+    let items = store.list_turn_items(parent.id, 10, 0).await.unwrap();
+    assert_eq!(
+        items.iter().map(|i| i.ordinal).collect::<Vec<_>>(),
+        [3, 4, 8, 9]
+    );
+    assert_eq!(items[0].run_id, runs[1].id);
+    assert_eq!(items[2].kind, TurnItemKind::CommandExecution);
+    assert_eq!(items[2].summary.as_deref(), Some("example"));
+    assert!(items[2].compressed_bytes.is_some());
+    let output = items[2].payload["output"].as_str().unwrap();
+    assert!(output.starts_with("HEAD") && output.ends_with("TAIL"));
+    assert_eq!(store.db_stats().await.unwrap().dedup_blobs_count, 1);
+    assert_eq!(
+        store.search_fts("履歴検索", 10).await.unwrap()[0].item_id,
+        Some(items[0].id)
+    );
+    assert_eq!(
+        store.search_fts("日本語タイトル", 10).await.unwrap()[0].thread_id,
+        parent.id
+    );
+    let repeated = store.import_history_from_t3_sqlite(&path).await.unwrap();
+    assert_eq!(
+        (
+            repeated.projects_imported,
+            repeated.threads_imported,
+            repeated.runs_imported,
+            repeated.items_imported
+        ),
+        (0, 0, 0, 0)
+    );
+    assert!(source == fs::read(&path).unwrap());
+    assert!(!dir.0.join("legacy.sqlite-wal").exists());
+    assert!(!dir.0.join("legacy.sqlite-shm").exists());
+
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute(
+            "INSERT INTO orchestration_v2_projection_turn_items VALUES
+         ('late', 'parent', 'legacy-run', 10, 'assistant_message', '2026-01-01T00:03:00Z', '{}')",
+            [],
+        )
+        .unwrap();
+    let wal = dir.0.join("legacy.sqlite-wal");
+    let wal_before = fs::read(&wal).unwrap();
+    let incremental = store.import_history_from_t3_sqlite(&path).await.unwrap();
+    assert_eq!(incremental.items_imported, 1);
+    assert_eq!(incremental.runs_imported, 0);
+    assert!(source == fs::read(&path).unwrap());
+    assert!(wal_before == fs::read(&wal).unwrap());
+}

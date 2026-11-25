@@ -203,7 +203,8 @@ const S = {
   detail: null,           // { thread, runs, items, children, handoffs, attachments }
   live: new Map(),        // threadId -> { runId, assistant, reasoning }
   pending: new Map(),     // threadId -> PendingRequest[]
-  collapsed: new Set(),   // thread ids collapsed in tree
+  showKids: ls.get('t3.kids', '0') === '1', // unfold delegated / forked children by default
+  kidsOpen: new Map(),    // thread id -> explicit fold state chosen by the user
   collapsedProjects: new Set(ls.json('t3.pcollapsed', [])),
   expandedProjects: new Set(), // projects showing all threads
   behavior: ls.get('t3.behavior', '') === 'queue' ? 'queue' : 'steer',
@@ -218,6 +219,7 @@ const S = {
   diffStat: null,         // { threadId, add, del, files }
   ignoreWs: ls.get('t3.ws', '1') !== '0',
   dbStats: null,
+  usage: { days: 7, metric: 'cost', tab: 'model', hidden: new Set(), cache: new Map(), errors: new Map(), pending: new Map(), seq: new Map(), refreshing: new Set(), onchange: null },
   subscribed: new Set(),
   ws: null, wsOk: false,
   token: ls.get('t3.token', ''),
@@ -310,12 +312,12 @@ function promptToken() {
 }
 
 // ───────────────────────── modal helper (native <dialog>) ─────────────────────────
-function openModal(title, build, { cls = '', onclose } = {}) {
+function openModal(title, build, { cls = '', onclose, head } = {}) {
   closePopover();
   const dlg = h('dialog', { class: `modal ${cls}`, 'aria-label': title });
   const close = () => { try { dlg.close(); } catch { dlg.remove(); } };
   const body = h('div', { class: 'modal-body' });
-  dlg.append(h('div', { class: 'modal-head' }, h('h2', { text: title }), ibtn('close', '閉じる', close)), body);
+  dlg.append(head ? head(close) : h('div', { class: 'modal-head' }, h('h2', { text: title }), ibtn('close', '閉じる', close)), body);
   dlg.addEventListener('close', () => { dlg.remove(); onclose?.(); });
   dlg.addEventListener('mousedown', (e) => { if (e.target === dlg) close(); });
   document.body.append(dlg);
@@ -703,7 +705,7 @@ const treeHas = (node, id) => node.t.id === id || node.kids.some((k) => treeHas(
 function threadRow(t, { shelf = false, kids = [] } = {}) {
   const pend = (S.pending.get(t.id) || []).length;
   const hasKids = !shelf && kids.length > 0;
-  const collapsed = S.collapsed.has(t.id);
+  const collapsed = !(S.kidsOpen.get(t.id) ?? (S.showKids || kids.some((k) => treeHas(k, S.threadId))));
   const rel = t.parent_thread_id ? (REL_LABEL[t.relationship] || t.relationship || '子') : null;
   const status = STATUS_LABEL[t.status] || t.status;
 
@@ -716,13 +718,13 @@ function threadRow(t, { shelf = false, kids = [] } = {}) {
   },
   hasKids ? h('button', {
     class: `caret${collapsed ? '' : ' open'}`, type: 'button', 'aria-label': collapsed ? '子スレッドを展開' : '子スレッドを折りたたむ', 'aria-expanded': String(!collapsed),
-    onclick: (e) => { e.stopPropagation(); collapsed ? S.collapsed.delete(t.id) : S.collapsed.add(t.id); renderSidebar(); },
+    onclick: (e) => { e.stopPropagation(); S.kidsOpen.set(t.id, collapsed); renderSidebar(); },
   }, iconEl('chevron')) : null,
   shelf ? monogram(projectById(t.project_id), 'sm') : null,
   provDot(t.model_selection?.provider, `${t.status === 'running' ? 'live' : ''} s-${t.status}`),
   h('span', { class: 'trow-title', text: t.title || '(無題)' }),
   t.pinned ? iconEl('pin', 'pinmark') : null,
-  hasKids && collapsed ? h('span', { class: 'kidcount', text: String(kids.length) }) : null,
+  hasKids && collapsed ? h('span', { class: 'kidcount', title: `子スレッド ${kids.length} 件`, text: String(kids.length) }) : null,
   pend ? h('span', { class: 'flag warn', text: '承認待ち' })
     : t.status === 'failed' ? h('span', { class: 'flag bad', text: '失敗' })
       : t.status === 'rate-limited' ? h('span', { class: 'flag warn', text: '制限中' })
@@ -736,7 +738,7 @@ function threadRow(t, { shelf = false, kids = [] } = {}) {
     main, hasKids && !collapsed ? h('ul', { class: 'tkids' }, kids.map((k) => threadRow(k.t, { kids: k.kids }))) : null);
 }
 
-const THREADS_PER_PROJECT = 6;
+const THREADS_PER_PROJECT = 10;
 function projectGroup(p) {
   const list = S.threads.filter((t) => t.project_id === p.id && (S.showArchived || !t.archived));
   const tree = buildTree(list);
@@ -767,7 +769,7 @@ function projectGroup(p) {
 let sidebarSig = '';
 function renderSidebar() {
   // skip DOM churn (and hover flicker) when nothing visible changed
-  const sig = JSON.stringify([Math.floor(Date.now() / 60000), S.threadId, S.projectId, S.showArchived, [...S.collapsed], [...S.collapsedProjects], [...S.expandedProjects],
+  const sig = JSON.stringify([Math.floor(Date.now() / 60000), S.threadId, S.projectId, S.showArchived, S.showKids, [...S.kidsOpen], [...S.collapsedProjects], [...S.expandedProjects],
     [...S.pending].map(([k, v]) => [k, v.length]), S.projects.map((p) => [p.id, p.title]),
     S.threads.map((t) => [t.id, t.title, t.status, t.pinned, t.archived, t.updated_at, t.project_id, t.parent_thread_id, t.model_selection?.provider])]);
   const shelf = S.threads.filter((t) => !t.archived && (isBusy(t.status) && t.status !== 'waiting-for-children' || (S.pending.get(t.id) || []).length));
@@ -1002,7 +1004,7 @@ function renderHeroRecent() {
   box.replaceChildren(...[
     recent.length ? h('div', { class: 'recent' }, h('span', { class: 'recent-lab', text: '最近のスレッド' }), recent.map((t) => h('button', { type: 'button', class: 'recent-chip', title: t.title, onclick: () => openThread(t.id) },
       provDot(t.model_selection?.provider, `s-${t.status}`), h('span', { class: 't', text: t.title || '(無題)' }), h('small', { text: fmtAgo(t.updated_at) })))) : null,
-    h('div', { class: 'hero-keys' }, [['K', '検索'], ['N', '新規'], ['B', 'サイドバー'], ['D', '差分']].map(([k, l]) => h('span', {}, h('kbd', { text: kbd(k) }), l))),
+    h('div', { class: 'hero-keys' }, [['K', '検索'], ['N', '新規'], ['B', 'サイドバー'], ['D', '差分'], ['U', '使用量']].map(([k, l]) => h('span', {}, h('kbd', { text: kbd(k) }), l))),
   ].filter(Boolean));
 }
 
@@ -1549,21 +1551,21 @@ function renderStatPill() {
   const runs = S.detail?.runs;
   if (runs) {
     const sum = (k) => runs.reduce((a, r) => a + (Number(r[k]) || 0), 0);
-    parts.push(h('span', { class: 'sp', title: 'このスレッドの Run 数', text: `${fmtNum(runs.length)} runs` }),
-      h('span', { class: 'sp', title: 'このスレッドの入力 / 出力トークン', text: `↑${fmtTok(sum('input_tokens'))} ↓${fmtTok(sum('output_tokens'))}` }));
+    parts.push(h('span', { class: 'sp', title: 'このスレッドの Run 数', dataset: { utab: 'model' }, text: `${fmtNum(runs.length)} runs` }),
+      h('span', { class: 'sp', title: 'このスレッドの入力 / 出力トークン', dataset: { utab: 'model' }, text: `↑${fmtTok(sum('input_tokens'))} ↓${fmtTok(sum('output_tokens'))}` }));
   } else if (S.dbStats) {
-    parts.push(h('span', { class: 'sp', text: `${fmtNum(S.dbStats.threads_count)} スレッド` }), h('span', { class: 'sp', text: `${fmtNum(S.dbStats.runs_count)} runs` }));
+    parts.push(h('span', { class: 'sp', dataset: { utab: 'system' }, text: `${fmtNum(S.dbStats.threads_count)} スレッド` }), h('span', { class: 'sp', dataset: { utab: 'model' }, text: `${fmtNum(S.dbStats.runs_count)} runs` }));
   }
   if (S.dbStats) {
     const raw = Number(S.dbStats.raw_payload_bytes) || 0; const stored = Number(S.dbStats.stored_payload_bytes) || 0;
     const saved = Math.max(0, raw - stored);
-    parts.push(h('span', { class: 'sp zstd', title: `DB 全体の zstd 圧縮: ${fmtBytes(raw)} → ${fmtBytes(stored)}`, text: `zstd −${fmtBytes(saved)}${raw ? ` (${((saved / raw) * 100).toFixed(0)}%)` : ''}` }));
+    parts.push(h('span', { class: 'sp zstd', dataset: { utab: 'system' }, title: `DB 全体の zstd 圧縮: ${fmtBytes(raw)} → ${fmtBytes(stored)}`, text: `zstd −${fmtBytes(saved)}${raw ? ` (${((saved / raw) * 100).toFixed(0)}%)` : ''}` }));
   }
   if (S.meta) {
     const clean = S.meta.telemetry_enabled === false && S.meta.privacy?.telemetry_enabled !== true;
-    parts.push(h('span', { class: `sp shield ${clean ? 'good' : 'bad'}` }, iconEl(clean ? 'shield' : 'alert'), clean ? 'ゼロテレメトリ' : 'テレメトリ有効'));
+    parts.push(h('span', { class: `sp shield ${clean ? 'good' : 'bad'}`, dataset: { utab: 'system' } }, iconEl(clean ? 'shield' : 'alert'), clean ? 'ゼロテレメトリ' : 'テレメトリ有効'));
   }
-  if (!parts.length) parts.push(h('span', { class: 'sp', text: '統計' }));
+  if (!parts.length) parts.push(h('span', { class: 'sp', text: '使用量' }));
   box.replaceChildren(...parts);
 }
 
@@ -1728,85 +1730,516 @@ function searchDialog() {
   }, { cls: 'search' });
 }
 
+// ───────────────────────── usage: data (T3 Code UsagePage) ─────────────────────────
+const U_PROVIDERS = {
+  claude: { label: 'Claude Code', color: '#d97757' },
+  codex: { label: 'Codex', color: 'var(--text)' },
+  antigravity: { label: 'Antigravity', color: '#8c7bd1' },
+  opencode: { label: 'OpenCode', color: '#5b9bbd' },
+};
+const U_PERIODS = [['1', '過去24時間'], ['7', '7日間'], ['30', '30日間'], ['90', '90日間']];
+const U_METRICS = [['cost', 'コスト'], ['tokens', 'トークン']];
+const U_KINDS = [
+  { key: 'input_tokens', label: '入力', color: 'var(--text)' },
+  { key: 'output_tokens', label: '出力', color: 'var(--accent)' },
+  { key: 'cache_read_tokens', label: 'キャッシュ読込', color: 'color-mix(in srgb, var(--text) 32%, transparent)' },
+  { key: 'cache_write_tokens', label: 'キャッシュ書込', color: 'color-mix(in srgb, var(--text) 58%, transparent)' },
+];
+const U_SUMS = ['cost_usd', 'total_tokens', ...U_KINDS.map((k) => k.key), 'sessions', 'requests'];
+
+const usdFmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtUsd = (n) => (n > 0 && n < 0.005 ? '<$0.01' : usdFmt.format(n));
+/** T3 Code style compact count: 3 significant digits with K / M / B / T. */
+function fmtCompact(n) {
+  if (Math.round(n) < 1000) return String(Math.round(n));
+  const units = ['K', 'M', 'B', 'T'];
+  let v = n / 1000; let i = 0;
+  while (v >= 999.5 && i < units.length - 1) { v /= 1000; i += 1; }
+  return `${Number(v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2))}${units[i]}`;
+}
+function fmtShare(x) { const p = x * 100; return p > 0 && p < 0.1 ? '<0.1%' : `${p.toFixed(1)}%`; }
+
+const uNum = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
+function uId(p) {
+  const s = String(p || 'unknown').toLowerCase();
+  return s === 'open-code' ? 'opencode' : s === 'claude-code' || s === 'claudeagent' ? 'claude' : s;
+}
+function uStats(x) {
+  const o = Object.fromEntries(U_SUMS.map((k) => [k, uNum(x?.[k])]));
+  o.reasoning_tokens = uNum(x?.reasoning_tokens);
+  if (!o.total_tokens) o.total_tokens = U_KINDS.reduce((a, k) => a + o[k.key], 0);
+  return o;
+}
+const uSum = (rows) => Object.fromEntries(U_SUMS.map((k) => [k, rows.reduce((a, r) => a + r[k], 0)]));
+function uProvider(id, serverLabel, serverColor) {
+  const known = Object.hasOwn(U_PROVIDERS, id) ? U_PROVIDERS[id] : null;
+  // colours end up in style properties, so only known values or plain hex are accepted
+  return known ? { id, ...known } : { id, label: String(serverLabel || id), color: /^#[0-9a-f]{3,8}$/i.test(serverColor || '') ? serverColor : '#8b8b8b' };
+}
+
+/** Makes the /api/usage payload safe to render: arrays always exist, numbers are finite, provider ids are canonical. */
+function normalizeUsage(raw) {
+  if (!raw || typeof raw !== 'object' || !(raw.totals || raw.providers || raw.buckets)) throw new Error('応答の形式が不正です');
+  const rows = (a) => (Array.isArray(a) ? a.filter((x) => x && typeof x === 'object') : []);
+  const shares = (x) => ({ cost_share: uNum(x.cost_share), token_share: uNum(x.token_share) });
+  const providers = rows(raw.providers).map((p) => ({ ...uStats(p), ...shares(p), ...uProvider(uId(p.provider), p.label, p.color) }));
+  const models = rows(raw.models).map((m) => ({ ...uStats(m), ...shares(m), ...uProvider(uId(m.provider)), model: String(m.model || '(不明なモデル)') }));
+  const buckets = rows(raw.buckets).map((b) => {
+    const by = new Map();
+    for (const [k, v] of Object.entries(b.by_provider || {})) {
+      const id = uId(k); const prev = by.get(id) || { cost_usd: 0, total_tokens: 0 };
+      by.set(id, { cost_usd: prev.cost_usd + uNum(v?.cost_usd), total_tokens: prev.total_tokens + uNum(v?.total_tokens) });
+    }
+    return { key: String(b.key ?? ''), label: String(b.label ?? b.key ?? ''), by };
+  }).sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  // a provider that only shows up in buckets still needs a legend row and a colour
+  for (const b of buckets) {
+    for (const id of b.by.keys()) {
+      if (providers.some((p) => p.id === id)) continue;
+      const sum = (k) => buckets.reduce((a, x) => a + (x.by.get(id)?.[k] || 0), 0);
+      providers.push({ ...uStats({ cost_usd: sum('cost_usd'), total_tokens: sum('total_tokens') }), cost_share: 0, token_share: 0, ...uProvider(id) });
+    }
+  }
+  const w = raw.window || {};
+  const totals = raw.totals ? uStats(raw.totals) : { ...uSum(providers), reasoning_tokens: 0 };
+  return {
+    window: { since: String(w.since || ''), until: String(w.until || ''), hourly: w.resolution ? w.resolution === 'hour' : Number(w.days) === 1 },
+    totals, providers, models, buckets, scannedAt: Date.parse(raw.scanned_at) || 0,
+  };
+}
+
+function loadUsage(days, { refresh = false } = {}) {
+  const u = S.usage;
+  if (!refresh && u.pending.has(days)) return u.pending.get(days);
+  const seq = (u.seq.get(days) || 0) + 1;
+  u.seq.set(days, seq);
+  if (refresh) u.refreshing.add(days);
+  const latest = () => u.seq.get(days) === seq; // an older response must never overwrite a newer one
+  const p = api(`/api/usage?days=${days}${refresh ? '&refresh=1' : ''}`)
+    .then(normalizeUsage)
+    .then((d) => { if (latest()) { u.cache.set(days, d); u.errors.delete(days); } })
+    .catch((e) => { if (latest()) u.errors.set(days, e.message || String(e)); })
+    .finally(() => {
+      if (!latest()) return;
+      u.pending.delete(days); u.refreshing.delete(days);
+      renderUsagePill(); u.onchange?.(days);
+    });
+  u.pending.set(days, p);
+  u.onchange?.(days);
+  return p;
+}
+const loadUsageSoon = debounce(() => { loadUsage(7); if (S.usage.onchange && S.usage.days !== 7) loadUsage(S.usage.days); }, 5000);
+
+function renderUsagePill() {
+  const d = S.usage.cache.get(7);
+  const pill = $('#usage-pill');
+  const btn = $('#btn-usage');
+  const hint = `使用量を開く (${kbd('U')})`;
+  if (!d) {
+    const err = S.usage.errors.get(7);
+    pill.textContent = err ? '–' : '…';
+    btn.title = err ? `使用量を取得できません: ${err}\n${hint}` : hint;
+    return;
+  }
+  const t = d.totals;
+  pill.textContent = `${t.cost_usd > 0 || !t.total_tokens ? fmtUsd(t.cost_usd) : `${fmtCompact(t.total_tokens)} tok`} · 7日`;
+  btn.title = `過去7日間: ${fmtUsd(t.cost_usd)}（API 推定）· ${fmtCompact(t.total_tokens)} トークン · ${fmtNum(t.sessions)} セッション\n${hint}`;
+}
+
+// ───────────────────────── usage: view ─────────────────────────
+const uMetricKey = () => (S.usage.metric === 'cost' ? 'cost_usd' : 'total_tokens');
+const uShareKey = () => (S.usage.metric === 'cost' ? 'cost_share' : 'token_share');
+const uFormat = (v) => (S.usage.metric === 'cost' ? fmtUsd(v) : fmtCompact(v));
+
+/** Applies the provider filter and the active metric to one payload. */
+function usageView(d) {
+  const key = uMetricKey();
+  const rank = (a, b) => b[key] - a[key] || b.total_tokens - a.total_tokens;
+  const ranked = [...d.providers].sort(rank);
+  const visible = ranked.filter((p) => !S.usage.hidden.has(p.id));
+  const filtered = visible.length !== ranked.length;
+  const totals = filtered ? { ...uSum(visible), reasoning_tokens: 0 } : d.totals;
+  // the server's shares are authoritative until the filter changes the denominator
+  const share = (row) => (!filtered && row[uShareKey()]) || (totals[key] > 0 ? Math.min(1, row[key] / totals[key]) : 0);
+  const models = d.models.filter((m) => !S.usage.hidden.has(m.id)).sort(rank);
+  const columns = d.buckets.map((b) => {
+    const parts = visible.map((p) => ({ p, cost_usd: b.by.get(p.id)?.cost_usd || 0, total_tokens: b.by.get(p.id)?.total_tokens || 0 }));
+    return { bucket: b, parts, cost_usd: parts.reduce((a, x) => a + x.cost_usd, 0), total_tokens: parts.reduce((a, x) => a + x.total_tokens, 0) };
+  });
+  return { key, ranked, visible, filtered, totals, share, models, columns, hourly: d.window.hourly };
+}
+
+const uTint = (el, color) => { el.style.background = color; return el; };
+const uDot = (color) => uTint(h('i', { class: 'u-dot', 'aria-hidden': 'true' }), color);
+function uBar(fraction, color, cls = '') {
+  const fill = uTint(h('i'), color);
+  fill.style.width = fraction > 0 ? `max(4px, ${Math.min(100, fraction * 100)}%)` : '0';
+  return h('div', { class: `u-bar ${cls}`, 'aria-hidden': 'true' }, fill);
+}
+const uEmpty = (text = 'この期間の利用はありません') => h('div', { class: 'u-empty', text });
+
+const WEEKDAYS = '日月火水木金土';
+const hhmm = (t) => `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
+/** Bucket keys are "YYYY-MM-DD" or an hourly timestamp; zoned timestamps are shown in local time. */
+function bucketDate(key) {
+  const m = /^(\d{4})-(\d\d)-(\d\d)(?:[T ](\d\d)(?::(\d\d))?)?/.exec(key);
+  if (!m) return null;
+  const zoned = /[T ]\d\d.*(Z|[+-]\d\d:?\d\d)$/.test(key);
+  const t = zoned ? new Date(key) : new Date(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0));
+  return Number.isNaN(t.getTime()) ? null : { t, timed: m[4] != null };
+}
+// labels are built from the key so that hours follow the viewer's clock; the server label is the fallback
+function bucketTick(b, hourly) {
+  const p = bucketDate(b.key);
+  if (!p || (hourly && !p.timed)) return b.label;
+  return hourly ? hhmm(p.t) : `${p.t.getMonth() + 1}/${p.t.getDate()}`;
+}
+function bucketTitle(b, hourly, short = false) {
+  const p = bucketDate(b.key);
+  if (!p) return b.label;
+  const { t } = p;
+  const day = short ? `${t.getMonth() + 1}/${t.getDate()}` : `${t.getMonth() + 1}月${t.getDate()}日`;
+  return hourly ? `${day} ${p.timed ? hhmm(t) : b.label}` : `${day} (${WEEKDAYS[t.getDay()]})`;
+}
+function rangeText(w) {
+  const f = (s) => {
+    if (!w.hourly) return s.replace(/^(\d{4}-\d\d-\d\d)T.*$/, '$1'); // daily windows are whole days
+    const p = bucketDate(s);
+    return p?.timed ? `${p.t.getMonth() + 1}/${p.t.getDate()} ${hhmm(p.t)}` : s;
+  };
+  return w.since || w.until ? `${f(w.since)} – ${f(w.until)}` : '';
+}
+
+/** Four equal intervals up to a round number at or above the peak. */
+function niceScale(peak) {
+  if (!(peak > 0)) return { max: 1, step: 0.25, ticks: [0, 0.25, 0.5, 0.75, 1], labeled: false };
+  const raw = peak / 4;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].find((x) => raw / mag <= x + 1e-9) * mag;
+  return { max: step * 4, step, ticks: [0, 1, 2, 3, 4].map((i) => step * i), labeled: true };
+}
+function tickText(v, step) {
+  if (S.usage.metric === 'tokens') return v === 0 ? '0' : fmtCompact(v);
+  if (v === 0) return '$0';
+  let digits = 0;
+  while (digits < 4 && Math.abs(step * 10 ** digits - Math.round(step * 10 ** digits)) > 1e-6) digits += 1;
+  if (digits === 1) digits = 2;
+  return `$${v.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
+}
+
+/** UsageProviderChart: one stacked column per bucket, plain HTML. */
+function usageChart(view) {
+  const { columns, key, hourly } = view;
+  const n = columns.length;
+  const scale = niceScale(Math.max(0, ...columns.map((c) => c[key])));
+  const at = (el, v) => { el.style.top = `${(1 - v / scale.max) * 100}%`; return el; };
+  const yaxis = h('div', { class: 'u-yaxis', 'aria-hidden': 'true' },
+    scale.labeled ? scale.ticks.map((v) => at(h('span', { text: tickText(v, scale.step) }), v)) : null);
+  const cols = columns.map((c) => {
+    if (!(c[key] > 0)) return h('div', { class: 'u-col' });
+    const stack = h('div', { class: 'u-stack' }, c.parts.filter((x) => x[key] > 0).map((x) => {
+      const seg = uTint(h('i', { dataset: { provider: x.p.id } }), x.p.color);
+      seg.style.flexGrow = String(x[key] / c[key]);
+      return seg;
+    }));
+    stack.style.height = `${(c[key] / scale.max) * 100}%`;
+    return h('div', { class: 'u-col' }, stack);
+  });
+  const colBox = h('div', { class: 'u-cols' }, cols);
+  colBox.style.gap = `${n <= 10 ? 10 : n <= 31 ? 3 : 1}px`;
+  const tip = h('div', { class: 'u-tip', role: 'status', hidden: true });
+  const plot = h('div', {
+    class: 'u-plot', tabindex: 0, role: 'group',
+    'aria-label': `${hourly ? '時間別' : '日別'}の${S.usage.metric === 'cost' ? 'コスト' : 'トークン'}グラフ。左右キーで期間を移動`,
+  }, scale.ticks.map((v) => at(h('div', { class: `u-grid${v === 0 ? ' base' : ''}`, 'aria-hidden': 'true' }), v)), colBox,
+  n && scale.labeled ? null : uEmpty(), tip);
+
+  let active = -1;
+  const hide = () => { active = -1; tip.hidden = true; plot.classList.remove('hovering'); cols.forEach((c) => c.classList.remove('hover')); };
+  const show = (i, x, y) => {
+    if (i !== active) {
+      active = i;
+      cols.forEach((c, k) => c.classList.toggle('hover', k === i));
+      const c = columns[i];
+      const line = (cls, head, row) => h('div', { class: cls }, head, h('span', { class: 'u-tip-v' },
+        h('b', { text: fmtUsd(row.cost_usd) }), h('small', { text: `${fmtNum(Math.round(row.total_tokens))} tok` })));
+      const used = c.parts.filter((p) => p.cost_usd > 0 || p.total_tokens > 0);
+      tip.replaceChildren(h('div', { class: 'u-tip-h', text: bucketTitle(c.bucket, hourly) }),
+        ...(used.length ? used.map((p) => line('u-tip-row', h('span', { class: 'u-tip-l' }, uDot(p.p.color), p.p.label), p)) : [h('div', { class: 'u-tip-l', text: '利用なし' })]),
+        line('u-tip-row total', h('span', { class: 'u-tip-l', text: '合計' }), c));
+    }
+    plot.classList.add('hovering');
+    tip.hidden = false;
+    const w = tip.offsetWidth; const th = tip.offsetHeight;
+    const left = x + 12 + w <= plot.clientWidth ? x + 12 : x - 12 - w;
+    const top = y + 12 + th <= plot.clientHeight ? y + 12 : y - 12 - th;
+    tip.style.left = `${Math.max(0, Math.min(left, plot.clientWidth - w))}px`;
+    tip.style.top = `${Math.max(0, Math.min(top, plot.clientHeight - th))}px`;
+  };
+  const point = (e) => {
+    const r = plot.getBoundingClientRect();
+    if (!n || !r.width) return;
+    const x = e.clientX - r.left;
+    show(Math.max(0, Math.min(n - 1, Math.floor((x / r.width) * n))), x, e.clientY - r.top);
+  };
+  plot.addEventListener('pointermove', point);
+  plot.addEventListener('pointerdown', point);
+  plot.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse') hide(); }); // touch keeps the tooltip until it taps elsewhere
+  plot.addEventListener('blur', hide);
+  plot.addEventListener('keydown', (e) => {
+    if (!n || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
+    e.preventDefault();
+    const i = active < 0 ? n - 1 : Math.max(0, Math.min(n - 1, active + (e.key === 'ArrowLeft' ? -1 : 1)));
+    show(i, ((i + 0.5) / n) * plot.clientWidth, 8);
+  });
+
+  const every = n > 0 && n <= 10;
+  const marks = every ? columns : n ? [columns[0], columns[Math.floor(n / 2)], columns[n - 1]] : [];
+  const xaxis = h('div', { class: `u-xaxis${every ? ' every' : ''}`, 'aria-hidden': 'true' }, marks.map((c) => h('span', { text: bucketTick(c.bucket, hourly) })));
+  if (every) xaxis.style.gap = '10px';
+  return { el: h('div', { class: 'u-chart-box' }, h('div', { class: 'u-chart' }, yaxis, plot), xaxis), hide, plot };
+}
+
+/** Left hero column: headline metric and the ranked provider list, which doubles as the filter. */
+function usageSummary(view, rerender) {
+  const cost = S.usage.metric === 'cost';
+  const t = view.totals;
+  const providers = view.ranked.map((p) => {
+    const off = S.usage.hidden.has(p.id);
+    const share = off ? 0 : view.share(p);
+    return h('button', {
+      type: 'button', class: `u-prov${off ? ' off' : ''}`, dataset: { provider: p.id }, 'aria-pressed': String(!off),
+      title: off ? `${p.label} を表示する` : `${p.label} を非表示にする`,
+      onclick: () => { off ? S.usage.hidden.delete(p.id) : S.usage.hidden.add(p.id); rerender(); },
+    },
+    h('span', { class: 'u-prov-top' }, uDot(p.color), h('span', { class: 'u-prov-name', text: p.label }), h('span', { class: 'u-prov-val', text: off ? '–' : uFormat(p[view.key]) })),
+    uBar(share, p.color),
+    h('span', { class: 'u-prov-sub' }, h('span', { text: off ? '非表示' : `${fmtNum(p.sessions)} セッション` }), h('span', { text: off ? '' : fmtShare(share) })));
+  });
+  return h('div', { class: 'u-summary' },
+    h('div', { class: 'u-headline' },
+      h('p', { class: 'u-big', text: uFormat(t[view.key]) }),
+      h('p', { class: 'u-sub', text: cost ? `${fmtNum(t.sessions)} セッション · API 推定` : `${fmtNum(t.sessions)} セッション · ${fmtNum(t.requests)} リクエスト` }),
+      view.filtered ? h('button', { type: 'button', class: 'link u-reset', text: '絞り込み中 — すべて表示', onclick: () => { S.usage.hidden.clear(); rerender(); } }) : null),
+    providers.length ? providers : uEmpty('プロバイダのデータがありません'));
+}
+
+function usageTotals(view) {
+  const t = view.totals;
+  const stat = (label, value, title) => h('div', { title }, h('dt', { text: label }), h('dd', { text: value }));
+  const mix = U_KINDS.map((k) => ({ ...k, value: t[k.key] })).filter((k) => k.value > 0);
+  const mixSum = mix.reduce((a, k) => a + k.value, 0);
+  return [
+    h('section', { class: 'u-section' }, h('h3', { text: '合計' }), h('dl', { class: 'u-totals' },
+      stat('処理トークン', fmtCompact(t.total_tokens), `${fmtNum(t.total_tokens)} tok`),
+      stat('キャッシュ読込', fmtCompact(t.cache_read_tokens)),
+      stat('キャッシュ書込', fmtCompact(t.cache_write_tokens)),
+      stat('入力', fmtCompact(t.input_tokens)),
+      stat('出力', fmtCompact(t.output_tokens), t.reasoning_tokens ? `うち推論 ${fmtNum(t.reasoning_tokens)} tok` : null))),
+    S.usage.metric === 'tokens' && mixSum > 0 ? h('section', { class: 'u-section u-mix' }, h('h3', { text: '種類別トークン' }),
+      h('div', { class: 'u-mixbar', 'aria-hidden': 'true' }, mix.map((k) => {
+        const seg = uTint(h('i', { title: `${k.label} · ${fmtCompact(k.value)} · ${fmtShare(k.value / mixSum)}` }), k.color);
+        seg.style.flexGrow = String(k.value / mixSum);
+        return seg;
+      })),
+      h('ul', {}, mix.map((k) => h('li', {}, uDot(k.color), h('span', { class: 'muted', text: k.label }), h('span', { text: fmtCompact(k.value) }))))) : null,
+  ];
+}
+
+function usageModels(view) {
+  if (!view.models.length) return uEmpty();
+  const peak = Math.max(0, ...view.models.map((m) => m[view.key]));
+  return h('ol', { class: 'u-models' }, view.models.map((m, i) => h('li', { class: 'u-model' },
+    h('span', { class: 'u-rank', text: String(i + 1) }),
+    h('span', { class: 'u-model-name', title: `${m.label} / ${m.model} · ${fmtNum(m.sessions)} セッション · ${fmtNum(m.requests)} リクエスト` }, uDot(m.color), h('code', { text: m.model })),
+    h('span', { class: 'u-model-val', text: uFormat(m[view.key]) }),
+    h('span', { class: 'u-model-share', text: fmtShare(view.share(m)) }),
+    uBar(peak > 0 ? m[view.key] / peak : 0, m.color),
+    h('span', { class: 'u-chips' }, U_KINDS.map((k) => h('span', { class: 'u-chip', title: `${k.label}: ${fmtNum(m[k.key])} tok` }, k.label, h('b', { text: fmtCompact(m[k.key]) })))))));
+}
+
+function usageTimeline(view) {
+  const rows = view.columns.filter((c) => c.total_tokens > 0 || c.cost_usd > 0).reverse();
+  if (!rows.length) return uEmpty();
+  const peak = Math.max(0, ...rows.map((c) => c[view.key]));
+  return h('table', { class: 'u-times' },
+    h('thead', {}, h('tr', {}, h('th', { text: view.hourly ? '時間' : '日付' }), h('th', { class: 'u-t-bar', text: 'プロバイダ内訳' }), h('th', { text: 'トークン' }), h('th', { text: '推定コスト' }))),
+    h('tbody', {}, rows.map((c) => {
+      const bar = h('div', { class: 'u-hbar' }, c.parts.filter((x) => x[view.key] > 0).map((x) => {
+        const seg = uTint(h('i', { title: `${x.p.label}: ${fmtUsd(x.cost_usd)} · ${fmtNum(x.total_tokens)} tok` }), x.p.color);
+        seg.style.flexGrow = String(x[view.key] / c[view.key]);
+        return seg;
+      }));
+      bar.style.width = c[view.key] > 0 ? `max(4px, ${(c[view.key] / peak) * 100}%)` : '0';
+      return h('tr', {}, h('th', { scope: 'row', text: bucketTitle(c.bucket, view.hourly, true) }), h('td', { class: 'u-t-bar' }, bar),
+        h('td', { class: 'muted', title: `${fmtNum(c.total_tokens)} tok`, text: fmtCompact(c.total_tokens) }), h('td', { text: fmtUsd(c.cost_usd) }));
+    })));
+}
+
+const usageSkeleton = () => h('div', { class: 'u-hero u-skel', 'aria-busy': 'true', 'aria-label': '使用量を読み込み中' },
+  h('div', { class: 'u-summary' }, ['big', 'sub', 'row', 'row', 'row', 'row'].map((c) => h('i', { class: c }))),
+  h('div', {}, h('i', { class: 'chart' }), h('p', { class: 'muted', text: '使用量を集計しています…' })));
+
+function usageDialog(tab) {
+  if (tab) S.usage.tab = tab;
+  if ($('dialog.usage[open]')) return;
+  closeDrawer();
+  const u = S.usage;
+  const range = h('span', { class: 'u-range' });
+  const top = h('div', { class: 'u-top' });
+  const tabs = h('div', { class: 'u-tabs' });
+  const panel = h('div', { class: 'u-panel' });
+  const foot = h('p', { class: 'u-foot' });
+  let system = null; // the DB / privacy panel loads on first use
+  let chart = null;
+  let drawn = []; // what the top half currently shows
+
+  const refresh = ibtn('refresh', '使用量を再スキャン', () => {
+    if (u.refreshing.has(u.days)) return;
+    loadUsage(u.days, { refresh: true });
+    if (u.tab === 'system') system?.load();
+  }, 'sm u-refresh');
+
+  const renderBreakdown = () => {
+    const d = u.cache.get(u.days);
+    const hourly = d ? d.window.hourly : u.days === 1;
+    const focused = tabs.contains(document.activeElement);
+    tabs.replaceChildren(segmented([['model', 'モデル別'], ['time', hourly ? '時間別' : '日別'], ['system', 'DB・プライバシー']], u.tab,
+      (v) => { u.tab = v; renderBreakdown(); }, { label: '内訳の表示', cls: 'mini' }));
+    if (focused) $('button.on', tabs)?.focus();
+    if (u.tab === 'system') {
+      system ||= systemPanel();
+      if (panel.firstChild !== system.el) panel.replaceChildren(system.el);
+    } else if (d) panel.replaceChildren(u.tab === 'model' ? usageModels(usageView(d)) : usageTimeline(usageView(d)));
+    else panel.replaceChildren(uEmpty(u.errors.has(u.days) ? '使用量を取得できないため表示できません' : '読み込み中…'));
+  };
+
+  const renderTop = () => {
+    const d = u.cache.get(u.days);
+    const error = u.errors.get(u.days);
+    range.textContent = d ? rangeText(d.window) : '';
+    refresh.classList.toggle('busy', u.pending.has(u.days));
+    refresh.setAttribute('aria-busy', String(u.pending.has(u.days)));
+    foot.textContent = d ? `コストは API 料金からの推定です${d.scannedAt ? ` · 最終スキャン ${new Date(d.scannedAt).toLocaleString('ja-JP')}` : ''}` : '';
+    const banner = error ? h('div', { class: 'u-error', role: 'alert' },
+      h('span', { text: `使用量の${d ? '更新' : '取得'}に失敗しました: ${error}${d ? '（前回の結果を表示中）' : ''}` }),
+      h('button', { type: 'button', class: 'btn xs', text: '再試行', onclick: () => loadUsage(u.days) })) : null;
+    // starting a re-fetch changes nothing here; rebuilding would drop the tooltip under the pointer
+    const state = [d, error, u.metric, [...u.hidden].join()];
+    if (state.every((v, i) => v === drawn[i])) return;
+    drawn = state;
+    chart = null;
+    if (!d) { top.replaceChildren(banner || usageSkeleton()); return; }
+    const view = usageView(d);
+    chart = usageChart(view);
+    const focused = top.contains(document.activeElement) ? document.activeElement.dataset.provider : null;
+    const title = `${view.hourly ? '時間別' : '日別'}${u.metric === 'cost' ? 'コスト' : '処理トークン'}`;
+    top.replaceChildren(...[banner,
+      h('section', { class: 'u-hero' }, usageSummary(view, () => { renderTop(); renderBreakdown(); }),
+        h('div', { class: 'u-main' }, h('h3', { text: title }), chart.el)),
+      ...usageTotals(view)].filter(Boolean));
+    if (focused) top.querySelector(`.u-prov[data-provider="${CSS.escape(focused)}"]`)?.focus();
+  };
+  const render = () => { renderTop(); renderBreakdown(); };
+  const onchange = (days) => { if (days === u.days) render(); };
+
+  const head = (close) => h('div', { class: 'u-head' },
+    h('div', { class: 'u-title' }, h('h2', { text: '使用量' }), range),
+    h('div', { class: 'u-controls' },
+      segmented(U_PERIODS, String(u.days), (v) => { u.days = Number(v); render(); loadUsage(u.days); }, { label: '期間', cls: 'mini u-period' }),
+      segmented(U_METRICS, u.metric, (v) => { u.metric = v; render(); }, { label: '指標', cls: 'mini u-metric' })),
+    h('div', { class: 'u-actions' }, refresh, ibtn('close', '閉じる (Esc)', close, 'sm u-close')));
+
+  openModal('使用量', (body, _close, dlg) => {
+    body.append(top, h('section', { class: 'u-section u-breakdown' }, h('div', { class: 'u-bhead' }, h('h3', { text: '内訳' }), tabs), panel), foot);
+    dlg.addEventListener('pointerdown', (e) => { if (chart && !chart.plot.contains(e.target)) chart.hide(); });
+    dlg.tabIndex = -1; dlg.focus();
+    u.onchange = onchange;
+    render();
+    loadUsage(u.days);
+    if (tab === 'system') system.ready.then(() => tabs.parentElement.scrollIntoView({ block: 'start' })); // deep link from the stat pill
+  }, { cls: 'usage', head, onclose: () => { if (u.onchange === onchange) u.onchange = null; } });
+}
+
+// ───────────────────────── usage: DB / privacy tab ─────────────────────────
 const scard = (l, v) => h('div', { class: 'scard' }, h('div', { class: 'sl', text: l }), h('div', { class: 'sv', text: v }));
 
-function statsDialog() {
-  if ($('dialog.stats')) return;
-  closeDrawer();
-  openModal('統計・プライバシー・ストレージ', (body) => {
-    const render = async () => {
-      body.replaceChildren(h('div', { class: 'loading', text: '読み込み中…' }));
-      const [meta, orch, db] = await Promise.allSettled([api('/api/meta'), api('/api/stats/orch'), api('/api/stats/db')]);
-      const out = [];
-      // ── privacy
-      out.push(h('div', { class: 'sec-h', text: 'プライバシー / 認証' }));
-      if (meta.status === 'fulfilled') {
-        const m = meta.value; const pv = m.privacy || {};
-        const noTelemetry = m.telemetry_enabled === false && pv.telemetry_enabled !== true;
-        const noCreds = pv.reads_provider_credentials !== true;
-        S.meta = m;
-        const authMode = pv.auth_mode || m.auth_identity?.method;
-        out.push(h('div', { class: 'privacy-badges' },
-          h('span', { class: `pbadge ${noTelemetry ? 'good' : 'bad'}`, text: noTelemetry ? '✓ テレメトリ完全無効' : '✗ テレメトリが有効です' }),
-          h('span', { class: `pbadge ${noCreds ? 'good' : 'bad'}`, text: noCreds ? '✓ 認証ファイル不読' : '✗ 認証情報を読み取ります' }),
-          h('span', { class: 'pbadge info', text: `認証: ${authLabel(authMode)}` }),
-          pv.passed != null ? h('span', { class: `pbadge ${pv.passed ? 'good' : 'bad'}`, text: pv.passed ? '✓ プライバシー監査 PASS' : '✗ プライバシー監査 FAIL' }) : null));
-        const rows = [['バージョン', m.version], ['認証ユーザー', m.auth_identity ? [m.auth_identity.email, m.auth_identity.subject].filter(Boolean).join(' / ') : '（なし）'],
-          ['バインド', pv.bind_host], ['既定モデル', m.default_model ? `${provLabel(m.default_model.provider)} / ${m.default_model.model}` : null],
-          ['追加指示の既定', m.follow_up_behavior === 'queue' ? 'Queue (予約)' : m.follow_up_behavior ? 'Steer (割り込み)' : null],
-          ['許可された外部通信', (pv.allowed_outbound_urls || []).length ? pv.allowed_outbound_urls.join(', ') : 'なし（完全ローカル）']].filter((r) => r[1]);
-        const dl = h('dl', { class: 'kv' });
-        rows.forEach(([k, v]) => dl.append(h('dt', { text: k }), h('dd', { text: String(v) })));
-        out.push(dl);
-        if ((pv.notes || []).length) out.push(h('ul', { class: 'notes' }, pv.notes.map((n) => h('li', { text: n }))));
-      } else out.push(h('div', { class: 'errtxt', text: `取得に失敗: ${meta.reason.message}` }));
-      // ── providers
-      if (S.providers.length) {
-        out.push(h('div', { class: 'sec-h', text: 'プロバイダ' }), h('div', { class: 'provs' }, S.providers.map((p) => h('div', { class: `prov-card${p.available ? '' : ' off'}`, title: p.error || p.binary_path || '' },
-          provDot(p.provider), h('b', { text: provLabel(p.provider) }), h('small', { text: p.available ? p.version || '利用可能' : p.error || '未導入' })))));
-      }
-      // ── storage
-      out.push(h('div', { class: 'sec-h', text: 'ストレージ（SQLite + zstd 圧縮）' }));
-      if (db.status === 'fulfilled') {
-        const d = db.value;
-        S.dbStats = d;
-        const raw = Number(d.raw_payload_bytes) || 0; const st = Number(d.stored_payload_bytes) || 0;
-        const ratio = st > 0 ? raw / st : 0;
-        const saved = Math.max(0, raw - st);
-        const pct = raw > 0 ? (saved / raw) * 100 : 0;
-        const bar = (v, cls) => { const i = h('i', { class: cls }); i.style.width = `${raw > 0 ? Math.max(1, (v / raw) * 100) : 0}%`; return h('div', { class: 'bar' }, i); };
-        out.push(h('div', { class: 'sgrid' },
-          scard('DB ファイル', fmtBytes(d.db_size_bytes)), scard('圧縮率', ratio ? `×${ratio.toFixed(2)}` : '–'), scard('節約量', `${fmtBytes(saved)} (${pct.toFixed(0)}%)`),
-          scard('スレッド / Run', `${fmtNum(d.threads_count)} / ${fmtNum(d.runs_count)}`), scard('ターン項目', fmtNum(d.turn_items_count)),
-          scard('重複排除ブロブ / 添付', `${fmtNum(d.dedup_blobs_count)} / ${fmtNum(d.attachments_count)}`)));
-        out.push(h('div', { class: 'dbrow' }, h('span', { text: '元サイズ' }), bar(raw, ''), h('span', { text: fmtBytes(raw) })));
-        out.push(h('div', { class: 'dbrow' }, h('span', { text: '保存サイズ' }), bar(st, 'ok'), h('span', { text: fmtBytes(st) })));
-      } else out.push(h('div', { class: 'errtxt', text: `取得に失敗: ${db.reason.message}` }));
-      // ── orch
-      out.push(h('div', { class: 'sec-h' }, h('span', { text: 'orch-stats（プロバイダ / モデル別）' }), h('button', { class: 'btn xs', type: 'button', text: '更新', onclick: render })));
-      if (orch.status === 'fulfilled') {
-        const rows = [...orch.value].sort((a, b) => b.total_runs - a.total_runs);
-        if (!rows.length) out.push(h('div', { class: 'muted', text: 'まだ実行履歴がありません' }));
-        else {
-          const tot = rows.reduce((a, r) => ({ n: a.n + r.total_runs, ok: a.ok + r.completed_runs, f: a.f + r.failed_runs, i: a.i + r.total_input_tokens, o: a.o + r.total_output_tokens }), { n: 0, ok: 0, f: 0, i: 0, o: 0 });
-          const rate = (r) => (r.total_runs > 0 ? r.completed_runs / r.total_runs : 0);
-          const rateCell = (v, n) => { const i = h('i', { class: v >= .9 ? 'ok' : v >= .6 ? 'warn' : 'err' }); i.style.width = `${v * 100}%`; return h('td', { class: 'rate' }, h('div', { class: 'bar' }, i), n ? `${(v * 100).toFixed(0)}%` : '–'); };
-          const tb = h('tbody');
-          for (const r of rows) {
-            tb.append(h('tr', {}, h('td', {}, provDot(r.provider), ` ${provLabel(r.provider)} / ${r.model}`), h('td', { text: `${fmtNum(r.total_runs)}` }), h('td', { text: `${fmtNum(r.completed_runs)} / ${fmtNum(r.failed_runs)}` }),
-              rateCell(rate(r), r.total_runs), h('td', { text: fmtDur(r.avg_duration_ms) }), h('td', { text: fmtTok(r.total_input_tokens) }), h('td', { text: fmtTok(r.total_output_tokens) })));
-          }
-          tb.append(h('tr', { class: 'total' }, h('td', { text: '合計' }), h('td', { text: fmtNum(tot.n) }), h('td', { text: `${fmtNum(tot.ok)} / ${fmtNum(tot.f)}` }),
-            rateCell(tot.n ? tot.ok / tot.n : 0, tot.n), h('td'), h('td', { text: fmtTok(tot.i) }), h('td', { text: fmtTok(tot.o) })));
-          out.push(h('div', { class: 'twrap' }, h('table', { class: 'tbl' },
-            h('thead', {}, h('tr', {}, ['モデル', '実行', '成功 / 失敗', '成功率', '平均所要', '入力tok', '出力tok'].map((x) => h('th', { text: x })))), tb)));
+function systemPanel() {
+  const el = h('div', { class: 'u-system' }, h('div', { class: 'loading', text: '読み込み中…' }));
+  let seq = 0;
+  const load = async () => {
+    const my = ++seq;
+    const [meta, orch, db] = await Promise.allSettled([api('/api/meta'), api('/api/stats/orch'), api('/api/stats/db')]);
+    if (my !== seq) return;
+    const out = [];
+    // ── privacy
+    out.push(h('div', { class: 'sec-h', text: 'プライバシー / 認証' }));
+    if (meta.status === 'fulfilled') {
+      const m = meta.value; const pv = m.privacy || {};
+      const noTelemetry = m.telemetry_enabled === false && pv.telemetry_enabled !== true;
+      const noCreds = pv.reads_provider_credentials !== true;
+      S.meta = m;
+      const authMode = pv.auth_mode || m.auth_identity?.method;
+      out.push(h('div', { class: 'privacy-badges' },
+        h('span', { class: `pbadge ${noTelemetry ? 'good' : 'bad'}`, text: noTelemetry ? '✓ テレメトリ完全無効' : '✗ テレメトリが有効です' }),
+        h('span', { class: `pbadge ${noCreds ? 'good' : 'bad'}`, text: noCreds ? '✓ 認証ファイル不読' : '✗ 認証情報を読み取ります' }),
+        h('span', { class: 'pbadge info', text: `認証: ${authLabel(authMode)}` }),
+        pv.passed != null ? h('span', { class: `pbadge ${pv.passed ? 'good' : 'bad'}`, text: pv.passed ? '✓ プライバシー監査 PASS' : '✗ プライバシー監査 FAIL' }) : null));
+      const rows = [['バージョン', m.version], ['認証ユーザー', m.auth_identity ? [m.auth_identity.email, m.auth_identity.subject].filter(Boolean).join(' / ') : '（なし）'],
+        ['バインド', pv.bind_host], ['既定モデル', m.default_model ? `${provLabel(m.default_model.provider)} / ${m.default_model.model}` : null],
+        ['追加指示の既定', m.follow_up_behavior === 'queue' ? 'Queue (予約)' : m.follow_up_behavior ? 'Steer (割り込み)' : null],
+        ['許可された外部通信', (pv.allowed_outbound_urls || []).length ? pv.allowed_outbound_urls.join(', ') : 'なし（完全ローカル）']].filter((r) => r[1]);
+      const dl = h('dl', { class: 'kv' });
+      rows.forEach(([k, v]) => dl.append(h('dt', { text: k }), h('dd', { text: String(v) })));
+      out.push(dl);
+      if ((pv.notes || []).length) out.push(h('ul', { class: 'notes' }, pv.notes.map((n) => h('li', { text: n }))));
+    } else out.push(h('div', { class: 'errtxt', text: `取得に失敗: ${meta.reason.message}` }));
+    // ── providers
+    if (S.providers.length) {
+      out.push(h('div', { class: 'sec-h', text: 'プロバイダ' }), h('div', { class: 'provs' }, S.providers.map((p) => h('div', { class: `prov-card${p.available ? '' : ' off'}`, title: p.error || p.binary_path || '' },
+        provDot(p.provider), h('b', { text: provLabel(p.provider) }), h('small', { text: p.available ? p.version || '利用可能' : p.error || '未導入' })))));
+    }
+    // ── storage
+    out.push(h('div', { class: 'sec-h', text: 'ストレージ（SQLite + zstd 圧縮）' }));
+    if (db.status === 'fulfilled') {
+      const d = db.value;
+      S.dbStats = d;
+      const raw = Number(d.raw_payload_bytes) || 0; const st = Number(d.stored_payload_bytes) || 0;
+      const ratio = st > 0 ? raw / st : 0;
+      const saved = Math.max(0, raw - st);
+      const pct = raw > 0 ? (saved / raw) * 100 : 0;
+      const bar = (v, cls) => { const i = h('i', { class: cls }); i.style.width = `${raw > 0 ? Math.max(1, (v / raw) * 100) : 0}%`; return h('div', { class: 'bar' }, i); };
+      out.push(h('div', { class: 'sgrid' },
+        scard('DB ファイル', fmtBytes(d.db_size_bytes)), scard('圧縮率', ratio ? `×${ratio.toFixed(2)}` : '–'), scard('節約量', `${fmtBytes(saved)} (${pct.toFixed(0)}%)`),
+        scard('スレッド / Run', `${fmtNum(d.threads_count)} / ${fmtNum(d.runs_count)}`), scard('ターン項目', fmtNum(d.turn_items_count)),
+        scard('重複排除ブロブ / 添付', `${fmtNum(d.dedup_blobs_count)} / ${fmtNum(d.attachments_count)}`)));
+      out.push(h('div', { class: 'dbrow' }, h('span', { text: '元サイズ' }), bar(raw, ''), h('span', { text: fmtBytes(raw) })));
+      out.push(h('div', { class: 'dbrow' }, h('span', { text: '保存サイズ' }), bar(st, 'ok'), h('span', { text: fmtBytes(st) })));
+    } else out.push(h('div', { class: 'errtxt', text: `取得に失敗: ${db.reason.message}` }));
+    // ── orch
+    out.push(h('div', { class: 'sec-h' }, h('span', { text: 'orch-stats（プロバイダ / モデル別）' }), h('button', { class: 'btn xs', type: 'button', text: '更新', onclick: load })));
+    if (orch.status === 'fulfilled') {
+      const rows = [...orch.value].sort((a, b) => b.total_runs - a.total_runs);
+      if (!rows.length) out.push(h('div', { class: 'muted', text: 'まだ実行履歴がありません' }));
+      else {
+        const tot = rows.reduce((a, r) => ({ n: a.n + r.total_runs, ok: a.ok + r.completed_runs, f: a.f + r.failed_runs, i: a.i + r.total_input_tokens, o: a.o + r.total_output_tokens }), { n: 0, ok: 0, f: 0, i: 0, o: 0 });
+        const rate = (r) => (r.total_runs > 0 ? r.completed_runs / r.total_runs : 0);
+        const rateCell = (v, n) => { const i = h('i', { class: v >= .9 ? 'ok' : v >= .6 ? 'warn' : 'err' }); i.style.width = `${v * 100}%`; return h('td', { class: 'rate' }, h('div', { class: 'bar' }, i), n ? `${(v * 100).toFixed(0)}%` : '–'); };
+        const tb = h('tbody');
+        for (const r of rows) {
+          tb.append(h('tr', {}, h('td', {}, provDot(r.provider), ` ${provLabel(r.provider)} / ${r.model}`), h('td', { text: `${fmtNum(r.total_runs)}` }), h('td', { text: `${fmtNum(r.completed_runs)} / ${fmtNum(r.failed_runs)}` }),
+            rateCell(rate(r), r.total_runs), h('td', { text: fmtDur(r.avg_duration_ms) }), h('td', { text: fmtTok(r.total_input_tokens) }), h('td', { text: fmtTok(r.total_output_tokens) })));
         }
-      } else out.push(h('div', { class: 'errtxt', text: `取得に失敗: ${orch.reason.message}` }));
-      body.replaceChildren(...out);
-      renderStatPill();
-    };
-    render();
-  }, { cls: 'wide stats' });
+        tb.append(h('tr', { class: 'total' }, h('td', { text: '合計' }), h('td', { text: fmtNum(tot.n) }), h('td', { text: `${fmtNum(tot.ok)} / ${fmtNum(tot.f)}` }),
+          rateCell(tot.n ? tot.ok / tot.n : 0, tot.n), h('td'), h('td', { text: fmtTok(tot.i) }), h('td', { text: fmtTok(tot.o) })));
+        out.push(h('div', { class: 'twrap' }, h('table', { class: 'tbl' },
+          h('thead', {}, h('tr', {}, ['モデル', '実行', '成功 / 失敗', '成功率', '平均所要', '入力tok', '出力tok'].map((x) => h('th', { text: x })))), tb)));
+      }
+    } else out.push(h('div', { class: 'errtxt', text: `取得に失敗: ${orch.reason.message}` }));
+    el.replaceChildren(...out);
+    renderStatPill();
+  };
+  return { el, load, ready: load() };
 }
 
 // ───────────────────────── diff panel ─────────────────────────
@@ -1996,7 +2429,7 @@ function handleWs(m) {
         S.live.delete(m.thread_id);
         if (m.status === 'failed' && m.error) toast(`実行失敗: ${m.error}`, 'err', 6000);
         if (m.thread_id === cur) { loadDetailSoon(); refreshDiffSoon(); }
-        loadThreadsSoon(); loadDbStatsSoon();
+        loadThreadsSoon(); loadDbStatsSoon(); loadUsageSoon();
       } else if (m.thread_id === cur) { renderHeader(); renderLive(); }
       break;
     }
@@ -2095,9 +2528,16 @@ function wire() {
   $('#btn-add-project').onclick = projectDialog;
   $('#btn-search').onclick = searchDialog;
   $('#btn-sb-search').onclick = searchDialog;
-  $('#btn-stats').onclick = statsDialog;
-  $('#btn-top-stats').onclick = statsDialog;
-  $('#stat-pill').onclick = statsDialog;
+  $('#btn-usage').onclick = () => usageDialog();
+  $('#btn-top-usage').onclick = () => usageDialog();
+  $('#stat-pill').onclick = (e) => usageDialog(e.target.closest('[data-utab]')?.dataset.utab || 'model');
+  $('#btn-kids').setAttribute('aria-pressed', String(S.showKids));
+  $('#btn-kids').onclick = (e) => {
+    S.showKids = !S.showKids; ls.set('t3.kids', S.showKids ? '1' : '0'); S.kidsOpen.clear();
+    e.currentTarget.setAttribute('aria-pressed', String(S.showKids));
+    renderSidebar();
+  };
+  renderUsagePill();
   $('#btn-archived').onclick = (e) => {
     S.showArchived = !S.showArchived; ls.set('t3.archived', S.showArchived ? '1' : '0');
     e.currentTarget.setAttribute('aria-pressed', String(S.showArchived));
@@ -2196,6 +2636,12 @@ function wire() {
     const k = e.key.toLowerCase();
     const modal = $('dialog[open]');
     if (k === 'k') { if (modal && !modal.classList.contains('search')) return; e.preventDefault(); searchDialog(); return; }
+    if (k === 'u') {
+      if (e.target.closest?.('input, textarea, select, [contenteditable="true"]')) return;
+      e.preventDefault(); // Ctrl+U would otherwise open "view source"
+      if (modal?.classList.contains('usage')) modal.close(); else if (!modal) usageDialog();
+      return;
+    }
     if (!['b', 'd', 'n'].includes(k)) return;
     e.preventDefault();
     if (modal) return;
@@ -2228,7 +2674,7 @@ async function boot() {
     if (meta?.follow_up_behavior && !ls.get('t3.behavior', '')) S.behavior = meta.follow_up_behavior === 'queue' ? 'queue' : 'steer';
     await loadProjects();
     S.compose.sel = defaultSelection(S.projectId);
-    renderComposer(); renderStatPill(); loadDbStats();
+    renderComposer(); renderStatPill(); loadDbStats(); loadUsage(7);
     await loadThreads();
   } catch (e) {
     setConn('bad', `サーバーに接続できません: ${e.message}`);
@@ -2238,6 +2684,7 @@ async function boot() {
   else if (!isCoarse() && !$('dialog[open]')) ta().focus();
   $('#app').classList.add('ready');
   setInterval(() => { if (!document.hidden) loadThreads().catch(() => {}); }, 15000);
+  setInterval(() => { if (!document.hidden) loadUsage(7); }, 5 * 60000);
 }
 
 boot();

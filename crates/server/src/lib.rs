@@ -8,12 +8,14 @@ mod database;
 pub mod privacy;
 pub mod routes;
 mod threads;
+mod usage;
 mod ws;
 
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    path::PathBuf,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use t3_core::{CoreError, CoreResult, McpInjectionSpec, ServerConfig, create_private_dir};
@@ -36,6 +38,8 @@ pub struct ServerState {
     pub store: SqliteStore,
     pub config: Arc<ServerConfig>,
     auth: AuthLayer,
+    usage_home: Option<PathBuf>,
+    usage_cache: Arc<Mutex<usage::UsageScanCache>>,
     mcp: Arc<McpServer<RunCoordinator>>,
 }
 
@@ -61,6 +65,8 @@ impl ServerState {
             store,
             auth,
             config: Arc::new(config),
+            usage_home: std::env::home_dir(),
+            usage_cache: Arc::new(Mutex::new(usage::UsageScanCache::default())),
         })
     }
 }

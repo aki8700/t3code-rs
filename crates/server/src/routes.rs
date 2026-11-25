@@ -46,6 +46,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/search", get(search))
         .route("/api/stats/orch", get(orch_stats))
         .route("/api/stats/db", get(db_stats))
+        .route("/api/usage", get(crate::usage::get))
         .route("/ws", get(ws::upgrade))
         .route_layer(middleware::from_fn_with_state(
             state.auth.clone(),
@@ -184,7 +185,7 @@ async fn threads(
             .thread_list(
                 query.project_id,
                 query.include_archived,
-                query.limit.unwrap_or(200),
+                query.limit.unwrap_or(500),
             )
             .await?,
     ))

@@ -38,6 +38,7 @@
       <section class="sb-section">
         <h3 class="sb-h">
           <span>プロジェクト</span><span class="grow"></span>
+          <button type="button" class="ibtn xs" id="btn-kids" data-icon="split" title="子スレッド（委譲・分岐）をすべて展開／折りたたみ" aria-label="子スレッドを表示" aria-pressed="false"></button>
           <button type="button" class="ibtn xs" id="btn-archived" data-icon="archive" title="アーカイブ済みを表示" aria-label="アーカイブ済みを表示" aria-pressed="false"></button>
         </h3>
         <div id="project-groups"></div>
@@ -46,8 +47,8 @@
     </div>
     <div class="sb-foot">
       <button type="button" class="foot-row" id="btn-sb-search" data-icon="search"><span>検索</span><kbd data-kbd-label="K"></kbd></button>
-      <button type="button" class="foot-row" id="btn-stats" data-icon="chart"><span>統計・プライバシー</span></button>
       <button type="button" class="foot-row" id="btn-theme" data-icon="palette" aria-haspopup="true"><span>テーマ</span><small id="theme-name"></small></button>
+      <button type="button" class="foot-row usage-row" id="btn-usage" data-icon="chart" aria-haspopup="dialog"><span>使用量</span><small class="usage-pill" id="usage-pill">…</small></button>
       <div class="conn" id="conn" title="WebSocket 接続状態"><span class="dot"></span><span id="conn-text">接続中…</span></div>
     </div>
   </aside>
@@ -63,7 +64,7 @@
         <button type="button" class="tbtn thread-only" id="btn-delegate" data-icon="split" title="子スレッドとして並列に委譲 (Delegate)"><span class="lbl">委譲</span></button>
         <button type="button" class="tbtn thread-only" id="btn-diff" data-icon="diff" data-kbd="D" data-title="Git 差分" aria-pressed="false"><span class="lbl">Diff</span><span class="diff-badge" id="diff-badge" hidden></span></button>
         <button type="button" class="ibtn wide-only" id="btn-search" data-icon="search" data-kbd="K" data-title="全文検索" aria-label="検索"></button>
-        <button type="button" class="ibtn wide-only" id="btn-top-stats" data-icon="chart" title="統計・プライバシー" aria-label="統計"></button>
+        <button type="button" class="ibtn wide-only" id="btn-top-usage" data-icon="chart" data-kbd="U" data-title="使用量" aria-label="使用量"></button>
       </div>
     </header>
     <div id="children-bar" class="children-bar" hidden></div>
@@ -99,7 +100,7 @@
       </form>
 
       <div id="hero-extra" class="hero-extra"></div>
-      <button type="button" class="stat-pill" id="stat-pill" title="orch-stats / DB / プライバシーの詳細を開く"></button>
+      <button type="button" class="stat-pill" id="stat-pill" title="使用量・DB・プライバシーの詳細を開く"></button>
     </div>
     <div class="drop-hint" id="drop-hint" hidden><span>ドロップして添付</span></div>
   </main>

@@ -451,3 +451,29 @@ async fn respond_to_mcp(mut socket: TcpStream, id: u64) {
     );
     socket.write_all(response.as_bytes()).await.unwrap();
 }
+
+#[tokio::test]
+async fn import_history_rejects_source_as_destination() {
+    let dir = Fixture::new();
+    let config = ServerConfig {
+        data_dir: dir.0.clone(),
+        ..Default::default()
+    };
+    let source = dir.0.join("legacy.sqlite");
+    fs::write(&source, b"source fixture").unwrap();
+    fs::hard_link(&source, config.db_path()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_t3d"))
+        .args(["import-history", "--from"])
+        .arg(&source)
+        .arg("--data-dir")
+        .arg(&dir.0)
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("source and destination databases must differ")
+    );
+    assert_eq!(fs::read(source).unwrap(), b"source fixture");
+}
