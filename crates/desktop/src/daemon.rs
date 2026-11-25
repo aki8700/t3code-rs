@@ -76,6 +76,26 @@ fn spawn_at(executable: &Path, config: Option<&Path>) -> io::Result<Child> {
     if let Some(path) = config.filter(|path| path.is_file()) {
         command.arg("--config").arg(path);
     }
+    #[cfg(unix)]
+    {
+        let mut entries: Vec<PathBuf> = env::var_os("PATH")
+            .map(|p| env::split_paths(&p).collect())
+            .unwrap_or_default();
+        let mut extras = Vec::new();
+        if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+            extras.push(home.join(".local/bin"));
+        }
+        extras.push(PathBuf::from("/opt/homebrew/bin"));
+        extras.push(PathBuf::from("/usr/local/bin"));
+        for dir in extras.into_iter().rev() {
+            if !entries.contains(&dir) {
+                entries.insert(0, dir);
+            }
+        }
+        if let Ok(joined) = env::join_paths(entries) {
+            command.env("PATH", joined);
+        }
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())

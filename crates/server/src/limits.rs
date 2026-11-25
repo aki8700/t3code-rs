@@ -998,15 +998,53 @@ pub(crate) fn sort_antigravity_windows(windows: &mut [UsageLimitWindow]) {
 
 // ───────────────────────── Claude CLI probe ─────────────────────────
 
+fn resolve_cli_bin(configured: &Path) -> Option<PathBuf> {
+    if configured.is_file() {
+        return Some(configured.to_path_buf());
+    }
+    // Only search fallback locations for a bare binary name (not an explicit missing path).
+    if configured.components().count() != 1 {
+        return None;
+    }
+    let name = configured.file_name()?;
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    if let Some(home) = std::env::home_dir() {
+        let local = home.join(".local/bin").join(name);
+        if local.is_file() {
+            return Some(local);
+        }
+    }
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        let cand = Path::new(dir).join(name);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
 async fn probe_claude(bin: &Path, now: DateTime<Utc>) -> ProviderUsageLimits {
-    if !bin.is_file() {
+    let Some(resolved) = resolve_cli_bin(bin) else {
         return unavailable(
             ProviderId::Claude,
             now,
             "Claude CLI が見つかりません。設定の claude_bin を確認してください。",
         );
-    }
-    let mut cmd = prepare_probe_cmd(bin);
+    };
+    let mut cmd = prepare_probe_cmd(&resolved);
+    // Claude Code 2.1.330+ suppresses `rate_limits` in `get_usage` when
+    // CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 is set; keep telemetry,
+    // error reporting, and auto-updater explicitly disabled instead.
+    cmd.env_remove("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+        .env("DISABLE_ERROR_REPORTING", "1")
+        .env("DISABLE_AUTOUPDATER", "1");
     cmd.args([
         "--print",
         "--output-format",
@@ -1108,8 +1146,8 @@ async fn probe_claude(bin: &Path, now: DateTime<Utc>) -> ProviderUsageLimits {
 // ───────────────────────── Codex CLI probe & reset credit ─────────────────────────
 
 async fn probe_codex(bin: &Path, home: Option<&Path>, now: DateTime<Utc>) -> ProviderUsageLimits {
-    if bin.is_file() {
-        match probe_codex_app_server(bin, now).await {
+    if let Some(resolved) = resolve_cli_bin(bin) {
+        match probe_codex_app_server(&resolved, now).await {
             Ok(limits) if !limits.windows.is_empty() => return limits,
             Ok(limits) => {
                 if let Some(home) = home
