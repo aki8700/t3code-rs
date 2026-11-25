@@ -115,6 +115,7 @@ impl RunCoordinator {
                 params![id, selection, Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)],
             )
         }).await?;
+        self.clear_live_context(thread.id).await;
         Ok(())
     }
 

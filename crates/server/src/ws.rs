@@ -70,13 +70,21 @@ async fn run(mut socket: WebSocket, coordinator: RunCoordinator, identity: AuthI
                     Some(Ok(event)) => {
                         let visible = match &event {
                             WsServerMessage::Delta { thread_id, .. }
-                            | WsServerMessage::TurnItemAdded { thread_id, .. } => subscriptions.contains(thread_id),
+                            | WsServerMessage::TurnItemAdded { thread_id, .. }
+                            | WsServerMessage::RunUsageUpdated { thread_id, .. } => {
+                                subscriptions.contains(thread_id)
+                            }
                             WsServerMessage::SwarmUpdated { board, .. } => board.members.iter().any(|member| subscriptions.contains(&member.thread_id)),
                             _ => true,
                         };
                         if visible && !send(&mut socket, &event).await { return; }
                     }
-                    Some(Err(_)) | None => {
+                    Some(Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(
+                        skipped,
+                    ))) => {
+                        tracing::debug!(skipped, "WebSocket client lagged behind broadcast channel");
+                    }
+                    None => {
                         let _ = socket.close().await;
                         return;
                     }

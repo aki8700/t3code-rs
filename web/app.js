@@ -1,251 +1,20 @@
-// t3code-rs web UI — vanilla ES module. No build step, no external requests.
-// All dynamic text goes through textContent / esc(); the Markdown renderer escapes before it builds HTML.
-
-// ───────────────────────── utilities ─────────────────────────
-const $ = (s, r = document) => r.querySelector(s);
-const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ESC[c]);
-
-function h(tag, attrs, ...kids) {
-  const el = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs || {})) {
-    if (v == null || v === false) continue;
-    if (k === 'class') el.className = v;
-    else if (k === 'text') el.textContent = v;
-    else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
-    else if (k === 'dataset') { for (const [a, b] of Object.entries(v)) if (b != null) el.dataset[a] = b; }
-    else if (k in el && k !== 'list' && k !== 'form') { try { el[k] = v; } catch { el.setAttribute(k, v); } }
-    else el.setAttribute(k, v === true ? '' : v);
-  }
-  for (const kid of kids.flat()) {
-    if (kid == null || kid === false || kid === '') continue;
-    el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
-  }
-  return el;
-}
-
-const ls = {
-  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : v; } catch { return d; } },
-  set(k, v) { try { localStorage.setItem(k, v); } catch { /* storage may be unavailable */ } },
-  json(k, d) { try { return JSON.parse(this.get(k, '')) ?? d; } catch { return d; } },
-};
-
-const ICONS = {
-  panel: '<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M9.5 4v16"/>',
-  compose: '<path d="M11 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-5"/><path d="M17.5 3.5a2.1 2.1 0 0 1 3 3L12 15l-4 1 1-4z"/>',
-  search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.8-3.8"/>',
-  diff: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M12 8v5M9.5 10.5h5M9.5 17h5"/>',
-  chart: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
-  palette: '<path d="M12 3a9 9 0 1 0 0 18c1.2 0 2-.9 2-2 0-.6-.2-1-.6-1.4-.3-.4-.6-.8-.6-1.4 0-1.1.9-2 2-2h2.4c2.1 0 3.8-1.7 3.8-3.8C21 6 17 3 12 3z"/><circle cx="7.5" cy="11" r="1"/><circle cx="10.5" cy="7.5" r="1"/><circle cx="15" cy="7.8" r="1"/>',
-  plus: '<path d="M12 5v14M5 12h14"/>',
-  folderPlus: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM12 11v5M9.5 13.5h5"/>',
-  clip: '<path d="M21 11l-9 9a5 5 0 0 1-7-7l9-9a3.5 3.5 0 0 1 5 5l-9 9a2 2 0 0 1-3-3l8-8"/>',
-  stop: '<rect class="fill" x="7" y="7" width="10" height="10" rx="2"/>',
-  arrowUp: '<path d="M12 19V5M5.5 11.5L12 5l6.5 6.5"/>',
-  down: '<path d="M12 5v14M6 13l6 6 6-6"/>',
-  fork: '<circle cx="6" cy="5" r="2.2"/><circle cx="6" cy="19" r="2.2"/><circle cx="18" cy="7" r="2.2"/><path d="M6 7.2v9.6M18 9.2c0 4.5-6 3.800-11 7"/>',
-  split: '<circle cx="12" cy="5" r="2.2"/><circle cx="5" cy="19" r="2.2"/><circle cx="19" cy="19" r="2.2"/><path d="M12 7.2V11M12 11c-4 0-7 2-7 5.8M12 11c4 0 7 2 7 5.8"/>',
-  close: '<path d="M6 6l12 12M18 6L6 18"/>',
-  refresh: '<path d="M21 12a9 9 0 1 1-2.700-6.400L21 8M21 3v5h-5"/>',
-  expand: '<path d="M7 9l5-5 5 5M7 15l5 5 5-5"/>',
-  pin: '<path d="M12 17v5M9 3h6l-1 7 3.500 4h-11L10 10z"/>',
-  archive: '<path d="M3 4h18v4.500H3zM5 8.500V20h14V8.500M10 12.500h4"/>',
-  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>',
-  check: '<path d="M5 12.500l4.500 4.500L19 7.500"/>',
-  chevron: '<path d="M9 6l6 6-6 6"/>',
-  chevDown: '<path d="M6 9l6 6 6-6"/>',
-  terminal: '<path d="M5 7l5 5-5 5M12.500 17H19"/>',
-  tool: '<path d="M14.700 6.300a4 4 0 0 0 5 5L11 20a2.100 2.100 0 0 1-3-3l8.700-8.700a4 4 0 0 0-5-5l2.600 2.600-.600 3-3 .600-2.600-2.600a4 4 0 0 0 5 5"/>',
-  file: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8zM14 3v5h5"/>',
-  filePen: '<path d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h4M13 3v5h5M18.400 12.600a1.900 1.900 0 0 1 2.700 2.700L16 20.400l-3.500.800.800-3.500z"/>',
-  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.200 3 14.800 0 18M12 3c-3 3.200-3 14.800 0 18"/>',
-  bot: '<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 4v4M9 13v2M15 13v2"/>',
-  handoff: '<path d="M4 8h14M14 4l4 4-4 4M20 16H6M10 12l-4 4 4 4"/>',
-  brain: '<path d="M9 4a3 3 0 0 0-3 3 3.500 3.500 0 0 0-2 6 3.500 3.500 0 0 0 3 5.500A2.500 2.500 0 0 0 12 18V6a2.500 2.500 0 0 0-3-2zM15 4a3 3 0 0 1 3 3 3.500 3.500 0 0 1 2 6 3.500 3.500 0 0 1-3 5.500A2.500 2.500 0 0 1 12 18"/>',
-  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.500v.01"/>',
-  shield: '<path d="M12 3l8 3v6c0 4.500-3.300 8-8 9-4.700-1-8-4.500-8-9V6z"/><path d="M8.500 12l2.500 2.500 4.500-5"/>',
-  alert: '<path d="M12 4l9.500 16h-19zM12 10v4M12 17v.01"/>',
-  swarm: '<circle cx="12" cy="5.500" r="2.500"/><circle cx="5.500" cy="17.500" r="2.500"/><circle cx="18.500" cy="17.500" r="2.500"/><path d="M10.800 7.700l-4.100 7.600M13.200 7.700l4.100 7.600M8 17.500h8"/>',
-  open: '<path d="M14 4h6v6M20 4l-9 9M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/>',
-  ticket: '<path d="M3 9a3 3 0 0 1 0 6v3a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1v-3a3 3 0 0 1 0-6V6a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1zM14 5v2.500M14 10.750v2.500M14 16.500V19"/>',
-  trendUp: '<path d="M16 7h6v6M22 7l-8.500 8.500-5-5L2 17"/>',
-  trendDown: '<path d="M16 17h6v-6M22 17l-8.500-8.500-5 5L2 7"/>',
-  gauge: '<path d="M12 14l4-4M3.340 19a10 10 0 1 1 17.320 0"/>',
-};
-const svg = (n) => `<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n] || ''}</svg>`;
-const iconEl = (n, cls = '') => { const s = h('span', { class: `iw ${cls}` }); s.innerHTML = svg(n); return s; };
-const hydrateIcons = (root = document) => $$('[data-icon]', root).forEach((el) => { if (!el.querySelector('svg')) el.insertAdjacentHTML('afterbegin', svg(el.dataset.icon)); });
-const ibtn = (ic, title, onclick, cls = '') => {
-  const b = h('button', { class: `ibtn ${cls}`, type: 'button', title, 'aria-label': title, onclick });
-  b.innerHTML = svg(ic);
-  return b;
-};
-
-const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
-const kbd = (k) => (IS_MAC ? `⌘${k}` : `Ctrl+${k}`);
-
-function fmtAgo(iso) {
-  const t = Date.parse(iso); if (!t) return '';
-  const now = new Date();
-  const s = Math.max(0, (now - t) / 1000);
-  if (s < 45) return 'たった今';
-  if (s < 3600) return `${Math.max(1, Math.round(s / 60))}分前`;
-  if (s < 86400) return `${Math.floor(s / 3600)}時間前`;
-  const day = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-  const days = Math.round((day(now) - day(new Date(t))) / 86400000);
-  if (days <= 1) return '昨日';
-  if (days < 30) return `${days}日前`;
-  return new Date(t).toLocaleDateString('ja-JP', { year: '2-digit', month: 'numeric', day: 'numeric' });
-}
-function fmtDur(ms) {
-  if (ms == null || !isFinite(ms)) return '–';
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(1)}秒`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}分${Math.floor(s % 60)}秒`;
-  return `${Math.floor(m / 60)}時間${m % 60}分`;
-}
-function fmtBytes(n) {
-  n = Number(n) || 0;
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(2)} MB`;
-  return `${(n / 1024 ** 3).toFixed(2)} GB`;
-}
-const fmtNum = (n) => Number(n || 0).toLocaleString('ja-JP');
-function fmtTok(n) {
-  n = Number(n) || 0;
-  if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
-  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
-  return String(n);
-}
-const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
-const rafThrottle = (fn) => { let q = false; return () => { if (q) return; q = true; requestAnimationFrame(() => { q = false; fn(); }); }; };
-const clip = (s, n) => { s = String(s ?? ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
-const oneLine = (s, n = 200) => clip(String(s ?? '').replace(/\s+/g, ' ').trim(), n);
-const pretty = (v) => { try { return typeof v === 'string' ? v : JSON.stringify(v, null, 2); } catch { return String(v); } };
-const isCoarse = () => matchMedia('(pointer: coarse)').matches;
-const isNarrow = () => matchMedia('(max-width: 860px)').matches;
-const hashNum = (s) => { let n = 0; for (const c of String(s)) n = (n * 31 + c.codePointAt(0)) >>> 0; return n; };
-
-/** Display form of a thread title: no Markdown heading markers or agent XML wrappers, single spaced. */
-function cleanTitle(src) {
-  const raw = String(src ?? '');
-  let s = raw.replace(/<(command-name|command-message|command-args|system-reminder|local-command-caveat)\b[^<>]*>[\s\S]*?(<\/\1>|$)/gi, ' ');
-  if (/<user_action\b/i.test(s)) s = s.replace(/<\/?[a-z][\w-]*[^<>]*(>|$)/gi, ' ');
-  s = s.replace(/<\/?[a-z]+(?:[-_][a-z]+)+(?:\s[^<>]*)?(>|$)/gi, ' ')
-    .replace(/\s+/g, ' ').trim()
-    .replace(/^(?:#{1,6}(?:\s+|$)|>\s*)+/, '').trim();
-  if (s) return s;
-  const cmd = /<command-name>\s*([^<]*)/i.exec(raw)?.[1].trim();
-  return cmd || (/<user_action\b/i.test(raw) ? 'ユーザー操作' : '(無題)');
-}
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-/** SHA-1 (only for UUIDv5; crypto.subtle is unavailable on plain-http non-loopback origins). */
-function sha1(bytes) {
-  const len = ((bytes.length + 8 >> 6) + 1) * 64;
-  const buf = new Uint8Array(len); buf.set(bytes); buf[bytes.length] = 0x80;
-  const view = new DataView(buf.buffer);
-  view.setUint32(len - 4, (bytes.length * 8) >>> 0);
-  const H = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
-  const w = new Uint32Array(80);
-  const rol = (x, n) => (x << n) | (x >>> (32 - n));
-  for (let off = 0; off < len; off += 64) {
-    for (let i = 0; i < 80; i++) w[i] = i < 16 ? view.getUint32(off + i * 4) : rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
-    let [a, b, c, d, e] = H;
-    for (let i = 0; i < 80; i++) {
-      const [fn, k] = i < 20 ? [(b & c) | (~b & d), 0x5a827999] : i < 40 ? [b ^ c ^ d, 0x6ed9eba1] : i < 60 ? [(b & c) | (b & d) | (c & d), 0x8f1bbcdc] : [b ^ c ^ d, 0xca62c1d6];
-      const t = (rol(a, 5) + fn + e + k + w[i]) | 0;
-      e = d; d = c; c = rol(b, 30); b = a; a = t;
-    }
-    [a, b, c, d, e].forEach((v, i) => { H[i] = (H[i] + v) | 0; });
-  }
-  return H.flatMap((v) => [v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]);
-}
-/**
- * Local thread id for a payload / link reference. Imported history keeps upstream string ids ("thread:…");
- * the importer stores those threads under UUIDv5(NAMESPACE_URL, id).
- */
-function resolveThreadId(raw) {
-  const s = String(raw || '');
-  if (UUID_RE.test(s)) return s.toLowerCase();
-  if (!s.startsWith('thread:')) return '';
-  const ns = [0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8];
-  const b = sha1(new Uint8Array([...ns, ...new TextEncoder().encode(s)])).slice(0, 16);
-  b[6] = (b[6] & 0x0f) | 0x50; b[8] = (b[8] & 0x3f) | 0x80;
-  const hex = b.map((x) => x.toString(16).padStart(2, '0')).join('');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-
-function toast(msg, kind = '', ms = 3800) {
-  const box = $('#toasts');
-  const el = h('div', { class: `toast ${kind}`, text: msg });
-  box.append(el);
-  // re-show so the popover sits above any open modal <dialog> in the top layer
-  try { box.hidePopover(); box.showPopover(); } catch { /* popover unsupported */ }
-  setTimeout(() => { el.remove(); if (!box.childElementCount) { try { box.hidePopover(); } catch { /* noop */ } } }, ms);
-}
-
-// ───────────────────────── desktop shell (wry / WKWebView) ─────────────────────────
-const isDesktop = () => window.__T3_DESKTOP__ === true || document.documentElement.classList.contains('t3-desktop');
-const ipc = (msg) => window.ipc?.postMessage(msg);
-
-function wireDesktop() {
-  if (window.__T3_DESKTOP__ === true) document.documentElement.classList.add('t3-desktop');
-  const INTERACTIVE = 'button, input, textarea, select, a, label, summary, [role="button"], [contenteditable="true"], .no-drag';
-  const onDragRegion = (e) => isDesktop() && e.button === 0 && e.target.closest?.('.drag-region') && !e.target.closest(INTERACTIVE);
-  // The second press of a double click must not start a window drag, or dblclick never fires.
-  document.addEventListener('mousedown', (e) => { if (onDragRegion(e) && e.detail < 2) ipc('drag'); });
-  document.addEventListener('dblclick', (e) => { if (onDragRegion(e)) ipc('toggle-maximize'); });
-  document.addEventListener('click', (e) => {
-    if (!isDesktop()) return;
-    const a = e.target.closest?.('a[target="_blank"]');
-    if (!a || !/^https?:/i.test(a.href)) return;
-    e.preventDefault();
-    ipc(`open-external:${a.href}`);
-  });
-}
-
-// ───────────────────────── labels & domain helpers ─────────────────────────
-const PROVIDER_LABEL = { claude: 'Claude', codex: 'Codex', antigravity: 'Antigravity', 'open-code': 'OpenCode', opencode: 'OpenCode', mock: 'Mock' };
-const PROVIDER_FALLBACK = ['claude', 'codex', 'antigravity', 'open-code'];
-const provLabel = (p) => PROVIDER_LABEL[p] || p || '?';
-const provClass = (p) => `p-${p === 'opencode' ? 'open-code' : p || 'mock'}`;
-const provDot = (p, extra = '') => h('span', { class: `pdot ${provClass(p)} ${extra}`, title: provLabel(p) });
-const TIERS = {
-  0: { label: 'Tier 0 無料/ローカル' },
-  1: { label: 'Tier 1 高速' },
-  2: { label: 'Tier 2 監査' },
-  3: { label: 'Tier 3 設計' },
-};
-const EFFORT_FALLBACK = ['low', 'medium', 'high', 'xhigh'];
-const STATUS_LABEL = {
-  idle: '待機', running: '実行中', 'waiting-for-children': '子の完了待ち', 'rate-limited': 'レート制限', completed: '完了', failed: '失敗', interrupted: '中断',
-  queued: '待ち行列', cancelled: '取消',
-};
-const REL_LABEL = { delegate: '委譲', delegated: '委譲', fork: '分岐', forked: '分岐', handoff: '引継', child: '子' };
-const MODES = ['approval-required', 'auto-accept-edits', 'full-access'];
-const MODE_LABEL = { 'approval-required': '承認制', 'auto-accept-edits': '編集自動', 'full-access': 'フルアクセス' };
-const MODE_HINT = {
-  'approval-required': '変更やコマンド実行の前に承認を求めます',
-  'auto-accept-edits': 'ファイル編集は自動承認し、それ以外は承認を求めます',
-  'full-access': '承認なしですべて実行します。信頼できる作業でのみ使ってください',
-};
-const BUSY = new Set(['running', 'waiting-for-children', 'rate-limited']);
-const TERMINAL_RUN = new Set(['completed', 'failed', 'cancelled']);
-const isBusy = (st) => BUSY.has(st);
-
-function authLabel(m) {
-  m = String(m || '').toLowerCase();
-  if (m.includes('cloudflare')) return 'Cloudflare Access';
-  if (m.includes('tailscale')) return 'Tailscale';
-  if (m.includes('bearer')) return 'Bearer トークン';
-  if (m.includes('local')) return 'LocalOnly（ループバック限定）';
-  return m || '不明';
-}
+// t3code-rs web UI — vanilla ES modules (no build step, zero external requests).
+import {
+  $, $$, esc, h, ls, svg, svgNode, iconEl, hydrateIcons, ibtn,
+  IS_MAC, kbd, fmtAgo, fmtDur, fmtBytes, fmtNum, fmtTok, fmtCompact, fmtShare, fmtUsd, fmtPctCompact,
+  debounce, rafThrottle, clip, oneLine, pretty, isCoarse, isNarrow, hashNum, compactPath, kindLetter,
+  cleanTitle, resolveThreadId, pstr, textOf, toast, copyText, isDesktop, ipc, wireDesktop,
+  PROVIDER_FALLBACK, provLabel, provClass, provDot, TIERS, EFFORT_FALLBACK, STATUS_LABEL, REL_LABEL,
+  MODES, MODE_LABEL, MODE_HINT, TERMINAL_RUN, isBusy, authLabel, THEMES,
+} from './js/util.js';
+import { md, mdEl } from './js/markdown.js';
+import {
+  fileEntries, changedFiles, patchLines, latestTurnChangedPaths, filterDiffFilesByPaths,
+} from './js/patch.js';
+import { wireRailResizer } from './js/rail.js';
+import {
+  CTX_SOURCE_LABEL, CTX_KIND_META, fallbackContextWindow, contextRingSvg, setContextRing, ctxSection,
+} from './js/context-ui.js';
 
 // ───────────────────────── state ─────────────────────────
 const S = {
@@ -274,9 +43,18 @@ const S = {
   heroSel: ls.json('t3.sel', null),
   optimistic: [],
   stick: true,
-  rail: ['diff', 'swarm'].find((x) => x === ls.get('t3.rail', '')) || null, // which panel owns the right rail
+  rail: (() => {
+    const saved = ls.get('t3.rail', null);
+    if (saved === 'none' || saved === '') return null;
+    if (['context', 'diff', 'swarm'].includes(saved)) return saved;
+    return innerWidth > 1180 ? 'context' : null;
+  })(), // which panel owns the right rail
   swarms: new Map(),      // threadId -> SwarmBoardSnapshot
+  liveUsage: new Map(),   // threadId -> { runId, context_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens }
   diffStat: null,         // { threadId, add, del, files }
+  diffData: null,         // { threadId, data }
+  diffError: null,        // { threadId, message }
+  diffScope: ls.get('t3.diffScope', 'all') === 'latest' ? 'latest' : 'all',
   ignoreWs: ls.get('t3.ws', '1') !== '0',
   dbStats: null,
   usage: { days: 7, metric: 'cost', tab: 'model', hidden: new Set(), cache: new Map(), errors: new Map(), pending: new Map(), seq: new Map(), refreshing: new Set(), onchange: null },
@@ -443,172 +221,7 @@ document.addEventListener('pointerdown', (e) => {
 }, true);
 addEventListener('resize', () => popover?.place());
 
-// ───────────────────────── Markdown (safe: escape first, never raw HTML) ─────────────────────────
-const SAFE_URL = /^(https?:\/\/|\/(?!\/)|#|mailto:)/i;
-const LOCAL_PATH = /^(file:\/\/|~\/|\/(Users|home|private|tmp|var|Volumes|opt|etc)\/)/;
-const MD_MAX_DEPTH = 16; // nested quotes / lists beyond this stay plain text (no stack exhaustion)
-const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
-
-function mdInline(src) {
-  const stash = [];
-  const put = (html) => { stash.push(html); return `\u0000${stash.length - 1}\u0001`; };
-  let s = String(src).replace(/[\u0000\u0001]/g, '');
-  s = s.replace(/(`+)([\s\S]*?[^`])\1(?!`)/g, (_, __, code) => put(`<code>${esc(code.trim())}</code>`));
-  s = esc(s);
-  const emph = (t) => t
-    .replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/__([^_\n]+?)__/g, '<strong>$1</strong>')
-    .replace(/(^|[^*\w])\*([^*\s][^*\n]*?)\*(?!\*)/g, '$1<em>$2</em>')
-    .replace(/(^|[^\w_])_([^_\s][^_\n]*?)_(?![\w_])/g, '$1<em>$2</em>')
-    .replace(/~~([^~\n]+?)~~/g, '<del>$1</del>');
-  // Placeholders (\u0000n\u0001) stand for finished HTML, so no URL pattern may ever swallow one into an attribute.
-  // images are never fetched (privacy): show as plain link
-  s = s.replace(/!?\[([^\]\n]+)\]\((&lt;[^\n\u0000\u0001]*?&gt;|[^)\s\u0000\u0001]+)(?:\s+&quot;[^)\u0000\u0001]*&quot;)?\)/g, (m, t, url) => {
-    const u = url.startsWith('&lt;') && url.endsWith('&gt;') ? url.slice(4, -4) : url;
-    if (u.startsWith('t3-thread:')) {
-      const id = resolveThreadId(safeDecode(u.split('/').pop())) || resolveThreadId(u.split('/').pop());
-      return id ? put(`<button type="button" class="thread-chip" data-thread="${id}">${emph(t)} →</button>`) : m;
-    }
-    if (LOCAL_PATH.test(u)) {
-      const path = esc(safeDecode(u.replace(/^file:\/\//, '').replace(/&amp;/g, '&').replace(/&#39;/g, "'")));
-      return put(`<button type="button" class="path-chip" data-path="${path}" title="${path}（クリックでコピー）">${emph(t)}</button>`);
-    }
-    return SAFE_URL.test(u) ? put(`<a href="${u}" target="_blank" rel="noopener noreferrer">${emph(t)}</a>`) : m;
-  });
-  s = s.replace(/(^|[\s(（])(https?:\/\/[^\s<>"'\u0000\u0001()（）]*[^\s<>"'\u0000\u0001()（）.,;:!?、。])/g, (m, pre, u) => `${pre}${put(`<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`)}`);
-  s = emph(s);
-  for (let i = 0; i < 4 && /\u0000\d+\u0001/.test(s); i++) s = s.replace(/\u0000(\d+)\u0001/g, (_, n) => stash[+n]);
-  return s;
-}
-
-function mdCodeBlock(code, lang) {
-  lang = (lang || '').replace(/[^\w+#.-]/g, '').slice(0, 24);
-  const isDiff = lang === 'diff' || lang === 'patch';
-  const body = isDiff ? code.split('\n').map((l) => {
-    const c = l.startsWith('+') && !l.startsWith('+++') ? 'dl-add' : l.startsWith('-') && !l.startsWith('---') ? 'dl-del' : l.startsWith('@@') ? 'dl-hunk' : '';
-    return `<span class="${c}">${esc(l) || ' '}</span>`;
-  }).join('') : esc(code);
-  return `<div class="codeblock"><div class="cb-head"><span>${esc(lang || 'text')}</span><button type="button" data-copy>${svg('copy')}<span>コピー</span></button></div><pre><code${isDiff ? ' class="diffc"' : ''}>${body}</code></pre></div>`;
-}
-
-const RE_FENCE = /^\s*(`{3,}|~{3,})\s*([^\s`]*)/;
-const RE_HR = /^\s*([-*_])(\s*\1){2,}\s*$/;
-const RE_LI = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
-const RE_TSEP = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
-const indentOf = (l) => l.match(/^\s*/)[0].length;
-
-function mdBlocks(lines, depth = 0) {
-  const out = [];
-  let i = 0;
-  const startsBlock = (l, next) => RE_FENCE.test(l) || /^#{1,6}\s/.test(l) || RE_HR.test(l) || /^\s*>/.test(l) || RE_LI.test(l)
-    || (l.includes('|') && next != null && RE_TSEP.test(next) && next.includes('-'));
-  while (i < lines.length) {
-    const line = lines[i];
-    let m = RE_FENCE.exec(line);
-    if (m) {
-      const f = m[1];
-      const close = new RegExp(`^\\s*${f[0] === '`' ? '`' : '~'}{${f.length},}\\s*$`);
-      const buf = []; i++;
-      while (i < lines.length && !close.test(lines[i])) buf.push(lines[i++]);
-      i++;
-      out.push(mdCodeBlock(buf.join('\n'), m[2]));
-      continue;
-    }
-    if (!line.trim()) { i++; continue; }
-    if ((m = /^(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line))) { out.push(`<h${m[1].length}>${mdInline(m[2])}</h${m[1].length}>`); i++; continue; }
-    if (RE_HR.test(line)) { out.push('<hr>'); i++; continue; }
-    if (depth < MD_MAX_DEPTH && /^\s*>/.test(line)) {
-      const buf = [];
-      while (i < lines.length && /^\s*>/.test(lines[i])) buf.push(lines[i++].replace(/^\s*>\s?/, ''));
-      out.push(`<blockquote>${mdBlocks(buf, depth + 1).join('')}</blockquote>`);
-      continue;
-    }
-    if (line.includes('|') && i + 1 < lines.length && RE_TSEP.test(lines[i + 1]) && lines[i + 1].includes('-')) {
-      const cells = (l) => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
-      const head = cells(line);
-      const al = cells(lines[i + 1]).map((c) => (/^:-+:$/.test(c) ? 'center' : /-+:$/.test(c) ? 'right' : ''));
-      i += 2;
-      const rows = [];
-      while (i < lines.length && lines[i].trim() && lines[i].includes('|')) rows.push(cells(lines[i++]));
-      const td = (tag, c, k) => `<${tag}${al[k] ? ` style="text-align:${al[k]}"` : ''}>${mdInline(c)}</${tag}>`;
-      out.push(`<div class="table-wrap"><table><thead><tr>${head.map((c, k) => td('th', c, k)).join('')}</tr></thead><tbody>${
-        rows.map((r) => `<tr>${head.map((_, k) => td('td', r[k] ?? '', k)).join('')}</tr>`).join('')}</tbody></table></div>`);
-      continue;
-    }
-    if ((m = RE_LI.exec(line))) {
-      const base = m[1].length;
-      const ordered = /\d/.test(m[2]);
-      const start = ordered ? parseInt(m[2], 10) : 1;
-      const items = [];
-      while (i < lines.length) {
-        const lm = RE_LI.exec(lines[i]);
-        if (!lm || lm[1].length !== base) break;
-        const it = { text: lm[3], sub: [] };
-        items.push(it); i++;
-        while (i < lines.length) {
-          const l = lines[i];
-          if (!l.trim()) {
-            const nx = lines.slice(i + 1).find((x) => x.trim());
-            if (nx != null && indentOf(nx) > base) { it.sub.push(''); i++; continue; }
-            break;
-          }
-          if (indentOf(l) > base) { it.sub.push(l); i++; continue; }
-          break;
-        }
-      }
-      const tag = ordered ? 'ol' : 'ul';
-      out.push(`<${tag}${start > 1 ? ` start="${start}"` : ''}>${items.map((it) => {
-        let t = it.text; let box = '';
-        const tm = /^\[( |x|X)\]\s+/.exec(t);
-        if (tm) { box = tm[1] === ' ' ? '☐ ' : '☑ '; t = t.slice(tm[0].length); }
-        let subHtml = '';
-        if (it.sub.length) {
-          const min = Math.min(...it.sub.filter((x) => x.trim()).map(indentOf));
-          const sub = it.sub.map((x) => x.slice(min));
-          subHtml = depth < MD_MAX_DEPTH ? mdBlocks(sub, depth + 1).join('') : `<p>${esc(sub.join('\n'))}</p>`;
-        }
-        return `<li>${box}${mdInline(t)}${subHtml}</li>`;
-      }).join('')}</${tag}>`);
-      continue;
-    }
-    const buf = [line]; i++;
-    while (i < lines.length && lines[i].trim() && !startsBlock(lines[i], lines[i + 1])) buf.push(lines[i++]);
-    out.push(`<p>${buf.map(mdInline).join('<br>')}</p>`);
-  }
-  return out;
-}
-const md = (src) => mdBlocks(String(src ?? '').replace(/\r\n?/g, '\n').split('\n')).join('');
-const mdEl = (src, cls = 'md') => { const el = h('div', { class: cls }); el.innerHTML = md(src); return el; };
-
-// ───────────────────────── payload helpers (defensive: payload shapes are provider-specific) ─────────────────────────
-function pstr(p, ...keys) {
-  if (p == null) return '';
-  if (typeof p === 'string') return p;
-  for (const k of keys) { const v = p[k]; if (typeof v === 'string' && v) return v; }
-  return '';
-}
-function textOf(v) {
-  if (v == null) return '';
-  if (typeof v === 'string') return v;
-  if (Array.isArray(v)) return v.map(textOf).filter(Boolean).join('\n');
-  if (typeof v === 'object') {
-    if (typeof v.text === 'string') return v.text;
-    if (v.content != null) return textOf(v.content);
-    return pretty(v);
-  }
-  return String(v);
-}
-
 // ───────────────────────── theme ─────────────────────────
-const THEMES = [
-  ['system', 'システムに合わせる'],
-  ['dark', 'T3 Code (Dark)'],
-  ['light', 'T3 Code (Light)'],
-  ['ember', 'Ember'],
-  ['ocean', 'Ocean'],
-  ['grove', 'Grove'],
-  ['iris', 'Iris'],
-];
 const darkQuery = matchMedia('(prefers-color-scheme: dark)');
 const resolvedTheme = () => (S.theme === 'system' ? (darkQuery.matches ? 'dark' : 'light') : S.theme);
 function applyTheme() {
@@ -784,6 +397,7 @@ async function patchPerm(id, change) {
     if (i >= 0) S.threads[i] = r;
     if (S.detail?.thread?.id === id) S.detail.thread = r;
     renderComposer();
+    if (shownRail() === 'context') renderContextPanel();
     toast('権限設定を変更しました', 'ok', 2000);
     return true;
   } catch (e) { toast(`権限の変更に失敗: ${e.message}`, 'err'); return false; }
@@ -809,6 +423,7 @@ function setComposeSel(sel) {
   S.compose.sel = sel;
   if (!curThread()) { S.heroSel = sel; ls.set('t3.sel', JSON.stringify(sel)); }
   renderComposer();
+  if (shownRail() === 'context') renderContextPanel();
 }
 function openModelPopover(anchor) {
   const panel = modelPanel({ value: S.compose.sel, onChange: setComposeSel });
@@ -1048,7 +663,8 @@ function goHome(projectId) {
   closePopover(); closeDrawer();
   stashDraft();
   if (S.threadId) clearBlobCache();
-  S.threadId = null; S.detail = null; S.diffStat = null;
+  S.threadId = null; S.detail = null; S.diffStat = null; S.diffData = null; S.diffError = null;
+  diffOpenFiles.clear();
   if (projectId && projectById(projectId)) { S.projectId = projectId; ls.set('t3.project', projectId); } else preferActiveProject();
   S.compose = { sel: defaultSelection(S.projectId), mode: 'approval-required', plan: false, isolation: 'shared', baseRef: '' };
   setHash('');
@@ -1066,12 +682,13 @@ async function openThread(id, { push = true } = {}) {
   if (id !== S.threadId) {
     stashDraft();
     S.threadId = id;
-    S.detail = null; S.diffStat = null;
+    S.detail = null; S.diffStat = null; S.diffData = null; S.diffError = null;
+    diffOpenFiles.clear();
     clearBlobCache();
     restoreDraft();
     $('#main').dataset.view = 'thread';
     tl().replaceChildren(h('div', { class: 'loading', text: '読み込み中…' }));
-    renderHeader(); renderApprovals(); renderSwarm();
+    renderHeader(); renderApprovals(); renderSwarm(); renderContextPanel();
   }
   S.stick = true;
   syncSubscriptions();
@@ -1176,6 +793,8 @@ function renderAll() {
   renderComposer();
   renderStatPill();
   renderSwarm();
+  renderContextMeters();
+  renderContextPanel();
 }
 
 // ───────────────────────── topbar ─────────────────────────
@@ -1278,7 +897,7 @@ function renderHeroRecent() {
   box.replaceChildren(...[
     recent.length ? h('div', { class: 'recent' }, h('span', { class: 'recent-lab', text: '最近のスレッド' }), recent.map((t) => h('button', { type: 'button', class: 'recent-chip', title: cleanTitle(t.title), onclick: () => openThread(t.id) },
       provDot(t.model_selection?.provider, `s-${t.status}`), h('span', { class: 't', text: cleanTitle(t.title) }), h('small', { text: fmtAgo(t.updated_at) })))) : null,
-    h('div', { class: 'hero-keys' }, [['K', '検索'], ['N', '新規'], ['B', 'サイドバー'], ['D', '差分'], ['U', '使用量']].map(([k, l]) => h('span', {}, h('kbd', { text: kbd(k) }), l))),
+    h('div', { class: 'hero-keys' }, [['K', '検索'], ['N', '新規'], ['B', 'サイドバー'], ['I', 'コンテキスト'], ['D', '差分'], ['U', '使用量']].map(([k, l]) => h('span', {}, h('kbd', { text: kbd(k) }), l))),
   ].filter(Boolean));
 }
 
@@ -1316,20 +935,6 @@ function attThumb(id) {
   const btn = h('button', { class: 'att-thumb', type: 'button', title: name, onclick: () => openAttachment(id, name, true) }, img);
   attachmentBlobUrl(id).then((u) => { img.src = u; }).catch(() => { img.alt = `${name}（読み込み失敗）`; });
   return btn;
-}
-
-function fileEntries(p) {
-  const raw = p?.files ?? p?.changes ?? p?.paths ?? (p?.path || p?.file_path ? [p] : []);
-  const arr = Array.isArray(raw) ? raw : typeof raw === 'object' && raw ? Object.entries(raw).map(([path, v]) => ({ path, ...(typeof v === 'object' ? v : { kind: v }) })) : [];
-  return arr.map((f) => (typeof f === 'string' ? { path: f } : f)).filter(Boolean)
-    .map((f) => ({ ...f, path: f.path || f.file_path || f.file || f.name })).filter((f) => f.path);
-}
-function kindLetter(k) {
-  k = String(k || 'M').toLowerCase();
-  if (/^(a|add|new|creat|untracked|\?)/.test(k)) return 'A';
-  if (/^(d|del|remov)/.test(k)) return 'D';
-  if (/^(r|ren|mov)/.test(k)) return 'R';
-  return 'M';
 }
 
 // ── compact task step cards ──
@@ -1398,60 +1003,6 @@ function stepRow({ item, icon, verb, target, targetTitle, badges = [], sections 
 }
 
 // ── file changes ──
-const compactPath = (p) => { const parts = String(p).split('/').filter(Boolean); return parts.length > 2 ? `…/${parts.slice(-2).join('/')}` : String(p); };
-/** Splits a unified diff that may cover several files. */
-function splitDiff(diff) {
-  const lines = String(diff || '').split('\n');
-  const parts = [];
-  let cur = null;
-  lines.forEach((l, i) => {
-    const git = l.startsWith('diff --git ');
-    const pair = l.startsWith('--- ') && lines[i + 1]?.startsWith('+++ ') && lines[i + 2]?.startsWith('@@');
-    if (!cur || git || (pair && cur.hunk)) { cur = { lines: [], hunk: false, path: '', old: '' }; parts.push(cur); }
-    if (!cur.hunk && l.startsWith('--- ')) cur.old = l.slice(4).split('\t')[0].replace(/^a\//, '');
-    if (!cur.hunk && l.startsWith('+++ ')) cur.path = l.slice(4).split('\t')[0].replace(/^b\//, '');
-    if (l.startsWith('@@')) cur.hunk = true;
-    cur.lines.push(l);
-  });
-  return parts.map((x) => ({ patch: x.lines.join('\n'), path: x.path && x.path !== '/dev/null' ? x.path : x.old, added: x.old === '/dev/null', deleted: x.path === '/dev/null' }))
-    .filter((x) => x.patch.trim());
-}
-function countPatch(patch) {
-  let add = 0; let del = 0;
-  const lines = String(patch || '').split('\n');
-  let inHunk = !lines.some((l) => l.startsWith('@@'));
-  for (const l of lines) {
-    if (l.startsWith('@@')) inHunk = true;
-    else if (l.startsWith('diff ')) inHunk = false;
-    else if (inHunk && l.startsWith('+') && !l.startsWith('+++ ')) add += 1;
-    else if (inHunk && l.startsWith('-') && !l.startsWith('--- ')) del += 1;
-  }
-  return { add, del };
-}
-/** One entry per changed file, with its inline patch and line counts when the payload carries them. */
-function changedFiles(p) {
-  const files = fileEntries(p).map((f) => ({ ...f, patch: typeof f.diff === 'string' ? f.diff : typeof f.patch === 'string' ? f.patch : '' }));
-  if (typeof p?.diff === 'string' && p.diff && !files.some((f) => f.patch)) {
-    const parts = splitDiff(p.diff);
-    if (parts.length === 1 && files.length <= 1) {
-      if (files.length) Object.assign(files[0], { patch: parts[0].patch, added: parts[0].added, deleted: parts[0].deleted });
-      else files.push({ ...parts[0], path: parts[0].path || p.path || '(不明なファイル)' });
-    } else {
-      for (const part of parts) {
-        const hit = files.find((f) => !f.patch && part.path && (f.path === part.path || f.path.endsWith(`/${part.path}`)));
-        if (hit) Object.assign(hit, { patch: part.patch, added: part.added, deleted: part.deleted });
-        else files.push({ ...part, path: part.path || p.path || '(不明なファイル)' });
-      }
-    }
-  }
-  return files.map((f) => {
-    const n = f.patch ? countPatch(f.patch) : null;
-    const created = f.added === true || /^--- \/dev\/null/m.test(f.patch);
-    const removed = f.deleted === true || /^\+\+\+ \/dev\/null/m.test(f.patch);
-    return { ...f, add: n ? n.add : Number(f.additions ?? f.added_lines) || 0, del: n ? n.del : Number(f.deletions ?? f.removed_lines) || 0,
-      letter: kindLetter(f.kind ?? f.status ?? f.change_type ?? (created ? 'A' : removed ? 'D' : f.operation)) };
-  });
-}
 const lineBadges = (add, del) => [add ? badge(`+${add}`, 'plus') : null, del ? badge(`−${del}`, 'minus') : null].filter(Boolean);
 function fileBlock(f, open) {
   if (!f.patch) {
@@ -1462,7 +1013,7 @@ function fileBlock(f, open) {
     h('summary', {}, iconEl('chevron', 's-chev'), h('span', { class: `fk ${f.letter}`, text: f.letter }), h('span', { class: 'p', title: f.path, text: compactPath(f.path) }),
       lineBadges(f.add, f.del), ibtn('copy', 'パスをコピー', (e) => { e.preventDefault(); e.stopPropagation(); copyText(f.path, 'パスをコピーしました'); }, 'xs')));
   let drawn = false;
-  const draw = () => { if (d.open && !drawn) { drawn = true; d.append(patchLines(f.patch, 400)); } };
+  const draw = () => { if (d.open && !drawn) { drawn = true; d.append(patchLines(f.patch, 400, f.path)); } };
   d.addEventListener('toggle', draw);
   draw();
   return d;
@@ -1971,6 +1522,7 @@ function renderComposer() {
   send.disabled = sending || (!ta().value.trim() && !S.atts.length);
   $('#btn-stop').disabled = !t || !busy;
   syncLimitAlert();
+  renderContextMeters();
 }
 const syncSendEnabled = () => { $('#btn-send').disabled = sending || (!ta().value.trim() && !S.atts.length); syncSwarmHint(); };
 
@@ -2098,17 +1650,6 @@ async function createThread(o) {
 async function interrupt() {
   const t = curThread(); if (!t) return;
   try { await api(`/api/threads/${t.id}/interrupt`, { method: 'POST' }); toast('停止を要求しました'); } catch (e) { toast(`停止に失敗: ${e.message}`, 'err'); }
-}
-
-async function copyText(text, done = 'コピーしました') {
-  try { await navigator.clipboard.writeText(text); toast(done, 'ok', 1500); return true; } catch { /* fall through */ }
-  const x = h('textarea', { value: text, style: 'position:fixed;opacity:0' });
-  (document.querySelector('dialog[open]') || document.body).append(x); x.select();
-  let ok = false;
-  try { ok = document.execCommand('copy'); } catch { /* noop */ }
-  x.remove();
-  toast(ok ? done : 'コピーできません', ok ? 'ok' : 'err', 1500);
-  return ok;
 }
 
 // ───────────────────────── session stats pill ─────────────────────────
@@ -2378,18 +1919,6 @@ const U_KINDS = [
 ];
 const U_SUMS = ['cost_usd', 'total_tokens', ...U_KINDS.map((k) => k.key), 'sessions', 'requests'];
 
-const usdFmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const fmtUsd = (n) => (n > 0 && n < 0.005 ? '<$0.01' : usdFmt.format(n));
-/** T3 Code style compact count: 3 significant digits with K / M / B / T. */
-function fmtCompact(n) {
-  if (Math.round(n) < 1000) return String(Math.round(n));
-  const units = ['K', 'M', 'B', 'T'];
-  let v = n / 1000; let i = 0;
-  while (v >= 999.5 && i < units.length - 1) { v /= 1000; i += 1; }
-  return `${Number(v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2))}${units[i]}`;
-}
-function fmtShare(x) { const p = x * 100; return p > 0 && p < 0.1 ? '<0.1%' : `${p.toFixed(1)}%`; }
-
 const uNum = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
 function uId(p) {
   const s = String(p || 'unknown').toLowerCase();
@@ -2544,7 +2073,7 @@ function loadUsageLimits({ refresh = false } = {}) {
 }
 const loadUsageLimitsSoon = debounce(() => loadUsageLimits(), 5000);
 /** Everything that shows limits; also run on a timer so countdowns and passed resets stay current. */
-function renderLimitSurfaces() { renderUsagePill(); syncLimitAlert(); S.limits.onchange?.(); }
+function renderLimitSurfaces() { renderUsagePill(); syncLimitAlert(); S.limits.onchange?.(); if (shownRail() === 'context') renderContextPanel(); }
 
 /** A window whose reset time has passed no longer limits anything, whatever its last reading said. */
 const limitIsReset = (w, now) => w.resetsAt > 0 && w.resetsAt <= now;
@@ -2900,11 +2429,6 @@ function monotonePath(pts) {
   }
   return d;
 }
-const svgNode = (tag, attrs) => {
-  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
-  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
-  return el;
-};
 /** Indices that get an x-axis label: whole hours for the 24h view, otherwise evenly spaced days ending today. */
 function axisMarks(columns, hourly) {
   const n = columns.length;
@@ -3307,6 +2831,377 @@ function systemPanel() {
   return { el, load, ready: load() };
 }
 
+// ───────────────────────── context panel (T3 Code right sidebar) ─────────────────────────
+function threadContextInfo() {
+  const t = curThread();
+  if (!t) return null;
+  const sel = S.compose.sel || t.model_selection;
+  const spec = findModelSpec(sel);
+  const ctx = S.detail?.context || null;
+  const live = S.liveUsage.get(t.id) || null;
+  const sameModel = sel && t.model_selection && sel.provider === t.model_selection.provider && sel.model === t.model_selection.model;
+  const windowSize = Number(spec?.context_window)
+    || (sameModel ? Number(ctx?.context_window) : 0)
+    || fallbackContextWindow(sel?.provider, sel?.model);
+
+  const runs = S.detail?.runs || [];
+  const totalInput = ctx ? Number(ctx.total_input_tokens) || 0 : runs.reduce((a, r) => a + (Number(r.input_tokens) || 0), 0);
+  const totalOutput = ctx ? Number(ctx.total_output_tokens) || 0 : runs.reduce((a, r) => a + (Number(r.output_tokens) || 0), 0);
+  const totalDuration = ctx ? Number(ctx.total_duration_ms) || 0 : runs.reduce((a, r) => a + (Number(r.duration_ms) || 0), 0);
+  const totalRawBytes = ctx ? Number(ctx.total_raw_bytes) || 0 : (S.detail?.items || []).reduce((a, it) => a + (Number(it.raw_bytes) || 0), 0);
+
+  let source = ctx?.source || 'empty';
+  let used = Number(ctx?.used_tokens) || 0;
+  let input = Number(ctx?.input_tokens) || 0;
+  let output = Number(ctx?.output_tokens) || 0;
+  let cacheRead = Number(ctx?.cache_read_tokens) || 0;
+  let cacheWrite = Number(ctx?.cache_write_tokens) || 0;
+  if (isBusy(t.status) && live && live.context_tokens > 0) {
+    source = 'live';
+    used = Number(live.context_tokens) || 0;
+    input = Number(live.input_tokens) || 0;
+    output = Number(live.output_tokens) || 0;
+    cacheRead = Number(live.cache_read_tokens) || 0;
+    cacheWrite = Number(live.cache_write_tokens) || 0;
+  }
+
+  const pct = windowSize > 0 ? Math.min(100, (used / windowSize) * 100) : 0;
+  const level = pct >= 90 ? 'crit' : pct >= 75 ? 'warn' : used > 0 ? 'ok' : 'idle';
+  const remaining = Math.max(0, windowSize - used);
+  const promptTok = input + cacheRead + cacheWrite;
+  const cacheHit = promptTok > 0 && cacheRead > 0 ? cacheRead / promptTok : null;
+  const breakdown = Array.isArray(ctx?.items_breakdown) ? ctx.items_breakdown : [];
+  return {
+    thread: t, sel, windowSize, used, pct, level, remaining, source,
+    input, output, cacheRead, cacheWrite, cacheHit,
+    totalInput, totalOutput, totalDuration, totalRawBytes, breakdown,
+    runsCount: runs.length,
+  };
+}
+
+function renderContextMeters() {
+  const info = threadContextInfo();
+  const meter = $('#btn-ctx-meter');
+  const tbRing = $('#tb-ctx-ring');
+  const tbLabel = $('#tb-ctx-label');
+  const tbBtn = $('#btn-context');
+  if (!info) {
+    if (meter) meter.hidden = true;
+    setContextRing(tbRing, 0, 'idle', 14, 2);
+    if (tbLabel) tbLabel.textContent = 'コンテキスト';
+    if (tbBtn) { tbBtn.classList.remove('l-warn', 'l-crit'); tbBtn.title = `コンテキスト・スレッド詳細 (${kbd('I')})`; }
+    return;
+  }
+  const pctText = fmtPctCompact(info.pct);
+  const srcTag = info.source === 'estimated' ? '（推定）' : '';
+  const tip = `コンテキストウィンドウ: ${pctText}${srcTag}\n${fmtCompact(info.used)} / ${fmtCompact(info.windowSize)} tok（残り ${fmtCompact(info.remaining)}）\nクリックで右側の詳細パネルを開閉 (${kbd('I')})`;
+  if (meter) {
+    meter.hidden = false;
+    meter.className = `ctx-meter thread-only l-${info.level}`;
+    meter.title = tip;
+    meter.setAttribute('aria-label', `コンテキスト使用率 ${pctText}`);
+    meter.setAttribute('aria-pressed', String(shownRail() === 'context'));
+    setContextRing(meter, info.pct, info.level, 16, 2.2);
+    let pctEl = meter.querySelector('.ctx-meter-pct');
+    if (!pctEl) { pctEl = h('span', { class: 'ctx-meter-pct' }); meter.append(pctEl); }
+    pctEl.textContent = pctText;
+  }
+  setContextRing(tbRing, info.pct, info.level, 14, 2);
+  if (tbLabel) tbLabel.textContent = info.used > 0 ? pctText : 'コンテキスト';
+  if (tbBtn) {
+    tbBtn.classList.toggle('l-warn', info.level === 'warn');
+    tbBtn.classList.toggle('l-crit', info.level === 'crit');
+    tbBtn.title = tip;
+  }
+}
+
+function renderContextLimits(providerId) {
+  const d = S.limits.data;
+  const now = Date.now();
+  const id = uId(providerId);
+  const matching = d?.providers.filter((p) => p.id === id && p.windows.length) || [];
+  const pools = matching.length ? matching : (d?.providers.filter((p) => p.windows.length) || []);
+  const headAction = h('div', { class: 'ctx-sec-acts' },
+    ibtn('refresh', '上限を再取得', () => loadUsageLimits({ refresh: true }), 'xs'),
+    h('button', { type: 'button', class: 'link ctx-more-link', text: 'すべて →', onclick: () => usageDialog({ metric: 'limits' }) }));
+  if (!d) {
+    return ctxSection('使用上限', headAction,
+      h('div', { class: 'ctx-card ctx-muted-card', text: S.limits.pending ? '上限を取得中…' : '上限データがありません' }));
+  }
+  if (!pools.length) {
+    return ctxSection('使用上限', headAction,
+      h('div', { class: 'ctx-card ctx-muted-card', text: '表示できるクォータ枠がありません' }));
+  }
+  const rows = [];
+  for (const p of pools) {
+    if (!matching.length) {
+      rows.push(h('div', { class: 'ctx-lprov' }, uDot(p.color), h('span', { text: p.label }), p.plan ? h('small', { text: p.plan }) : null));
+    }
+    for (const w of p.windows) {
+      const st = limitState(w, now);
+      const reset = st.upcoming ? fmtResetIn(w.resetsAt, now) : st.expired ? 'リセット済' : '';
+      const fill = h('i');
+      fill.style.width = w.remaining > 0 ? `max(2px, ${w.remaining}%)` : '0';
+      fill.style.background = st.level === ' out' ? 'var(--error)' : st.level === ' low' ? 'var(--warning)' : p.color;
+      rows.push(h('button', {
+        type: 'button', class: 'ctx-lrow', title: `${p.label} ${w.label}: 残り ${fmtLeft(w.remaining)}${reset ? ` · ${reset}` : ''}`,
+        onclick: () => usageDialog({ metric: 'limits' }),
+      },
+      h('div', { class: 'ctx-lrow-top' },
+        h('span', { class: 'ctx-lrow-name', text: w.label }),
+        h('span', { class: `ctx-lrow-val${st.level}`, text: `残り ${fmtLeft(w.remaining)}` })),
+      h('div', { class: 'ctx-mini-bar' }, fill),
+      reset ? h('div', { class: 'ctx-lrow-sub' }, h('span', { text: reset }), st.pace ? h('span', { text: st.pace.cls === 'ahead' ? '消費速め' : st.pace.cls === 'under' ? '余裕あり' : '適正ペース' }) : null) : null));
+    }
+  }
+  const providerHead = matching[0] ? h('div', { class: 'ctx-lprov top' }, uDot(matching[0].color), h('span', { text: matching[0].label }), matching[0].plan ? h('span', { class: 'ctx-tag', text: matching[0].plan }) : null) : null;
+  return ctxSection('使用上限', headAction, h('div', { class: 'ctx-card ctx-limits-card' }, providerHead, ...rows));
+}
+
+function renderContextChanges(t) {
+  if (nonGitProjects.has(t.project_id)) {
+    return ctxSection('変更ファイル', null,
+      h('div', { class: 'ctx-card ctx-muted-card', text: 'Git リポジトリではありません' }));
+  }
+  const diff = S.diffData && S.diffData.threadId === t.id ? S.diffData.data : null;
+  const stat = S.diffStat && S.diffStat.threadId === t.id ? S.diffStat : null;
+  const err = S.diffError && S.diffError.threadId === t.id ? S.diffError : null;
+  const openDiffAction = h('button', { type: 'button', class: 'link ctx-more-link', text: '差分を開く →', onclick: () => setRail('diff') });
+  if (!diff && !stat) {
+    if (err) {
+      return ctxSection('変更ファイル', openDiffAction,
+        h('div', { class: 'ctx-card ctx-muted-card' },
+          h('div', { class: 'errtxt', text: `差分を取得できません: ${err.message}` }),
+          h('button', { type: 'button', class: 'btn xs', text: '再試行', onclick: () => { S.diffError = null; renderContextPanel(); refreshDiffStat(); } })));
+    }
+    return ctxSection('変更ファイル', openDiffAction,
+      h('div', { class: 'ctx-card ctx-muted-card', text: '作業ツリーを確認中…' }));
+  }
+  const files = diff?.files || [];
+  const add = diff ? diff.total_additions : stat?.add || 0;
+  const del = diff ? diff.total_deletions : stat?.del || 0;
+  if (!files.length) {
+    return ctxSection('変更ファイル', openDiffAction,
+      h('div', { class: 'ctx-card ctx-clean' }, iconEl('check'), h('span', { text: '変更はありません（クリーン）' })));
+  }
+  const shown = files.slice(0, 10);
+  return ctxSection('変更ファイル',
+    h('div', { class: 'ctx-sec-acts' },
+      h('span', { class: 'ctx-diff-nums' }, h('span', { class: 'plus', text: `+${add}` }), h('span', { class: 'minus', text: `−${del}` })),
+      openDiffAction),
+    h('div', { class: 'ctx-card ctx-files-card' },
+      shown.map((f) => {
+        const L = kindLetter(f.status);
+        const slash = f.path.lastIndexOf('/');
+        return h('button', {
+          type: 'button', class: 'ctx-frow', title: `${f.path}\nクリックして差分を表示`,
+          onclick: () => { diffOpenFiles.add(f.path); setRail('diff'); },
+        },
+        h('span', { class: `fk ${L}`, text: L }),
+        h('span', { class: 'ctx-fpath' }, h('b', { text: f.path.slice(slash + 1) }), slash > 0 ? h('small', { text: f.path.slice(0, slash) }) : null),
+        h('span', { class: 'ctx-fstat' }, f.additions ? h('span', { class: 'plus', text: `+${f.additions}` }) : null, f.deletions ? h('span', { class: 'minus', text: `−${f.deletions}` }) : null));
+      }),
+      files.length > shown.length ? h('button', { type: 'button', class: 'ctx-more-btn', text: `他 ${files.length - shown.length} 件を差分で表示 →`, onclick: () => setRail('diff') }) : null));
+}
+
+function renderContextPanel() {
+  const body = $('#context-body');
+  if (!body) return;
+  const info = threadContextInfo();
+  if (!info) {
+    const proj = projectById(S.projectId);
+    const activeCount = S.threads.filter((x) => !x.archived && (!proj || x.project_id === proj.id)).length;
+    const sel = S.compose.sel || defaultSelection(S.projectId);
+    const win = Number(findModelSpec(sel)?.context_window) || fallbackContextWindow(sel?.provider, sel?.model);
+    const parts = [
+      ctxSection('新規スレッド', null, h('div', { class: 'ctx-card ctx-home-card' },
+        h('div', { class: 'ctx-home-row' }, provDot(sel?.provider), h('b', { text: modelLabel(sel).replace(/^[\w-]+\//, '') }), h('span', { class: 'ctx-tag', text: `上限 ${fmtCompact(win)}` })),
+        proj ? h('div', { class: 'ctx-kv-list' },
+          h('div', { class: 'ctx-kv' }, h('span', { text: 'プロジェクト' }), h('b', { text: proj.title })),
+          h('div', { class: 'ctx-kv' }, h('span', { text: 'スレッド数' }), h('b', { text: `${fmtNum(activeCount)} 件` })),
+          h('div', { class: 'ctx-kv' }, h('span', { text: 'パス' }), h('button', { type: 'button', class: 'ctx-copy-val mono', title: 'クリックでコピー', text: compactPath(proj.workspace_root), onclick: () => copyText(proj.workspace_root, 'パスをコピーしました') })))
+          : h('p', { class: 'muted', text: 'プロジェクトを選択または追加して開始してください' }))),
+      renderContextLimits(sel?.provider),
+    ];
+    if (S.providers.length) {
+      parts.push(ctxSection('プロバイダ', null, h('div', { class: 'ctx-card ctx-provs-card' },
+        S.providers.map((p) => h('div', { class: `ctx-prov-row${p.available ? '' : ' off'}`, title: p.error || p.binary_path || '' },
+          provDot(p.provider), h('span', { class: 'ctx-prov-n', text: provLabel(p.provider) }),
+          h('small', { text: p.available ? (p.version || '利用可能') : '未導入' }))))));
+    }
+    body.replaceChildren(...parts);
+    return;
+  }
+
+  const { thread: t, sel, windowSize, used, pct, level, remaining, source, input, output, cacheRead, cacheWrite, cacheHit, totalInput, totalOutput, totalDuration, totalRawBytes, breakdown, runsCount } = info;
+  const project = projectById(t.project_id);
+  const parts = [];
+
+  // ── 1. Context Window Card (hero)
+  const segs = [];
+  if (used > 0 && windowSize > 0) {
+    const hasTokenSplit = source !== 'estimated' && (input || output || cacheRead || cacheWrite);
+    if (hasTokenSplit) {
+      const total = Math.max(used, input + output + cacheRead + cacheWrite);
+      const scale = Math.min(100, (used / windowSize) * 100) / total;
+      for (const [val, label, color] of [
+        [cacheRead, 'キャッシュ読込', 'color-mix(in srgb, var(--accent) 55%, var(--text-muted))'],
+        [cacheWrite, 'キャッシュ書込', 'color-mix(in srgb, var(--accent) 78%, var(--text))'],
+        [input, '新規入力', 'var(--accent)'],
+        [output, '出力', 'var(--success)'],
+      ]) {
+        if (val > 0) segs.push({ pct: val * scale, title: `${label}: ${fmtCompact(val)} tok`, color });
+      }
+    } else {
+      const col = level === 'crit' ? 'var(--error)' : level === 'warn' ? 'var(--warning)' : 'var(--accent)';
+      segs.push({ pct: Math.min(100, pct), title: `推定コンテキスト: ${fmtCompact(used)} tok`, color: col });
+    }
+  }
+  const barTrack = h('div', { class: 'ctx-bar', 'aria-hidden': 'true' }, segs.map((s) => {
+    const el = h('i', { title: s.title });
+    el.style.width = `${Math.max(0.8, s.pct)}%`;
+    el.style.background = s.color;
+    return el;
+  }));
+
+  const statsGrid = h('div', { class: 'ctx-stats-grid' },
+    h('div', { class: 'ctx-stat', title: `直近ステップ入力: ${fmtNum(input)} tok` },
+      h('span', { text: source === 'estimated' ? '推定トークン' : '新規入力' }),
+      h('b', { text: fmtCompact(input) })),
+    h('div', { class: 'ctx-stat', title: `直近ステップ出力: ${fmtNum(output)} tok` },
+      h('span', { text: '出力' }),
+      h('b', { text: fmtCompact(output) })),
+    cacheRead > 0 || cacheWrite > 0
+      ? h('div', { class: 'ctx-stat', title: `キャッシュ読込: ${fmtNum(cacheRead)} / 書込: ${fmtNum(cacheWrite)}` },
+        h('span', { text: 'キャッシュ' }),
+        h('b', { text: cacheHit != null ? `${fmtCompact(cacheRead)} (${Math.round(cacheHit * 100)}%)` : fmtCompact(cacheRead + cacheWrite) }))
+      : h('div', { class: 'ctx-stat', title: `スレッド累計入力 ${fmtNum(totalInput)} / 出力 ${fmtNum(totalOutput)}` },
+        h('span', { text: 'スレッド累計' }),
+        h('b', { text: totalInput || totalOutput ? `↑${fmtCompact(totalInput)} ↓${fmtCompact(totalOutput)}` : '–' })),
+    h('div', { class: 'ctx-stat', title: `実行回数 ${runsCount} 回 / 総所要時間 ${fmtDur(totalDuration)}` },
+      h('span', { text: 'ターン / 所要' }),
+      h('b', { text: `${fmtNum(runsCount)} · ${totalDuration ? fmtDur(totalDuration) : '–'}` })));
+
+  const warnBanner = level === 'crit'
+    ? h('div', { class: 'ctx-alert crit' }, iconEl('alert'), h('span', { text: 'コンテキスト上限間近です。分岐 (Fork) して引き継ぐと安定します。' }))
+    : level === 'warn'
+      ? h('div', { class: 'ctx-alert warn' }, iconEl('alert'), h('span', { text: 'コンテキスト使用率が 75% を超えています。' }))
+      : null;
+
+  parts.push(h('section', { class: 'ctx-card ctx-hero-card' },
+    h('div', { class: 'ctx-hero-top' },
+      h('div', { class: 'ctx-big-ring' },
+        contextRingSvg(pct, level, 58, 4.5),
+        h('span', { class: `ctx-big-pct l-${level}`, text: fmtPctCompact(pct) })),
+      h('div', { class: 'ctx-hero-meta' },
+        h('div', { class: 'ctx-hero-label' },
+          h('span', { text: 'コンテキストウィンドウ' }),
+          h('span', { class: `ctx-src s-${source}`, title: source === 'estimated' ? 'プロバイダからのトークン報告がないため保存データ量から概算しています' : 'プロバイダ報告に基づく値', text: CTX_SOURCE_LABEL[source] || source })),
+        h('div', { class: 'ctx-hero-nums', title: `${fmtNum(used)} / ${fmtNum(windowSize)} tok` },
+          h('b', { text: fmtCompact(used) }), h('span', { text: ` / ${fmtCompact(windowSize)}` })),
+        h('div', { class: 'ctx-hero-rem', text: `残り ${fmtCompact(remaining)} tok` }))),
+    barTrack,
+    warnBanner,
+    statsGrid,
+    h('div', { class: 'ctx-quick-acts' },
+      h('button', { type: 'button', class: 'btn xs', onclick: forkDialog }, iconEl('fork'), h('span', { text: '文脈を分岐' })),
+      h('button', { type: 'button', class: 'btn xs', onclick: () => usageDialog('model') }, iconEl('chart'), h('span', { text: '使用量詳細' })))));
+
+  // ── 2. Context Breakdown (items composition)
+  if (breakdown.length && totalRawBytes > 0) {
+    const byKind = new Map(breakdown.map((b) => [b.kind, b]));
+    const rows = CTX_KIND_META
+      .map(([kind, label, color]) => {
+        const b = byKind.get(kind);
+        return b && b.count > 0 ? { kind, label, color, count: Number(b.count), bytes: Number(b.raw_bytes) } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.bytes - a.bytes);
+    if (rows.length) {
+      const stackBar = h('div', { class: 'ctx-stackbar', 'aria-hidden': 'true' }, rows.filter((r) => r.bytes > 0).map((r) => {
+        const seg = h('i', { title: `${r.label}: ${fmtBytes(r.bytes)} (${fmtShare(r.bytes / totalRawBytes)})` });
+        seg.style.flexGrow = String(r.bytes / totalRawBytes);
+        seg.style.background = r.color;
+        return seg;
+      }));
+      parts.push(ctxSection('コンテキスト内訳',
+        h('span', { class: 'ctx-sec-meta', text: `${fmtNum(S.detail?.total_items || 0)} 項目 · ${fmtBytes(totalRawBytes)}` }),
+        h('div', { class: 'ctx-card ctx-break-card' },
+          stackBar,
+          h('ul', { class: 'ctx-break-list' }, rows.map((r) => h('li', {},
+            uDot(r.color),
+            h('span', { class: 'ctx-bl-name', text: r.label }),
+            h('span', { class: 'ctx-bl-cnt', text: `${fmtNum(r.count)}` }),
+            h('span', { class: 'ctx-bl-sz', text: fmtBytes(r.bytes) }),
+            h('span', { class: 'ctx-bl-pct', text: fmtShare(r.bytes / totalRawBytes) })))))));
+    }
+  }
+
+  // ── 3. Provider Quota Limits
+  parts.push(renderContextLimits(sel?.provider));
+
+  // ── 4. Git Changes Summary
+  parts.push(renderContextChanges(t));
+
+  // ── 5. Thread Details / Environment
+  const kv = [];
+  kv.push(['モデル', h('button', {
+    type: 'button', class: 'ctx-val-btn', title: 'モデルを変更',
+    onclick: () => openModelPopover($('#btn-model')),
+  }, provDot(sel?.provider), h('span', { text: `${modelLabel(sel).replace(/^[\w-]+\//, '')}${sel?.effort ? ` · ${sel.effort}` : ''}` }))]);
+  kv.push(['実行権限', h('span', { class: 'ctx-val-inline' },
+    h('span', { class: t.runtime_mode === 'full-access' ? 'ctx-warn-txt' : '', text: MODE_LABEL[t.runtime_mode] || t.runtime_mode }),
+    t.interaction_mode === 'plan' ? h('span', { class: 'ctx-tag accent', text: 'Plan' }) : null)]);
+  if (project) {
+    kv.push(['プロジェクト', h('span', { text: project.title })]);
+    kv.push(['ワークスペース', h('button', { type: 'button', class: 'ctx-copy-val mono', title: `${project.workspace_root}（クリックでコピー）`, text: compactPath(project.workspace_root), onclick: () => copyText(project.workspace_root, 'パスをコピーしました') })]);
+  }
+  if (t.branch) kv.push(['ブランチ', h('span', { class: 'mono', text: `⎇ ${t.branch}` })]);
+  if (t.worktree_path) kv.push(['Worktree', h('button', { type: 'button', class: 'ctx-copy-val mono', title: `${t.worktree_path}（クリックでコピー）`, text: compactPath(t.worktree_path), onclick: () => copyText(t.worktree_path, 'Worktree パスをコピーしました') })]);
+  if (t.provider_session_id) {
+    kv.push(['セッション ID', h('button', { type: 'button', class: 'ctx-copy-val mono', title: `${t.provider_session_id}（クリックでコピー）`, text: clip(t.provider_session_id, 22), onclick: () => copyText(t.provider_session_id, 'セッション ID をコピーしました') })]);
+  }
+  kv.push(['更新', h('span', { title: new Date(t.updated_at).toLocaleString('ja-JP'), text: fmtAgo(t.updated_at) })]);
+  parts.push(ctxSection('スレッド詳細',
+    h('span', { class: `status-pill s-${t.status}`, text: STATUS_LABEL[t.status] || t.status }),
+    h('div', { class: 'ctx-card ctx-kv-list' }, kv.map(([k, v]) => h('div', { class: 'ctx-kv' }, h('span', { text: k }), v)))));
+
+  // ── 6. Related threads (parent / children / attachments)
+  const parent = t.parent_thread_id ? threadById(t.parent_thread_id) : null;
+  const kids = S.detail?.children || [];
+  if (t.parent_thread_id || kids.length) {
+    const rel = [];
+    if (t.parent_thread_id) {
+      rel.push(h('button', { type: 'button', class: 'ctx-rel-row', onclick: () => openThread(t.parent_thread_id) },
+        iconEl('handoff'), h('span', { class: 'ctx-rel-tag', text: '親' }),
+        h('span', { class: 'ctx-rel-title', text: parent ? cleanTitle(parent.title) : t.parent_thread_id.slice(0, 8) })));
+    }
+    for (const k of kids) {
+      rel.push(h('button', { type: 'button', class: 'ctx-rel-row', onclick: () => openThread(k.id) },
+        provDot(k.model_selection?.provider, k.status === 'running' ? 'live' : ''),
+        h('span', { class: 'ctx-rel-title', text: cleanTitle(k.title) }),
+        h('small', { text: STATUS_LABEL[k.status] || k.status })));
+    }
+    parts.push(ctxSection(`関連スレッド (${rel.length})`,
+      h('button', { type: 'button', class: 'link ctx-more-link', text: '+ 委譲', onclick: delegateDialog }),
+      h('div', { class: 'ctx-card ctx-rel-card' }, rel)));
+  }
+
+  const atts = S.detail?.attachments || [];
+  if (atts.length) {
+    parts.push(ctxSection(`添付ファイル (${atts.length})`, null,
+      h('div', { class: 'ctx-card ctx-rel-card' }, atts.map((a) => h('button', {
+        type: 'button', class: 'ctx-rel-row',
+        onclick: () => openAttachment(a.id, a.filename, /^image\//.test(a.mime_type || '')),
+      }, iconEl('clip'), h('span', { class: 'ctx-rel-title', text: a.filename }), h('small', { text: fmtBytes(a.size_bytes) }))))));
+  }
+
+  const scrollTop = body.scrollTop;
+  body.replaceChildren(...parts);
+  body.scrollTop = scrollTop;
+}
+const renderContextPanelSoon = rafThrottle(() => { if (shownRail() === 'context') renderContextPanel(); });
+
 // ───────────────────────── diff panel ─────────────────────────
 let diffSeq = 0;
 let diffShownFor = null;
@@ -3316,19 +3211,37 @@ const diffOpenFiles = new Set();
 const shownRail = () => (S.rail === 'swarm' && !curBoard() ? null : S.rail);
 function renderRail() {
   const shown = shownRail();
+  const hasSwarm = !!curBoard();
+  $('#context-panel').hidden = shown !== 'context';
   $('#diff-panel').hidden = shown !== 'diff';
   $('#swarm-panel').hidden = shown !== 'swarm';
+  const resizer = $('#rail-resizer');
+  if (resizer) resizer.hidden = !shown;
   $('#app').dataset.rail = shown || 'none';
+  $('#btn-context').setAttribute('aria-pressed', String(shown === 'context'));
+  $('#btn-ctx-meter')?.setAttribute('aria-pressed', String(shown === 'context'));
   $('#btn-diff').setAttribute('aria-pressed', String(shown === 'diff'));
   $('#btn-swarm').setAttribute('aria-pressed', String(shown === 'swarm'));
+  $$('.rail-tab').forEach((tab) => {
+    const target = tab.dataset.railTab;
+    if (target === 'swarm') tab.hidden = !hasSwarm;
+    const on = shown === target;
+    tab.classList.toggle('on', on);
+    tab.setAttribute('aria-selected', String(on));
+  });
 }
 function setRail(name) {
   S.rail = name;
-  ls.set('t3.rail', name || '');
+  ls.set('t3.rail', name || 'none');
   renderRail();
   if (name === 'diff') loadDiff();
+  else if (name === 'context') {
+    renderContextPanel();
+    if (S.threadId && (!S.diffData || S.diffData.threadId !== S.threadId)) refreshDiffStat();
+  }
 }
-const toggleDiff = () => setRail(S.rail === 'diff' ? null : 'diff');
+const toggleDiff = () => setRail(shownRail() === 'diff' ? null : 'diff');
+const toggleContext = () => setRail(shownRail() === 'context' ? null : 'context');
 
 function renderDiffBadge() {
   const b = $('#diff-badge');
@@ -3336,39 +3249,90 @@ function renderDiffBadge() {
   const dirty = !!d && d.threadId === S.threadId && d.files > 0;
   b.hidden = !dirty;
   if (dirty) b.replaceChildren(h('span', { class: 'plus', text: `+${d.add}` }), h('span', { class: 'minus', text: `−${d.del}` }));
+  const tabBadge = $('#ctx-tab-diff-badge');
+  if (tabBadge) {
+    tabBadge.hidden = !dirty;
+    if (dirty) tabBadge.textContent = String(d.files);
+  }
 }
 const nonGitProjects = new Set();
 const fetchDiff = (id) => api(`/api/threads/${id}/diff?ignore_whitespace=${S.ignoreWs}`);
 function noteDiffStat(threadId, d) {
   S.diffStat = { threadId, add: d.total_additions, del: d.total_deletions, files: d.clean ? 0 : d.files.length };
+  S.diffData = { threadId, data: d };
+  S.diffError = null;
   renderDiffBadge();
+  if (shownRail() === 'context' && threadId === S.threadId) renderContextPanel();
 }
 async function refreshDiffStat() {
   const id = S.threadId; if (!id) return;
   const project = curThread()?.id === id ? curThread().project_id : null;
   if (project && nonGitProjects.has(project)) return;
   try { const d = await fetchDiff(id); if (id === S.threadId) noteDiffStat(id, d); } catch (e) {
-    if (project && /not a git repository/i.test(e.message)) nonGitProjects.add(project); // no badge, and no repeat requests
+    if (project && /not a git repository/i.test(e.message)) {
+      nonGitProjects.add(project); // no badge, and no repeat requests
+    } else if (id === S.threadId) {
+      S.diffError = { threadId: id, message: e.message || String(e) };
+    }
+    if (shownRail() === 'context' && id === S.threadId) renderContextPanel();
   }
+}
+
+function syncDiffScopeButtons() {
+  $$('#diff-scope button').forEach((b) => {
+    const on = b.dataset.scope === S.diffScope;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-checked', String(on));
+  });
+}
+
+function renderDiffView(d) {
+  const t = curThread();
+  const body = $('#diff-body'); const sum = $('#diff-sum'); const branch = $('#diff-branch');
+  syncDiffScopeButtons();
+  branch.textContent = d.branch ? `⎇ ${d.branch}` : '';
+  const latestOnly = S.diffScope === 'latest';
+  let files = d.files || [];
+  if (latestOnly && t) {
+    const turnPaths = latestTurnChangedPaths(S.detail, projectById(t.project_id)?.workspace_root || '');
+    files = filterDiffFilesByPaths(files, turnPaths);
+  }
+  const add = files.reduce((a, f) => a + (Number(f.additions) || 0), 0);
+  const del = files.reduce((a, f) => a + (Number(f.deletions) || 0), 0);
+  sum.replaceChildren(
+    h('span', { class: 'sbadge plus', text: `+${add}` }),
+    h('span', { class: 'sbadge minus', text: `−${del}` }),
+    h('span', { class: 'muted', text: `${files.length} ファイル` }),
+  );
+  if (d.clean || !d.files.length) {
+    body.replaceChildren(h('div', { class: 'dp-empty' }, iconEl('check'), h('span', { text: '変更はありません（クリーン）' })));
+    return;
+  }
+  if (!files.length && latestOnly) {
+    body.replaceChildren(h('div', { class: 'dp-empty' },
+      iconEl('file'),
+      h('span', { text: '最新ターンで変更されたファイルはありません' }),
+      h('button', { type: 'button', class: 'btn xs', text: `全 ${d.files.length} ファイルを表示`, onclick: () => { S.diffScope = 'all'; ls.set('t3.diffScope', 'all'); renderDiffView(d); } })));
+    return;
+  }
+  const top = body.scrollTop;
+  body.replaceChildren(...files.map(diffFile));
+  body.scrollTop = top;
 }
 
 async function loadDiff() {
   const t = curThread();
   const body = $('#diff-body'); const sum = $('#diff-sum'); const branch = $('#diff-branch');
   const my = ++diffSeq;
+  syncDiffScopeButtons();
   if (!t) { diffShownFor = null; body.replaceChildren(h('div', { class: 'dp-empty', text: 'スレッドを選択すると、作業ツリーの差分が表示されます' })); sum.replaceChildren(); branch.textContent = ''; return; }
-  if (diffShownFor !== t.id) { diffOpenFiles.clear(); sum.replaceChildren(); branch.textContent = ''; body.replaceChildren(h('div', { class: 'dp-empty', text: '読み込み中…' })); }
+  if (diffShownFor !== t.id) { sum.replaceChildren(); branch.textContent = ''; body.replaceChildren(h('div', { class: 'dp-empty', text: '読み込み中…' })); }
   try {
     const d = await fetchDiff(t.id);
     if (my !== diffSeq) return;
     diffShownFor = t.id;
     noteDiffStat(t.id, d);
-    sum.replaceChildren(h('span', { class: 'sbadge plus', text: `+${d.total_additions}` }), h('span', { class: 'sbadge minus', text: `−${d.total_deletions}` }), h('span', { class: 'muted', text: `${d.files.length} ファイル` }));
-    branch.textContent = d.branch ? `⎇ ${d.branch}` : '';
-    if (d.clean || !d.files.length) { body.replaceChildren(h('div', { class: 'dp-empty' }, iconEl('check'), h('span', { text: '変更はありません（クリーン）' }))); return; }
-    const top = body.scrollTop;
-    body.replaceChildren(...d.files.map(diffFile));
-    body.scrollTop = top;
+    renderDiffView(d);
   } catch (e) {
     if (my !== diffSeq) return;
     diffShownFor = null; S.diffStat = null; renderDiffBadge();
@@ -3380,37 +3344,6 @@ async function loadDiff() {
 }
 const refreshDiffSoon = debounce(() => { if (S.rail === 'diff') loadDiff(); else refreshDiffStat(); }, 600);
 
-function patchLines(patch, max = 3000) {
-  const lines = String(patch || '').split('\n');
-  if (lines.at(-1) === '') lines.pop();
-  const frag = document.createDocumentFragment();
-  let a = 0; let b = 0; let numbered = false;
-  let inHunk = !lines.some((l) => l.startsWith('@@'));
-  const row = (cls, o, n, sign, text) => frag.append(h('div', { class: `dl ${cls}` },
-    h('span', { class: 'ln', text: o }), h('span', { class: 'ln', text: n }), h('span', { class: 'sg', text: sign }), h('span', { class: 'tx', text })));
-  for (const l of lines.slice(0, max)) {
-    if (l.startsWith('@@')) {
-      const hunk = /^@@+ -(\d+)(?:,\d+)? (?:-\d+(?:,\d+)? )*\+(\d+)/.exec(l);
-      numbered = !!hunk;
-      if (hunk) { a = +hunk[1]; b = +hunk[2]; }
-      inHunk = true; frag.append(h('div', { class: 'dl hunk', text: l })); continue;
-    }
-    if (l.startsWith('diff ')) inHunk = false;
-    if (!inHunk) { if (/^(rename|copy|new file|deleted file|old mode|new mode|Binary)/.test(l)) frag.append(h('div', { class: 'dl meta', text: l })); continue; }
-    if (l.startsWith('+')) row('add', '', numbered ? b++ : '', '+', l.slice(1));
-    else if (l.startsWith('-')) row('del', numbered ? a++ : '', '', '−', l.slice(1));
-    else if (l.startsWith('\\')) frag.append(h('div', { class: 'dl meta', text: l }));
-    else row('', numbered ? a++ : '', numbered ? b++ : '', '', l.slice(1));
-  }
-  if (!frag.childNodes.length) frag.append(h('div', { class: 'dl meta', text: '（パッチ本文なし：バイナリ or 空白のみの変更）' }));
-  const inner = h('div', { class: 'patch-in' }, frag);
-  const box = h('div', { class: 'patch' }, inner);
-  if (lines.length > max) {
-    box.append(h('button', { type: 'button', class: 'btn xs out-more', text: `残り ${fmtNum(lines.length - max)} 行を表示`, onclick: () => box.replaceWith(patchLines(patch, Infinity)) }));
-  }
-  return box;
-}
-
 function diffFile(f) {
   const L = kindLetter(f.status);
   const slash = f.path.lastIndexOf('/');
@@ -3420,7 +3353,7 @@ function diffFile(f) {
       ibtn('copy', 'パスをコピー', (e) => { e.preventDefault(); e.stopPropagation(); copyText(f.path); }, 'xs dcopy'),
       h('span', { class: 'sbadge plus', text: `+${f.additions}` }), h('span', { class: 'sbadge minus', text: `−${f.deletions}` })));
   let drawn = false;
-  const draw = () => { if (d.open && !drawn) { drawn = true; d.append(patchLines(f.patch)); } };
+  const draw = () => { if (d.open && !drawn) { drawn = true; d.append(patchLines(f.patch, 3000, f.path)); } };
   d.addEventListener('toggle', () => { d.open ? diffOpenFiles.add(f.path) : diffOpenFiles.delete(f.path); draw(); });
   if (diffOpenFiles.has(f.path)) { d.open = true; draw(); }
   return d;
@@ -3760,6 +3693,7 @@ function handleWs(m) {
     }
     case 'run_started': {
       S.live.set(m.thread_id, { runId: m.run.id, assistant: '', reasoning: '' });
+      S.liveUsage.delete(m.thread_id);
       setThreadStatus(m.thread_id, 'running');
       renderSidebarSoon();
       if (m.thread_id === cur && S.detail) {
@@ -3774,6 +3708,7 @@ function handleWs(m) {
       if (run) run.status = m.status;
       if (TERMINAL_RUN.has(m.status)) {
         S.live.delete(m.thread_id);
+        S.liveUsage.delete(m.thread_id);
         if (m.status === 'failed' && m.error) toast(`実行失敗: ${m.error}`, 'err', 6000);
         if (m.thread_id === cur) { loadDetailSoon(); refreshDiffSoon(); loadSwarm(cur); }
         loadThreadsSoon(); loadDbStatsSoon(); loadUsageSoon(); loadUsageLimitsSoon();
@@ -3816,6 +3751,22 @@ function handleWs(m) {
       renderLive(); scrollBottom();
       if (it.kind === 'file_change') refreshDiffSoon();
       if (it.kind === 'subagent') loadDetailSoon();
+      renderContextPanelSoon();
+      break;
+    }
+    case 'run_usage_updated': {
+      S.liveUsage.set(m.thread_id, {
+        runId: m.run_id,
+        context_tokens: Number(m.context_tokens) || 0,
+        input_tokens: Number(m.input_tokens) || 0,
+        output_tokens: Number(m.output_tokens) || 0,
+        cache_read_tokens: Number(m.cache_read_tokens) || 0,
+        cache_write_tokens: Number(m.cache_write_tokens) || 0,
+      });
+      if (m.thread_id === cur) {
+        renderContextMeters();
+        renderContextPanelSoon();
+      }
       break;
     }
     case 'pending_request': {
@@ -3899,6 +3850,33 @@ function wire() {
   };
   $('#btn-diff').onclick = toggleDiff;
   $('#btn-diff-close').onclick = () => setRail(null);
+  $('#btn-context').onclick = toggleContext;
+  $('#btn-ctx-meter').onclick = toggleContext;
+  $('#btn-ctx-close').onclick = () => setRail(null);
+  $('#btn-ctx-refresh').onclick = () => {
+    if (S.threadId) { loadDetail(S.threadId); refreshDiffStat(); }
+    loadUsageLimits({ refresh: true });
+  };
+  $$('.rail-tab').forEach((tab) => {
+    tab.onclick = () => {
+      const target = tab.dataset.railTab;
+      if (target === 'swarm' && !curBoard()) return;
+      setRail(target);
+    };
+  });
+  $$('.rail-tabs').forEach((bar) => {
+    bar.addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      const tabs = $$('.rail-tab', bar).filter((t) => !t.hidden);
+      const i = tabs.indexOf(e.target);
+      if (i < 0 || tabs.length < 2) return;
+      e.preventDefault();
+      const next = tabs[(i + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length];
+      setRail(next.dataset.railTab);
+      const panelId = next.getAttribute('aria-controls');
+      $(`#${panelId} .rail-tab[data-rail-tab="${next.dataset.railTab}"]`)?.focus();
+    });
+  });
   wireSwarm();
   $('#btn-diff-refresh').onclick = loadDiff;
   $('#btn-diff-expand').onclick = () => {
@@ -3907,6 +3885,16 @@ function wire() {
     all.forEach((d) => { d.open = anyClosed; });
   };
   $('#chk-ws').onchange = (e) => { S.ignoreWs = e.target.checked; ls.set('t3.ws', S.ignoreWs ? '1' : '0'); loadDiff(); };
+  $$('#diff-scope button').forEach((b) => {
+    b.onclick = () => {
+      S.diffScope = b.dataset.scope === 'latest' ? 'latest' : 'all';
+      ls.set('t3.diffScope', S.diffScope);
+      if (S.diffData && S.diffData.threadId === S.threadId) renderDiffView(S.diffData.data);
+      else loadDiff();
+    };
+  });
+  syncDiffScopeButtons();
+  wireRailResizer();
   $('#btn-fork').onclick = forkDialog;
   $('#btn-delegate').onclick = delegateDialog;
   $('#btn-children').onclick = (e) => childrenMenu(e.currentTarget);
@@ -4007,7 +3995,17 @@ function wire() {
       if (e.defaultPrevented) return;
       if (popover) { e.preventDefault(); const a = popover.anchor; closePopover(); a.focus(); } else if ($('#app').dataset.drawer === 'open') closeDrawer();
       else if (!$('dialog[open]') && shownRail() === 'swarm' && (swarmOverlay() || $('#swarm-panel').contains(e.target))) { e.preventDefault(); closeSwarm(); }
-      else if (!typing && !$('dialog[open]')) { e.preventDefault(); ta().focus(); }
+      else if (!$('dialog[open]') && shownRail() === 'context' && (swarmOverlay() || $('#context-panel').contains(e.target))) {
+        e.preventDefault();
+        const had = $('#context-panel').contains(document.activeElement);
+        setRail(null);
+        if (had) $('#btn-context')?.focus();
+      } else if (!$('dialog[open]') && shownRail() === 'diff' && (swarmOverlay() || $('#diff-panel').contains(e.target))) {
+        e.preventDefault();
+        const had = $('#diff-panel').contains(document.activeElement);
+        setRail(null);
+        if (had) $('#btn-diff')?.focus();
+      } else if (!typing && !$('dialog[open]')) { e.preventDefault(); ta().focus(); }
       return;
     }
     if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey && !typing && !popover && !$('dialog[open]')) { e.preventDefault(); ta().focus(); return; }
@@ -4024,11 +4022,12 @@ function wire() {
       if (modal?.classList.contains('usage')) modal.close(); else if (!modal) usageDialog();
       return;
     }
-    if (!['b', 'd', 'n'].includes(k)) return;
+    if (!['b', 'd', 'i', 'n'].includes(k)) return;
     e.preventDefault();
     if (modal) return;
     if (k === 'b') toggleSidebar();
     else if (k === 'd') toggleDiff();
+    else if (k === 'i') toggleContext();
     else goHome();
   });
   addEventListener('hashchange', () => { const id = threadFromHash(); if (id && id !== S.threadId) openThread(id, { push: false }); else if (!id && S.threadId) goHome(); });
@@ -4056,12 +4055,12 @@ async function boot() {
     if (meta?.follow_up_behavior && !ls.get('t3.behavior', '')) S.behavior = meta.follow_up_behavior === 'queue' ? 'queue' : 'steer';
     await loadProjects();
     S.compose.sel = defaultSelection(S.projectId);
-    renderComposer(); renderStatPill(); loadDbStats(); loadUsage(7);
+    renderComposer(); renderStatPill(); renderContextPanel(); loadDbStats(); loadUsage(7);
     await loadThreads();
     if (!S.threadId && !hashId) {
       preferActiveProject();
       S.compose.sel = defaultSelection(S.projectId);
-      renderSidebar(); renderHeader(); renderHero(); renderComposer();
+      renderSidebar(); renderHeader(); renderHero(); renderComposer(); renderContextPanel();
     }
   } catch (e) {
     setConn('bad', `サーバーに接続できません: ${e.message}`);

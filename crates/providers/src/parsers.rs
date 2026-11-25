@@ -10,6 +10,7 @@ pub(crate) struct Parser {
     session: Option<String>,
     partial_text: bool,
     partial_reasoning: bool,
+    claude_step_context: bool,
     codex_text: HashMap<String, String>,
     codex_calls: HashSet<String>,
     opencode_step_finished: bool,
@@ -22,6 +23,7 @@ impl Parser {
             session: None,
             partial_text: false,
             partial_reasoning: false,
+            claude_step_context: false,
             codex_text: HashMap::new(),
             codex_calls: HashSet::new(),
             opencode_step_finished: false,
@@ -70,7 +72,13 @@ impl Parser {
         match kind(event) {
             "stream_event" => self.claude_partial(&event["event"], out),
             "assistant" | "user" => self.claude_message(event, out),
-            "result" => stream_json_result(event, out),
+            "result" => {
+                let usage = event.get("usage").or(event.get("stats")).unwrap_or(&Value::Null);
+                if !self.claude_step_context && has_cache_tokens(usage) {
+                    push_context_usage(ProviderId::Claude, usage, out);
+                }
+                stream_json_result(event, out);
+            }
             "error" | "failed" | "rate_limit" | "rate_limited" => out.push(error_event(event)),
             "rate_limit_event"
                 if matches!(
@@ -107,8 +115,14 @@ impl Parser {
         }
     }
 
-    fn claude_message(&self, event: &Value, out: &mut Vec<StreamEvent>) {
+    fn claude_message(&mut self, event: &Value, out: &mut Vec<StreamEvent>) {
         let assistant = kind(event) == "assistant";
+        if assistant
+            && let Some(usage) = event.pointer("/message/usage")
+            && push_context_usage(ProviderId::Claude, usage, out)
+        {
+            self.claude_step_context = true;
+        }
         if let Some(content) = event.pointer("/message/content").and_then(Value::as_array) {
             for block in content {
                 match kind(block) {
@@ -140,6 +154,9 @@ impl Parser {
                 self.codex_item(&event["item"], kind(event) == "item.completed", out);
             }
             "turn.completed" => {
+                if has_cache_tokens(&event["usage"]) {
+                    push_context_usage(ProviderId::Codex, &event["usage"], out);
+                }
                 push_usage(out, &event["usage"]);
                 out.push(StreamEvent::Completed { final_text: None });
             }
@@ -201,6 +218,9 @@ impl Parser {
                         first_string(step, &["thinking_delta", "reasoning_delta"]),
                         true,
                     );
+                    if let Some(usage) = step.get("usage") {
+                        push_context_usage(ProviderId::Antigravity, usage, out);
+                    }
                     if string(step, "state") == Some("DONE")
                         && let Some(st) = string(step, "step_type")
                     {
@@ -216,7 +236,11 @@ impl Parser {
                 }
                 "result" => {
                     let res = event.get("result").unwrap_or(event);
-                    push_usage(out, res.get("usage").unwrap_or(&Value::Null));
+                    let usage = res.get("usage").unwrap_or(&Value::Null);
+                    if has_cache_tokens(usage) {
+                        push_context_usage(ProviderId::Antigravity, usage, out);
+                    }
+                    push_usage(out, usage);
                     let status = string(res, "status").unwrap_or("");
                     let failed = status.eq_ignore_ascii_case("error")
                         || status.eq_ignore_ascii_case("failed")
@@ -285,10 +309,11 @@ impl Parser {
             "file_change" => push_item(out, TurnItemKind::FileChange, part),
             "step_finish" => {
                 self.opencode_step_finished = true;
-                push_usage(
-                    out,
-                    part.get("tokens").or(event.get("usage")).unwrap_or(part),
-                );
+                let tokens = part.get("tokens").or(event.get("usage")).unwrap_or(part);
+                if has_cache_tokens(tokens) {
+                    push_context_usage(ProviderId::OpenCode, tokens, out);
+                }
+                push_usage(out, tokens);
             }
             "error" | "failed" | "rate_limit" | "rate_limited" => out.push(error_event(event)),
             _ => {}
@@ -351,6 +376,81 @@ fn token_counts(value: &Value) -> Option<(u64, u64)> {
     .into_iter()
     .find_map(|key| value[key].as_u64());
     (input.is_some() || output.is_some()).then_some((input.unwrap_or(0), output.unwrap_or(0)))
+}
+
+fn cache_counts(value: &Value) -> (Option<u64>, Option<u64>) {
+    let read = [
+        "cache_read_input_tokens",
+        "cached_input_tokens",
+        "cacheReadInputTokens",
+        "cachedContentTokenCount",
+        "cache_read",
+    ]
+    .into_iter()
+    .find_map(|key| value[key].as_u64())
+    .or_else(|| value.pointer("/cache/read").and_then(Value::as_u64));
+    let write = [
+        "cache_creation_input_tokens",
+        "cache_write_input_tokens",
+        "cacheCreationInputTokens",
+        "cache_write",
+    ]
+    .into_iter()
+    .find_map(|key| value[key].as_u64())
+    .or_else(|| value.pointer("/cache/write").and_then(Value::as_u64));
+    (read, write)
+}
+
+fn has_cache_tokens(value: &Value) -> bool {
+    let (read, write) = cache_counts(value);
+    read.is_some() || write.is_some()
+}
+
+fn push_context_usage(provider: ProviderId, value: &Value, out: &mut Vec<StreamEvent>) -> bool {
+    let counts = token_counts(value);
+    let (cache_read, cache_write) = cache_counts(value);
+    if counts.is_none() && cache_read.is_none() && cache_write.is_none() {
+        return false;
+    }
+    let (raw_input, output_tokens) = counts.unwrap_or((0, 0));
+    let cache_read_tokens = cache_read.unwrap_or(0);
+    let cache_write_tokens = cache_write.unwrap_or(0);
+    let (input_tokens, context_tokens) = match provider {
+        ProviderId::Codex => {
+            // Codex `input_tokens` already includes `cached_input_tokens`.
+            let fresh = raw_input.saturating_sub(cache_read_tokens);
+            let ctx = raw_input
+                .saturating_add(cache_write_tokens)
+                .saturating_add(output_tokens);
+            (fresh, ctx)
+        }
+        ProviderId::Antigravity if value["promptTokenCount"].is_u64() => {
+            // Gemini `promptTokenCount` already includes `cachedContentTokenCount`.
+            let fresh = raw_input.saturating_sub(cache_read_tokens);
+            let ctx = raw_input
+                .saturating_add(cache_write_tokens)
+                .saturating_add(output_tokens);
+            (fresh, ctx)
+        }
+        _ => {
+            let ctx = raw_input
+                .saturating_add(cache_read_tokens)
+                .saturating_add(cache_write_tokens)
+                .saturating_add(output_tokens);
+            (raw_input, ctx)
+        }
+    };
+    if context_tokens == 0 {
+        return false;
+    }
+    out.push(StreamEvent::ContextUsage {
+        context_tokens,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+    });
+    true
 }
 
 fn push_usage(out: &mut Vec<StreamEvent>, value: &Value) {
@@ -727,7 +827,13 @@ mod tests {
         let events = fixture(ProviderId::Antigravity, lines);
         assert_eq!(
             event_types(&events),
-            ["session_started", "assistant_delta", "usage", "completed"]
+            [
+                "session_started",
+                "assistant_delta",
+                "context_usage",
+                "usage",
+                "completed"
+            ]
         );
         assert_eq!(
             events[0]["provider_session_id"],
@@ -736,8 +842,44 @@ mod tests {
         assert_eq!(events[1]["text"], "OK");
         assert_eq!(
             events[2],
+            json!({
+                "type": "context_usage",
+                "context_tokens": 11175,
+                "input_tokens": 11126,
+                "output_tokens": 49,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0
+            })
+        );
+        assert_eq!(
+            events[3],
             json!({"type":"usage","input_tokens":11126,"output_tokens":49})
         );
-        assert_eq!(events[3]["final_text"], "OK\n");
+        assert_eq!(events[4]["final_text"], "OK\n");
+    }
+
+    #[test]
+    fn claude_assistant_usage_emits_context_usage_with_cache_tokens() {
+        let lines = concat!(
+            r#"{"type":"assistant","session_id":"claude-ctx","message":{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":120,"cache_read_input_tokens":40000,"cache_creation_input_tokens":1500,"output_tokens":380}}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","result":"hi","usage":{"input_tokens":120,"cache_read_input_tokens":40000,"cache_creation_input_tokens":1500,"output_tokens":380}}"#,
+        );
+        let events = fixture(ProviderId::Claude, lines);
+        assert_eq!(
+            event_types(&events),
+            ["session_started", "context_usage", "assistant_delta", "usage", "completed"]
+        );
+        assert_eq!(
+            events[1],
+            json!({
+                "type": "context_usage",
+                "context_tokens": 42000,
+                "input_tokens": 120,
+                "output_tokens": 380,
+                "cache_read_tokens": 40000,
+                "cache_write_tokens": 1500
+            })
+        );
     }
 }

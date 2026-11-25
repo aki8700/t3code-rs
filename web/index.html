@@ -65,6 +65,7 @@
         <button type="button" class="tbtn thread-only" id="btn-delegate" data-icon="split" title="子スレッドとして並列に委譲 (Delegate)"><span class="lbl">委譲</span></button>
         <button type="button" class="tbtn thread-only" id="btn-diff" data-icon="diff" data-kbd="D" data-title="Git 差分" aria-pressed="false"><span class="lbl">Diff</span><span class="diff-badge" id="diff-badge" hidden></span></button>
         <button type="button" class="tbtn swarm-btn" id="btn-swarm" data-icon="swarm" aria-pressed="false" aria-controls="swarm-panel" aria-keyshortcuts="Alt+S" hidden><span class="lbl">Swarm</span><b class="swarm-count">0</b><span class="pulse" aria-hidden="true" hidden></span></button>
+        <button type="button" class="tbtn ctx-btn thread-only" id="btn-context" data-kbd="I" data-title="コンテキスト・スレッド詳細" aria-pressed="false" aria-controls="context-panel"><span class="ctx-ring-slot" id="tb-ctx-ring" aria-hidden="true"></span><span class="lbl" id="tb-ctx-label">コンテキスト</span></button>
         <button type="button" class="ibtn wide-only" id="btn-search" data-icon="search" data-kbd="K" data-title="全文検索" aria-label="検索"></button>
         <button type="button" class="ibtn wide-only" id="btn-top-usage" data-icon="chart" data-kbd="U" data-title="使用量" aria-label="使用量"></button>
       </div>
@@ -91,6 +92,7 @@
           <button type="button" class="chip-btn" id="btn-perm" aria-haspopup="dialog"></button>
           <button type="button" class="chip-btn plan" id="btn-plan-chip" aria-haspopup="dialog" hidden>Plan</button>
           <span class="grow"></span>
+          <button type="button" class="ctx-meter thread-only" id="btn-ctx-meter" title="コンテキスト使用量" aria-label="コンテキスト使用量" aria-controls="context-panel" hidden></button>
           <button type="button" class="model-pill" id="btn-model" aria-haspopup="dialog" aria-expanded="false"></button>
           <div class="seg mini run-only" id="behavior" role="radiogroup" aria-label="実行中の送信方法" hidden>
             <button type="button" role="radio" data-b="steer" title="実行中のターンに割り込んで指示を送る">Steer</button>
@@ -107,10 +109,32 @@
     <div class="drop-hint" id="drop-hint" hidden><span>ドロップして添付</span></div>
   </main>
 
+  <!-- ===== 右パネル幅調整ハンドル ===== -->
+  <div id="rail-resizer" class="rail-resizer" role="separator" aria-orientation="vertical" aria-label="右パネルの幅を調整" aria-valuemin="260" aria-valuemax="760" tabindex="0" title="ドラッグで幅を調整（ダブルクリックでリセット）" hidden></div>
+
+  <!-- ===== 右: コンテキスト・スレッド詳細（T3 Code 右サイドバー） ===== -->
+  <aside id="context-panel" class="rail-panel context-panel" aria-label="コンテキストとスレッド詳細" hidden>
+    <div class="dp-head drag-region">
+      <div class="rail-tabs" role="tablist" aria-label="右パネル">
+        <button type="button" role="tab" class="rail-tab on" data-rail-tab="context" aria-controls="context-panel" aria-selected="true">コンテキスト</button>
+        <button type="button" role="tab" class="rail-tab" data-rail-tab="diff" aria-controls="diff-panel" aria-selected="false">差分<span class="rail-tab-badge" id="ctx-tab-diff-badge" hidden></span></button>
+        <button type="button" role="tab" class="rail-tab" data-rail-tab="swarm" aria-controls="swarm-panel" aria-selected="false" hidden>Swarm</button>
+      </div>
+      <span class="grow"></span>
+      <button type="button" class="ibtn sm" id="btn-ctx-refresh" data-icon="refresh" title="更新" aria-label="コンテキスト情報を更新"></button>
+      <button type="button" class="ibtn sm" id="btn-ctx-close" data-icon="close" title="閉じる" aria-label="閉じる"></button>
+    </div>
+    <div class="ctx-body" id="context-body"></div>
+  </aside>
+
   <!-- ===== 右: Git 差分 ===== -->
   <aside id="diff-panel" class="rail-panel diff-panel" aria-label="Git 差分" hidden>
     <div class="dp-head drag-region">
-      <strong>差分</strong>
+      <div class="rail-tabs" role="tablist" aria-label="右パネル">
+        <button type="button" role="tab" class="rail-tab" data-rail-tab="context" aria-controls="context-panel" aria-selected="false">コンテキスト</button>
+        <button type="button" role="tab" class="rail-tab on" data-rail-tab="diff" aria-controls="diff-panel" aria-selected="true">差分</button>
+        <button type="button" role="tab" class="rail-tab" data-rail-tab="swarm" aria-controls="swarm-panel" aria-selected="false" hidden>Swarm</button>
+      </div>
       <span class="dp-sum" id="diff-sum"></span>
       <span class="grow"></span>
       <button type="button" class="ibtn sm" id="btn-diff-expand" data-icon="expand" title="全て展開／折りたたみ" aria-label="全て展開／折りたたみ"></button>
@@ -119,8 +143,12 @@
     </div>
     <div class="dp-sub">
       <span class="dp-branch" id="diff-branch"></span>
+      <div class="seg mini" id="diff-scope" role="radiogroup" aria-label="差分の範囲">
+        <button type="button" role="radio" data-scope="all" class="on" aria-checked="true">すべて</button>
+        <button type="button" role="radio" data-scope="latest" aria-checked="false">最新ターン</button>
+      </div>
       <span class="grow"></span>
-      <label class="switch"><input type="checkbox" id="chk-ws" checked><i></i><span>空白の差を無視</span></label>
+      <label class="switch"><input type="checkbox" id="chk-ws" checked><i></i><span>空白を無視</span></label>
     </div>
     <div class="dp-body" id="diff-body"></div>
   </aside>
@@ -134,6 +162,13 @@
       </div>
       <button type="button" class="ibtn sm" id="btn-swarm-refresh" data-icon="refresh" title="更新" aria-label="Swarm ボードを更新"></button>
       <button type="button" class="ibtn sm" id="btn-swarm-close" data-icon="close" title="閉じる" aria-label="Swarm ボードを閉じる"></button>
+    </div>
+    <div class="sw-rail-bar">
+      <div class="rail-tabs" role="tablist" aria-label="右パネル">
+        <button type="button" role="tab" class="rail-tab" data-rail-tab="context" aria-controls="context-panel" aria-selected="false">コンテキスト</button>
+        <button type="button" role="tab" class="rail-tab" data-rail-tab="diff" aria-controls="diff-panel" aria-selected="false">差分</button>
+        <button type="button" role="tab" class="rail-tab on" data-rail-tab="swarm" aria-controls="swarm-panel" aria-selected="true">Swarm</button>
+      </div>
     </div>
     <section class="sw-roster" aria-label="ワーカー一覧">
       <ul id="swarm-roster"></ul>

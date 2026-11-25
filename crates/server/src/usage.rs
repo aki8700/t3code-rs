@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
-    io::{self, BufRead, BufReader, Read},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::{Duration as StdDuration, Instant, SystemTime},
 };
@@ -34,6 +34,119 @@ fn parse_refresh<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<bo
         "false" | "0" => Ok(Some(false)),
         _ => Err(de::Error::custom("refresh must be a boolean")),
     }
+}
+
+const SESSION_CTX_CACHE_MAX: usize = 256;
+const SESSION_CTX_MISS_TTL: StdDuration = StdDuration::from_secs(10);
+const SESSION_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct SessionContextUsage {
+    pub context_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+}
+
+enum CachedSessionContext {
+    Hit {
+        path: PathBuf,
+        modified: Option<SystemTime>,
+        len: u64,
+        usage: Option<SessionContextUsage>,
+    },
+    Miss {
+        at: Instant,
+    },
+}
+
+/// Reads the latest token snapshot for a Claude or Codex session transcript without following symlinks.
+fn read_session_transcript(path: &Path, provider: ProviderId) -> Option<SessionContextUsage> {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(transcript_open_flags().ok()?);
+    }
+    let mut file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    // Bound read cost on huge transcripts by tail-parsing the final 2 MiB.
+    let len = meta.len();
+    let mut reader = if len > SESSION_TAIL_BYTES {
+        file.seek(SeekFrom::Start(len - SESSION_TAIL_BYTES)).ok()?;
+        let mut r = BufReader::new(file);
+        let mut discard = Vec::new();
+        let _ = r.read_until(b'\n', &mut discard);
+        r
+    } else {
+        BufReader::new(file)
+    };
+    let samples = parse_transcript(&mut reader, provider).ok()?;
+    let last = samples.last()?.tokens;
+    let context_tokens = last.total();
+    (context_tokens > 0).then_some(SessionContextUsage {
+        context_tokens,
+        input_tokens: last.input_tokens,
+        output_tokens: last.output_tokens,
+        cache_read_tokens: last.cache_read_tokens,
+        cache_write_tokens: last.cache_write_tokens,
+    })
+}
+
+fn find_claude_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let root = home.join(".claude").join("projects");
+    let filename = format!("{session_id}.jsonl");
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let candidate = dir.join(&filename);
+        if fs::symlink_metadata(&candidate).is_ok_and(|m| m.is_file()) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn find_codex_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let root = home.join(".codex").join("sessions");
+    let exact = format!("{session_id}.jsonl");
+    let suffixed = format!("-{session_id}.jsonl");
+    let mut dirs = vec![root];
+    let mut visited = 0usize;
+    while let Some(dir) = dirs.pop() {
+        visited += 1;
+        if visited > 512 || !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if kind.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name == exact || name.ends_with(&suffixed))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 pub(crate) async fn get(
@@ -70,6 +183,78 @@ pub(crate) async fn get(
 pub(crate) struct UsageScanCache {
     files: HashMap<PathBuf, CachedFile>,
     snapshot: Option<UsageSnapshot>,
+    session_ctx: HashMap<(ProviderId, String), CachedSessionContext>,
+}
+
+impl UsageScanCache {
+    pub(crate) fn session_context_usage(
+        &mut self,
+        home: Option<&Path>,
+        provider: ProviderId,
+        session_id: &str,
+    ) -> Option<SessionContextUsage> {
+        let home = home?;
+        if session_id.is_empty()
+            || session_id.len() > 128
+            || !session_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        {
+            return None;
+        }
+        let key = (provider, session_id.to_owned());
+        if let Some(entry) = self.session_ctx.get(&key) {
+            match entry {
+                CachedSessionContext::Hit {
+                    path,
+                    modified,
+                    len,
+                    usage,
+                } => {
+                    if let Ok(meta) = fs::symlink_metadata(path)
+                        && meta.is_file()
+                        && meta.modified().ok() == *modified
+                        && meta.len() == *len
+                    {
+                        return *usage;
+                    }
+                }
+                CachedSessionContext::Miss { at } => {
+                    if at.elapsed() < SESSION_CTX_MISS_TTL {
+                        return None;
+                    }
+                }
+            }
+        }
+        let path = match provider {
+            ProviderId::Claude => find_claude_session_file(home, session_id),
+            ProviderId::Codex => find_codex_session_file(home, session_id),
+            _ => None,
+        };
+        if self.session_ctx.len() >= SESSION_CTX_CACHE_MAX && !self.session_ctx.contains_key(&key) {
+            self.session_ctx.clear();
+        }
+        let Some(path) = path else {
+            self.session_ctx
+                .insert(key, CachedSessionContext::Miss { at: Instant::now() });
+            return None;
+        };
+        let meta = fs::symlink_metadata(&path).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let usage = read_session_transcript(&path, provider);
+        self.session_ctx.insert(
+            key,
+            CachedSessionContext::Hit {
+                path,
+                modified: meta.modified().ok(),
+                len: meta.len(),
+                usage,
+            },
+        );
+        usage
+    }
 }
 
 struct CachedFile {

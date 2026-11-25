@@ -22,6 +22,13 @@ pub(crate) async fn named(Path(name): Path<String>) -> Response {
     asset(&name)
 }
 
+pub(crate) async fn js_module(Path(name): Path<String>) -> Response {
+    if name.contains(['/', '\\']) || name.starts_with('.') || !name.ends_with(".js") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    asset(&format!("js/{name}"))
+}
+
 fn asset(name: &str) -> Response {
     let Some(file) = WebAssets::get(name) else {
         return StatusCode::NOT_FOUND.into_response();

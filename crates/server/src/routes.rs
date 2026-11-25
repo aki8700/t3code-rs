@@ -73,6 +73,7 @@ pub fn router(state: ServerState) -> Router {
         .merge(mcp_router(state))
         .route("/healthz", get(health))
         .route("/", get(assets::index))
+        .route("/js/{name}", get(assets::js_module))
         .route("/{asset}", get(assets::named))
         .layer(middleware::from_fn(assets::security_headers))
 }
@@ -222,17 +223,19 @@ async fn thread_detail(
 ) -> ApiResult<Json<Value>> {
     let store = &state.store;
     let thread = store.get_thread(id).await?;
-    let (runs, (items, has_more, total_items), children, handoffs, mut attachments) = tokio::try_join!(
-        store.list_runs(id),
-        store.list_turn_items_page(
-            id,
-            page.limit.unwrap_or(200).clamp(1, 1000),
-            page.before_ordinal
-        ),
-        store.list_child_threads(id),
-        store.list_handoffs(id),
-        store.list_attachments(id),
-    )?;
+    let (runs, (items, has_more, total_items), children, handoffs, mut attachments, breakdown) =
+        tokio::try_join!(
+            store.list_runs(id),
+            store.list_turn_items_page(
+                id,
+                page.limit.unwrap_or(200).clamp(1, 1000),
+                page.before_ordinal
+            ),
+            store.list_child_threads(id),
+            store.list_handoffs(id),
+            store.list_attachments(id),
+            state.coordinator.items_breakdown(id),
+        )?;
     let mut known: std::collections::HashSet<_> =
         attachments.iter().map(|attachment| attachment.id).collect();
     // Uploads made before a thread exists are referenced by its message items.
@@ -253,11 +256,129 @@ async fn thread_detail(
             }
         }
     }
+    let context = build_thread_context(&state, &thread, &runs, &breakdown).await;
     Ok(Json(json!({
         "thread": thread, "runs": runs, "items": items, "children": children,
         "has_more": has_more, "total_items": total_items,
         "handoffs": handoffs, "attachments": attachments,
+        "context": context,
     })))
+}
+
+async fn build_thread_context(
+    state: &ServerState,
+    thread: &Thread,
+    runs: &[Run],
+    breakdown: &[crate::coordinator::ItemBreakdown],
+) -> Value {
+    let context_window =
+        t3_providers::context_window_for(thread.model_selection.provider, &thread.model_selection.model);
+    let total_input_tokens: u64 = runs.iter().filter_map(|r| r.input_tokens).sum();
+    let total_output_tokens: u64 = runs.iter().filter_map(|r| r.output_tokens).sum();
+    let total_duration_ms: u64 = runs.iter().filter_map(|r| r.duration_ms).sum();
+    let total_raw_bytes: u64 = breakdown.iter().map(|b| b.raw_bytes).sum();
+
+    let matches_thread = |snap: &crate::coordinator::LiveContextUsage| {
+        snap.provider == thread.model_selection.provider
+            && snap.model == thread.model_selection.model
+            && (thread.provider_session_id.is_none()
+                || snap.session_id.is_none()
+                || snap.session_id == thread.provider_session_id)
+    };
+    let live = state
+        .coordinator
+        .live_context(thread.id)
+        .await
+        .filter(matches_thread);
+    let stored = if live.is_none() {
+        state
+            .coordinator
+            .stored_context(thread.id)
+            .await
+            .filter(matches_thread)
+    } else {
+        None
+    };
+    let session = if live.is_none()
+        && stored.is_none()
+        && matches!(
+            thread.model_selection.provider,
+            ProviderId::Claude | ProviderId::Codex
+        )
+        && let Some(session_id) = thread.provider_session_id.clone()
+    {
+        let home = state.usage_home.clone();
+        let usage_cache = state.usage_cache.clone();
+        let provider = thread.model_selection.provider;
+        tokio::task::spawn_blocking(move || {
+            let mut cache = usage_cache.lock().ok()?;
+            cache.session_context_usage(home.as_deref(), provider, &session_id)
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+
+    let (source, used_tokens, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) =
+        if let Some(snap) = live {
+            (
+                "live",
+                snap.context_tokens,
+                snap.input_tokens,
+                snap.output_tokens,
+                snap.cache_read_tokens,
+                snap.cache_write_tokens,
+            )
+        } else if let Some(snap) = stored {
+            (
+                "stored",
+                snap.context_tokens,
+                snap.input_tokens,
+                snap.output_tokens,
+                snap.cache_read_tokens,
+                snap.cache_write_tokens,
+            )
+        } else if let Some(sess) = session {
+            (
+                "session",
+                sess.context_tokens,
+                sess.input_tokens,
+                sess.output_tokens,
+                sess.cache_read_tokens,
+                sess.cache_write_tokens,
+            )
+        } else if let Some(last_run) = runs
+            .iter()
+            .rev()
+            .find(|r| r.input_tokens.is_some() || r.output_tokens.is_some())
+        {
+            let inp = last_run.input_tokens.unwrap_or(0);
+            let out = last_run.output_tokens.unwrap_or(0);
+            ("run", inp.saturating_add(out), inp, out, 0, 0)
+        } else if total_raw_bytes > 0 {
+            // Rough heuristic for mixed Japanese/code payloads (~3.5 bytes/token).
+            let est = ((total_raw_bytes as f64) / 3.5).round() as u64;
+            ("estimated", est, est, 0, 0, 0)
+        } else {
+            ("empty", 0, 0, 0, 0, 0)
+        };
+
+    json!({
+        "context_window": context_window,
+        "used_tokens": used_tokens,
+        "source": source,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "total_duration_ms": total_duration_ms,
+        "total_raw_bytes": total_raw_bytes,
+        "items_breakdown": breakdown,
+    })
 }
 
 async fn swarm_board(

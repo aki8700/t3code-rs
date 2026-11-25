@@ -8,6 +8,7 @@ mod process;
 mod retry;
 mod watchdog;
 
+pub use catalog::context_window_for;
 pub use cli_drivers::{AntigravityDriver, ClaudeDriver, CodexDriver, OpenCodeDriver};
 pub use mock::MockDriver;
 pub use retry::run_turn_with_retry;

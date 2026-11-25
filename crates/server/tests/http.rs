@@ -1574,3 +1574,65 @@ esac
     assert!(logged_req.contains("idempotencyKey"));
     agy_task.abort();
 }
+
+#[tokio::test]
+async fn thread_detail_returns_context_and_items_breakdown() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let app = router(state);
+    let providers = json_req(&app, Method::GET, "/api/providers", None).await;
+    let mock_models = providers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["provider"] == "mock")
+        .unwrap()["models"]
+        .as_array()
+        .unwrap();
+    assert_eq!(mock_models[0]["context_window"], 200_000);
+
+    let id = create_parent(&app, &tmp.0).await;
+    let _ = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({ "prompt": "context panel check" })),
+    )
+    .await;
+    // Wait briefly for the mock run to complete.
+    let mut detail = Value::Null;
+    for _ in 0..40 {
+        detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
+        if detail["thread"]["status"] == "completed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(detail["thread"]["status"], "completed");
+    let ctx = &detail["context"];
+    assert_eq!(ctx["context_window"], 200_000);
+    assert_eq!(ctx["source"], "live");
+    assert_eq!(ctx["used_tokens"], 2);
+    assert_eq!(ctx["total_input_tokens"], 1);
+    assert_eq!(ctx["total_output_tokens"], 1);
+    let breakdown = ctx["items_breakdown"].as_array().unwrap();
+    assert!(breakdown.iter().any(|b| b["kind"] == "user_message" && b["count"].as_u64().unwrap() >= 1));
+    assert!(breakdown.iter().any(|b| b["kind"] == "assistant_message" && b["count"].as_u64().unwrap() >= 1));
+
+    // Drop in-memory live context to simulate restart; stored DB context must survive.
+    drop(app);
+    let reopened = tmp.state(AuthConfig::LocalOnly);
+    let app2 = router(reopened);
+    let after_restart = json_req(&app2, Method::GET, &format!("/api/threads/{id}"), None).await;
+    assert_eq!(after_restart["context"]["source"], "stored");
+    assert_eq!(after_restart["context"]["used_tokens"], 2);
+    assert_eq!(after_restart["context"]["context_window"], 200_000);
+
+    // Embedded ES modules under /js/{name} serve .js files and reject traversal/non-js paths.
+    let js_ok = request(&app2, Request::get("/js/util.js").body(Body::empty()).unwrap()).await;
+    assert_eq!(js_ok.status(), StatusCode::OK);
+    let js_bad = request(&app2, Request::get("/js/..%2Findex.html").body(Body::empty()).unwrap()).await;
+    assert_eq!(js_bad.status(), StatusCode::NOT_FOUND);
+    let js_non = request(&app2, Request::get("/js/util.txt").body(Body::empty()).unwrap()).await;
+    assert_eq!(js_non.status(), StatusCode::NOT_FOUND);
+}

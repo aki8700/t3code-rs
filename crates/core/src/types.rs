@@ -56,6 +56,8 @@ pub struct ModelSpec {
     pub default_effort: Option<String>,
     pub is_local: bool,
     pub is_free: bool,
+    #[serde(default)]
+    pub context_window: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

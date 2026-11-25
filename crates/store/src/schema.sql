@@ -144,3 +144,17 @@ CREATE TABLE IF NOT EXISTS swarm_messages (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS swarm_messages_board_seq ON swarm_messages(board_id, seq);
+
+CREATE TABLE IF NOT EXISTS thread_context (
+    thread_id TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    session_id TEXT,
+    context_tokens INTEGER NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cache_read_tokens INTEGER NOT NULL,
+    cache_write_tokens INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);

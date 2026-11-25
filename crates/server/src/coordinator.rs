@@ -28,10 +28,33 @@ pub(crate) struct Coordinator {
     pub(crate) providers: ProviderRegistry,
     pub(crate) events: broadcast::Sender<WsServerMessage>,
     pub(crate) active: Mutex<HashMap<Uuid, ActiveRun>>,
+    pub(crate) latest_context: Mutex<HashMap<Uuid, LiveContextUsage>>,
     shutting_down: AtomicBool,
     injection: McpInjectionSpec,
     tokens: McpTokens,
     limits: Arc<crate::limits::UsageLimitsCache>,
+}
+
+const MAX_LIVE_CONTEXT_ENTRIES: usize = 256;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveContextUsage {
+    pub run_id: Uuid,
+    pub provider: ProviderId,
+    pub model: String,
+    pub session_id: Option<String>,
+    pub context_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ItemBreakdown {
+    pub kind: String,
+    pub count: u64,
+    pub raw_bytes: u64,
 }
 
 pub(crate) struct ActiveRun {
@@ -61,11 +84,13 @@ pub(crate) struct RunTicket {
     pub(crate) done: watch::Receiver<bool>,
 }
 
-#[derive(Default)]
 struct Outcome {
+    provider: ProviderId,
+    model: String,
     session: Option<String>,
     input: Option<u64>,
     output: Option<u64>,
+    has_context_usage: bool,
     assistant: String,
     reasoning: String,
     terminal: Option<(RunStatus, Option<String>)>,
@@ -109,8 +134,134 @@ impl RunCoordinator {
             limits,
             events,
             active: Mutex::new(HashMap::new()),
+            latest_context: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
         }))
+    }
+
+    pub async fn live_context(&self, thread_id: Uuid) -> Option<LiveContextUsage> {
+        self.0.latest_context.lock().await.get(&thread_id).cloned()
+    }
+
+    pub async fn stored_context(&self, thread_id: Uuid) -> Option<LiveContextUsage> {
+        let id = thread_id.to_string();
+        self.sql(move |db| {
+            use rusqlite::OptionalExtension;
+            db.query_row(
+                "SELECT run_id, provider, model, session_id, context_tokens,
+                        input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+                 FROM thread_context WHERE thread_id = ?1",
+                [id],
+                |row| {
+                    let run_id_s: String = row.get(0)?;
+                    let prov_s: String = row.get(1)?;
+                    let run_id = Uuid::parse_str(&run_id_s).unwrap_or_default();
+                    let provider =
+                        serde_json::from_str::<ProviderId>(&prov_s).unwrap_or(ProviderId::Mock);
+                    Ok(LiveContextUsage {
+                        run_id,
+                        provider,
+                        model: row.get(2)?,
+                        session_id: row.get(3)?,
+                        context_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                        input_tokens: row.get::<_, i64>(5)?.max(0) as u64,
+                        output_tokens: row.get::<_, i64>(6)?.max(0) as u64,
+                        cache_read_tokens: row.get::<_, i64>(7)?.max(0) as u64,
+                        cache_write_tokens: row.get::<_, i64>(8)?.max(0) as u64,
+                    })
+                },
+            )
+            .optional()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    pub async fn persist_context(&self, thread_id: Uuid, snap: &LiveContextUsage) {
+        let Ok(provider) = serde_json::to_string(&snap.provider) else {
+            return;
+        };
+        let id = thread_id.to_string();
+        let run_id = snap.run_id.to_string();
+        let model = snap.model.clone();
+        let session_id = snap.session_id.clone();
+        let (ctx, inp, out, cr, cw) = (
+            snap.context_tokens.min(i64::MAX as u64) as i64,
+            snap.input_tokens.min(i64::MAX as u64) as i64,
+            snap.output_tokens.min(i64::MAX as u64) as i64,
+            snap.cache_read_tokens.min(i64::MAX as u64) as i64,
+            snap.cache_write_tokens.min(i64::MAX as u64) as i64,
+        );
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        if let Err(error) = self
+            .sql(move |db| {
+                db.execute(
+                    "INSERT INTO thread_context (
+                        thread_id, run_id, provider, model, session_id,
+                        context_tokens, input_tokens, output_tokens,
+                        cache_read_tokens, cache_write_tokens, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT(thread_id) DO UPDATE SET
+                        run_id = excluded.run_id,
+                        provider = excluded.provider,
+                        model = excluded.model,
+                        session_id = excluded.session_id,
+                        context_tokens = excluded.context_tokens,
+                        input_tokens = excluded.input_tokens,
+                        output_tokens = excluded.output_tokens,
+                        cache_read_tokens = excluded.cache_read_tokens,
+                        cache_write_tokens = excluded.cache_write_tokens,
+                        updated_at = excluded.updated_at",
+                    rusqlite::params![id, run_id, provider, model, session_id, ctx, inp, out, cr, cw, now],
+                )
+            })
+            .await
+        {
+            tracing::warn!(%error, %thread_id, "Could not persist thread context");
+        }
+    }
+
+    pub async fn clear_live_context(&self, thread_id: Uuid) {
+        self.0.latest_context.lock().await.remove(&thread_id);
+        let id = thread_id.to_string();
+        let _ = self
+            .sql(move |db| db.execute("DELETE FROM thread_context WHERE thread_id = ?1", [id]))
+            .await;
+    }
+
+    async fn record_live_context(&self, thread_id: Uuid, snap: LiveContextUsage) {
+        let mut map = self.0.latest_context.lock().await;
+        if map.len() >= MAX_LIVE_CONTEXT_ENTRIES
+            && !map.contains_key(&thread_id)
+            && let Some(evict) = map.keys().next().copied()
+        {
+            map.remove(&evict);
+        }
+        map.insert(thread_id, snap);
+    }
+
+    pub async fn items_breakdown(&self, thread_id: Uuid) -> CoreResult<Vec<ItemBreakdown>> {
+        let id = thread_id.to_string();
+        self.sql(move |db| {
+            let mut stmt = db.prepare(
+                "SELECT kind, count(*), coalesce(sum(raw_bytes), 0)
+                 FROM turn_items WHERE thread_id = ?1 GROUP BY kind",
+            )?;
+            let rows = stmt
+                .query_map([id], |row| {
+                    let raw_kind: String = row.get(0)?;
+                    let kind = serde_json::from_str::<String>(&raw_kind).unwrap_or(raw_kind);
+                    Ok(ItemBreakdown {
+                        kind,
+                        count: row.get::<_, i64>(1)?.max(0) as u64,
+                        raw_bytes: row.get::<_, i64>(2)?.max(0) as u64,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<WsServerMessage> {
@@ -568,8 +719,15 @@ impl RunCoordinator {
         let thread_id = thread.id;
         let run_id = request.run_id;
         let mut outcome = Outcome {
+            provider: request.model_selection.provider,
+            model: request.model_selection.model.clone(),
             session: request.resume_session_id.clone(),
-            ..Default::default()
+            input: None,
+            output: None,
+            has_context_usage: false,
+            assistant: String::new(),
+            reasoning: String::new(),
+            terminal: None,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         let result = {
@@ -674,7 +832,7 @@ impl RunCoordinator {
             .finish_run(
                 run_id,
                 status,
-                outcome.session,
+                outcome.session.clone(),
                 outcome.input,
                 outcome.output,
                 started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
@@ -683,6 +841,15 @@ impl RunCoordinator {
             .await
         {
             tracing::error!(%error, %run_id, "Could not persist run completion");
+        }
+        if let Some(mut snap) = self.live_context(thread_id).await
+            && snap.run_id == run_id
+        {
+            if snap.session_id.is_none() {
+                snap.session_id = outcome.session;
+                self.record_live_context(thread_id, snap.clone()).await;
+            }
+            self.persist_context(thread_id, &snap).await;
         }
         if notify_parent
             && let Err(error) = self
@@ -874,6 +1041,62 @@ impl RunCoordinator {
             } => {
                 out.input = Some(out.input.unwrap_or(0).saturating_add(input_tokens));
                 out.output = Some(out.output.unwrap_or(0).saturating_add(output_tokens));
+                if !out.has_context_usage {
+                    let context_tokens = input_tokens.saturating_add(output_tokens);
+                    if context_tokens > 0 {
+                        let snap = LiveContextUsage {
+                            run_id,
+                            provider: out.provider,
+                            model: out.model.clone(),
+                            session_id: out.session.clone(),
+                            context_tokens,
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens: 0,
+                            cache_write_tokens: 0,
+                        };
+                        self.record_live_context(thread_id, snap).await;
+                        self.emit(WsServerMessage::RunUsageUpdated {
+                            thread_id,
+                            run_id,
+                            context_tokens,
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens: 0,
+                            cache_write_tokens: 0,
+                        });
+                    }
+                }
+            }
+            StreamEvent::ContextUsage {
+                context_tokens,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            } => {
+                out.has_context_usage = true;
+                let snap = LiveContextUsage {
+                    run_id,
+                    provider: out.provider,
+                    model: out.model.clone(),
+                    session_id: out.session.clone(),
+                    context_tokens,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                };
+                self.record_live_context(thread_id, snap).await;
+                self.emit(WsServerMessage::RunUsageUpdated {
+                    thread_id,
+                    run_id,
+                    context_tokens,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                });
             }
             StreamEvent::Completed { final_text } => {
                 if out.assistant.is_empty()

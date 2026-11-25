@@ -34,6 +34,13 @@ pub enum StreamEvent {
         input_tokens: u64,
         output_tokens: u64,
     },
+    ContextUsage {
+        context_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+    },
     Completed {
         final_text: Option<String>,
     },
@@ -74,6 +81,15 @@ pub enum WsServerMessage {
     TurnItemAdded {
         thread_id: Uuid,
         item: TurnItem,
+    },
+    RunUsageUpdated {
+        thread_id: Uuid,
+        run_id: Uuid,
+        context_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
     },
     PendingRequest {
         request: PendingRequest,

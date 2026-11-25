@@ -42,6 +42,41 @@ pub(crate) fn default_models(provider: ProviderId) -> Vec<ModelSpec> {
         .collect()
 }
 
+pub fn context_window_for(provider: ProviderId, model: &str) -> u64 {
+    let lower = model.to_ascii_lowercase();
+    match provider {
+        ProviderId::Claude => {
+            if lower.contains("haiku") {
+                200_000
+            } else {
+                1_000_000
+            }
+        }
+        ProviderId::Codex => {
+            if lower.contains("astra")
+                || lower.contains("sol")
+                || lower.contains("terra")
+                || lower.contains("luna")
+                || lower.contains("gpt-5")
+                || lower.contains("gpt-6")
+            {
+                400_000
+            } else {
+                200_000
+            }
+        }
+        ProviderId::Antigravity => 1_000_000,
+        ProviderId::OpenCode => {
+            if lower.contains("9b") || lower.contains("4b") || lower.contains("7b") || lower.contains("8b") {
+                32_768
+            } else {
+                128_000
+            }
+        }
+        ProviderId::Mock => 200_000,
+    }
+}
+
 fn model(provider: ProviderId, id: &str, tier: ModelTier) -> ModelSpec {
     let effort_levels: &[&str] = match provider {
         ProviderId::Claude | ProviderId::Antigravity => &["low", "medium", "high", "xhigh", "max"],
@@ -61,5 +96,6 @@ fn model(provider: ProviderId, id: &str, tier: ModelTier) -> ModelSpec {
         default_effort: None,
         is_local: false,
         is_free: false,
+        context_window: context_window_for(provider, id),
     }
 }
