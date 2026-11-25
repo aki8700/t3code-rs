@@ -216,7 +216,12 @@ done
 iconutil -c icns "$iconset" -o "$contents/Resources/AppIcon.icns"
 
 /usr/bin/plutil -lint "$contents/Info.plist"
-/usr/bin/codesign --force --deep --sign - "$bundle"
+# An ad-hoc signature makes the cdhash the designated requirement, so macOS privacy (TCC)
+# treats every rebuild as a new app and drops its file-access grants. A keychain identity
+# keeps the requirement stable across rebuilds; ad-hoc is only the fallback.
+identity="$(/usr/bin/security find-identity -v -p codesigning \
+    | awk '/"(Apple Development|Developer ID Application):/ { print $2; exit }')"
+/usr/bin/codesign --force --deep --sign "${identity:--}" "$bundle"
 /usr/bin/codesign --verify --deep --strict "$bundle"
 
 python3 - "$bundle" "$destination" <<'PYTHON'

@@ -51,9 +51,13 @@ Open `http://127.0.0.1:3774/` in your browser.
 This builds `t3d` and `t3code-rs-app`, generates the app icon, ad-hoc signs the bundle, and installs it atomically to `dist/T3 Code RS.app`.
 
 ```bash
-# Optional: copy into /Applications and ~/.local/bin
+# Optional: copy into /Applications
 cp -R "dist/T3 Code RS.app" /Applications/
-cp "dist/T3 Code RS.app/Contents/MacOS/t3d" ~/.local/bin/t3d
+
+# Install/update ~/.local/bin/t3d: build, sign, swap in, restart the LaunchAgent once idle.
+# Do not plain-`cp` an ad-hoc build: macOS privacy (TCC) treats each such rebuild as a new
+# app and drops its Documents/Desktop/Full Disk Access grants.
+./scripts/install-t3d.sh
 
 # Optional: run t3d in the background via launchd
 t3d launchd-plist --port 3774 > ~/Library/LaunchAgents/com.local.t3code-rs.plist
