@@ -160,9 +160,8 @@ impl Parser {
                 self.codex_item(&event["item"], kind(event) == "item.completed", out);
             }
             "turn.completed" => {
-                if has_cache_tokens(&event["usage"]) {
-                    push_context_usage(ProviderId::Codex, &event["usage"], out);
-                }
+                // This usage sums every request in the turn, so it is not the context size.
+                // The server reads that from the session file's latest `token_count` instead.
                 push_usage(out, &event["usage"]);
                 out.push(StreamEvent::Completed { final_text: None });
             }
@@ -456,14 +455,6 @@ fn push_context_usage(provider: ProviderId, value: &Value, out: &mut Vec<StreamE
     let cache_read_tokens = cache_read.unwrap_or(0);
     let cache_write_tokens = cache_write.unwrap_or(0);
     let (input_tokens, context_tokens) = match provider {
-        ProviderId::Codex => {
-            // Codex `input_tokens` already includes `cached_input_tokens`.
-            let fresh = raw_input.saturating_sub(cache_read_tokens);
-            let ctx = raw_input
-                .saturating_add(cache_write_tokens)
-                .saturating_add(output_tokens);
-            (fresh, ctx)
-        }
         ProviderId::Antigravity if value["promptTokenCount"].is_u64() => {
             // Gemini `promptTokenCount` already includes `cachedContentTokenCount`.
             let fresh = raw_input.saturating_sub(cache_read_tokens);
@@ -853,6 +844,17 @@ mod tests {
                 [json!({"type":"failed","message":"fixture failure"})]
             );
         }
+    }
+
+    #[test]
+    fn codex_turn_totals_are_not_reported_as_context_size() {
+        // `turn.completed.usage` sums every request in the turn, so it is far larger than the
+        // context window and must only count as run usage.
+        let events = fixture(
+            ProviderId::Codex,
+            r#"{"type":"turn.completed","usage":{"input_tokens":1148907,"cached_input_tokens":1096832,"output_tokens":3658}}"#,
+        );
+        assert_eq!(event_types(&events), ["usage", "completed"]);
     }
 
     #[test]

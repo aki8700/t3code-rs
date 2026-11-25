@@ -1580,7 +1580,9 @@ impl RunCoordinator {
             } => {
                 out.input = Some(out.input.unwrap_or(0).saturating_add(input_tokens));
                 out.output = Some(out.output.unwrap_or(0).saturating_add(output_tokens));
-                if !out.has_context_usage {
+                // Codex turn usage sums every request in the turn; its context size comes from
+                // the session file instead (see `build_thread_context`).
+                if !out.has_context_usage && out.provider != ProviderId::Codex {
                     let context_tokens = input_tokens.saturating_add(output_tokens);
                     if context_tokens > 0 {
                         let snap = LiveContextUsage {

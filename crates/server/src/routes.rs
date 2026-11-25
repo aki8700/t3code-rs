@@ -435,10 +435,13 @@ async fn build_thread_context(
     runs: &[Run],
     breakdown: &[crate::coordinator::ItemBreakdown],
 ) -> Value {
-    let context_window = t3_providers::context_window_for(
+    let mut context_window = t3_providers::context_window_for(
         thread.model_selection.provider,
         &thread.model_selection.model,
     );
+    // Codex reports only per-turn totals on its stream, so its context size is always read from
+    // the session file, which also reflects an in-place `/compact` without a new run.
+    let is_codex = thread.model_selection.provider == ProviderId::Codex;
     let total_input_tokens: u64 = runs.iter().filter_map(|r| r.input_tokens).sum();
     let total_output_tokens: u64 = runs.iter().filter_map(|r| r.output_tokens).sum();
     let total_duration_ms: u64 = runs.iter().filter_map(|r| r.duration_ms).sum();
@@ -468,12 +471,16 @@ async fn build_thread_context(
                 || snap.session_id.is_none()
                 || snap.session_id == thread.provider_session_id)
     };
-    let live = state
-        .coordinator
-        .live_context(thread.id)
-        .await
-        .filter(matches_thread);
-    let stored = if live.is_none() {
+    let live = if is_codex {
+        None
+    } else {
+        state
+            .coordinator
+            .live_context(thread.id)
+            .await
+            .filter(matches_thread)
+    };
+    let stored = if live.is_none() && !is_codex {
         state
             .coordinator
             .stored_context(thread.id)
@@ -524,6 +531,9 @@ async fn build_thread_context(
                 snap.cache_write_tokens,
             )
         } else if let Some(sess) = session {
+            if let Some(window) = sess.context_window {
+                context_window = window;
+            }
             (
                 "session",
                 sess.context_tokens,
@@ -532,10 +542,11 @@ async fn build_thread_context(
                 sess.cache_read_tokens,
                 sess.cache_write_tokens,
             )
-        } else if let Some(last_run) = runs
-            .iter()
-            .rev()
-            .find(|r| r.input_tokens.is_some() || r.output_tokens.is_some())
+        } else if !is_codex
+            && let Some(last_run) = runs
+                .iter()
+                .rev()
+                .find(|r| r.input_tokens.is_some() || r.output_tokens.is_some())
         {
             let inp = last_run.input_tokens.unwrap_or(0);
             let out = last_run.output_tokens.unwrap_or(0);

@@ -47,6 +47,8 @@ pub(crate) struct SessionContextUsage {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// Window the provider itself reported for this session (Codex `model_context_window`).
+    pub context_window: Option<u64>,
 }
 
 enum CachedSessionContext {
@@ -86,6 +88,9 @@ fn read_session_transcript(path: &Path, provider: ProviderId) -> Option<SessionC
     } else {
         BufReader::new(file)
     };
+    if provider == ProviderId::Codex {
+        return codex_context_usage(&mut reader).ok()?;
+    }
     let samples = parse_transcript(&mut reader, provider).ok()?;
     let last = samples.last()?.tokens;
     let context_tokens = last.total();
@@ -95,7 +100,84 @@ fn read_session_transcript(path: &Path, provider: ProviderId) -> Option<SessionC
         output_tokens: last.output_tokens,
         cache_read_tokens: last.cache_read_tokens,
         cache_write_tokens: last.cache_write_tokens,
+        context_window: None,
     })
+}
+
+#[derive(Deserialize)]
+struct CodexContextLine {
+    payload: CodexContextPayload,
+}
+
+#[derive(Deserialize)]
+struct CodexContextPayload {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    info: Option<CodexContextInfo>,
+}
+
+#[derive(Deserialize)]
+struct CodexContextInfo {
+    last_token_usage: Option<CodexLastUsage>,
+    model_context_window: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct CodexLastUsage {
+    #[serde(default, deserialize_with = "token_count_or_zero")]
+    input_tokens: u64,
+    #[serde(default, deserialize_with = "token_count_or_zero")]
+    cached_input_tokens: u64,
+    #[serde(default, deserialize_with = "token_count_or_zero")]
+    cache_write_input_tokens: u64,
+    #[serde(default, deserialize_with = "token_count_or_zero")]
+    output_tokens: u64,
+    #[serde(default, deserialize_with = "token_count_or_zero")]
+    total_tokens: u64,
+}
+
+/// Codex context size is the latest request's `last_token_usage`, which Codex also rewrites
+/// after `/compact` to the size of the replacement history. `total_token_usage` is cumulative.
+fn codex_context_usage(mut input: impl BufRead) -> io::Result<Option<SessionContextUsage>> {
+    let mut latest = None;
+    let mut line = Vec::new();
+    while input
+        .by_ref()
+        .take((MAX_JSONL_LINE + 1) as u64)
+        .read_until(b'\n', &mut line)?
+        != 0
+    {
+        if line.len() > MAX_JSONL_LINE {
+            if line.last() != Some(&b'\n') {
+                input.skip_until(b'\n')?;
+            }
+        } else if line.windows(13).any(|w| w == b"\"token_count\"")
+            && let Ok(parsed) = serde_json::from_slice::<CodexContextLine>(&line)
+            && parsed.payload.kind.as_deref() == Some("token_count")
+            && let Some(info) = parsed.payload.info
+            && let Some(last) = info.last_token_usage
+        {
+            let context_tokens = if last.total_tokens > 0 {
+                last.total_tokens
+            } else {
+                last.input_tokens
+                    .saturating_add(last.cache_write_input_tokens)
+                    .saturating_add(last.output_tokens)
+            };
+            if context_tokens > 0 {
+                latest = Some(SessionContextUsage {
+                    context_tokens,
+                    input_tokens: last.input_tokens.saturating_sub(last.cached_input_tokens),
+                    output_tokens: last.output_tokens,
+                    cache_read_tokens: last.cached_input_tokens,
+                    cache_write_tokens: last.cache_write_input_tokens,
+                    context_window: info.model_context_window.filter(|w| *w > 0),
+                });
+            }
+        }
+        line.clear();
+    }
+    Ok(latest)
 }
 
 fn find_claude_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
@@ -1343,5 +1425,157 @@ invalid json
         fs::remove_file(&log).unwrap();
         let removed = get("/api/usage?days=7&refresh=true").await;
         assert_eq!(removed["totals"]["total_tokens"], 80);
+    }
+
+    #[test]
+    fn codex_session_context_uses_latest_request_not_cumulative_total() {
+        let dir = std::env::temp_dir().join(format!("t3-ctx-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-x.jsonl");
+        let token_count = |total_in: u64, last: &str| {
+            format!(
+                r#"{{"timestamp":"2026-01-02T11:30:00Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{total_in},"cached_input_tokens":0,"output_tokens":3658,"total_tokens":{}}},"last_token_usage":{last},"model_context_window":258400}}}}}}"#,
+                total_in + 3658
+            )
+        };
+        let before = token_count(
+            1_148_907,
+            r#"{"input_tokens":62029,"cached_input_tokens":61312,"output_tokens":85,"total_tokens":62114}"#,
+        );
+        fs::write(&path, format!("{before}\n")).unwrap();
+        let usage = read_session_transcript(&path, ProviderId::Codex).unwrap();
+        assert_eq!(usage.context_tokens, 62_114);
+        assert_eq!(usage.input_tokens, 717);
+        assert_eq!(usage.cache_read_tokens, 61_312);
+        assert_eq!(usage.output_tokens, 85);
+        assert_eq!(usage.context_window, Some(258_400));
+
+        // After an in-place compaction Codex reports only the estimated size of the new history.
+        let after = token_count(
+            1_148_907,
+            r#"{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":25284}"#,
+        );
+        let compacted = r#"{"timestamp":"2026-01-02T11:31:00Z","type":"compacted","payload":{"message":"","replacement_history":[]}}"#;
+        fs::write(&path, format!("{before}\n{compacted}\n{after}\n")).unwrap();
+        let usage = read_session_transcript(&path, ProviderId::Codex).unwrap();
+        assert_eq!(usage.context_tokens, 25_284);
+        assert_eq!(usage.context_window, Some(258_400));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_thread_context_comes_from_session_file_not_stored_turn_totals() {
+        let home = Fixture::new();
+        let sessions = home.0.join(".codex/sessions/2026/01/02");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("rollout-2026-01-02T11-30-00-codex-ctx-1.jsonl"),
+            r#"{"timestamp":"2026-01-02T11:31:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1148907,"output_tokens":3658,"total_tokens":1152565},"last_token_usage":{"input_tokens":0,"output_tokens":0,"total_tokens":25284},"model_context_window":258400}}}
+"#,
+        )
+        .unwrap();
+        let mut state = ServerState::new(
+            ServerConfig {
+                data_dir: home.0.join("server"),
+                auth: AuthConfig::Bearer {
+                    token: "fixture-ctx-token".into(),
+                },
+                ..Default::default()
+            },
+            "http://127.0.0.1:3774".into(),
+        )
+        .unwrap();
+        state.usage_home = Some(home.0.clone());
+        let project = state
+            .store
+            .create_project("fixture".into(), home.0.clone())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let thread_id = Uuid::new_v4();
+        let model = "gpt-6.2-astra".to_owned();
+        state
+            .store
+            .create_thread(t3_core::Thread {
+                id: thread_id,
+                project_id: project.id,
+                parent_thread_id: None,
+                relationship: None,
+                title: "fixture".into(),
+                model_selection: t3_core::ModelSelection {
+                    provider: ProviderId::Codex,
+                    model: model.clone(),
+                    effort: None,
+                    agent: None,
+                },
+                runtime_mode: Default::default(),
+                interaction_mode: Default::default(),
+                status: Default::default(),
+                worktree_path: None,
+                branch: None,
+                provider_session_id: Some("codex-ctx-1".into()),
+                archived: false,
+                pinned: false,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let run_id = Uuid::new_v4();
+        state
+            .store
+            .create_run(Run {
+                id: run_id,
+                thread_id,
+                ordinal: 1,
+                provider: ProviderId::Codex,
+                model: model.clone(),
+                effort: None,
+                status: RunStatus::Completed,
+                prompt: String::new(),
+                provider_session_id: Some("codex-ctx-1".into()),
+                input_tokens: Some(1_148_907),
+                output_tokens: Some(3_658),
+                duration_ms: Some(1),
+                error_message: None,
+                started_at: now,
+                completed_at: Some(now),
+            })
+            .await
+            .unwrap();
+        // A snapshot an older build stored from `turn.completed` must not win.
+        state
+            .coordinator
+            .persist_context(
+                thread_id,
+                &crate::coordinator::LiveContextUsage {
+                    run_id,
+                    provider: ProviderId::Codex,
+                    model,
+                    session_id: Some("codex-ctx-1".into()),
+                    context_tokens: 1_152_565,
+                    input_tokens: 52_075,
+                    output_tokens: 3_658,
+                    cache_read_tokens: 1_096_832,
+                    cache_write_tokens: 0,
+                },
+            )
+            .await;
+        let response = crate::router(state)
+            .oneshot(
+                Request::get(format!("/api/threads/{thread_id}"))
+                    .header("authorization", "Bearer fixture-ctx-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let context = &serde_json::from_slice::<Value>(&body).unwrap()["context"];
+        assert_eq!(context["source"], "session");
+        assert_eq!(context["used_tokens"], 25_284);
+        assert_eq!(context["context_window"], 258_400);
+        assert_eq!(context["compaction"]["recommended"], false);
     }
 }

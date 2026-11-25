@@ -3779,8 +3779,10 @@ function threadContextInfo() {
   const ctx = S.detail?.context || null;
   const live = S.liveUsage.get(t.id) || null;
   const sameModel = sel && t.model_selection && sel.provider === t.model_selection.provider && sel.model === t.model_selection.model;
-  const windowSize = Number(spec?.context_window)
-    || (sameModel ? Number(ctx?.context_window) : 0)
+  // The server's window wins for the thread's own model: it carries the size the provider
+  // itself reported (Codex `model_context_window`), which can differ from the catalog.
+  const windowSize = (sameModel ? Number(ctx?.context_window) : 0)
+    || Number(spec?.context_window)
     || fallbackContextWindow(sel?.provider, sel?.model);
 
   const runs = S.detail?.runs || [];
