@@ -1,8 +1,11 @@
 //! Transport-independent MCP orchestration tools.
 
+mod code_tools;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use t3_core::*;
 use uuid::Uuid;
 
@@ -46,6 +49,14 @@ pub struct ForkOptions {
 #[async_trait]
 pub trait OrchestratorBackend: Send + Sync {
     async fn get_thread(&self, id: Uuid) -> CoreResult<Thread>;
+    /// Resolve the workspace for a scoped code tool. Backends with shared threads
+    /// should also resolve the caller's project root when there is no worktree.
+    async fn workspace_root(&self, thread: &Thread) -> CoreResult<PathBuf> {
+        thread
+            .worktree_path
+            .clone()
+            .ok_or_else(|| CoreError::NotFound("caller workspace".into()))
+    }
     async fn capabilities(&self) -> CoreResult<Capabilities>;
     async fn delegate(&self, spec: DelegationSpec, mode: DelegateMode)
     -> CoreResult<DelegatedTask>;
@@ -262,6 +273,18 @@ impl<B: OrchestratorBackend> McpServer<B> {
                 encode(backend.thread_fork(id, options).await?)
             }
             "orch_stats" => encode(backend.orch_stats().await?),
+            "compaction_econ" => encode(t3_maki::compaction_econ(decode(args)?)),
+            "code_index" | "code_slice" | "code_grep" | "code_diff" => {
+                let workspace = match (caller, thread_id) {
+                    (Some(caller), _) => Some(backend.workspace_root(caller).await?),
+                    (None, Some(id)) => {
+                        let caller = backend.get_thread(id).await?;
+                        Some(backend.workspace_root(&caller).await?)
+                    }
+                    (None, None) => None,
+                };
+                code_tools::call(name.to_owned(), args, workspace).await
+            }
             _ => Err(CoreError::InvalidArgument(format!("unknown tool: {name}"))),
         }
     }
@@ -478,6 +501,58 @@ fn tools() -> Vec<Value> {
             "Read run and token statistics per provider and model.",
             json!({}),
             &[],
+        ),
+        make(
+            "code_index",
+            "List source declarations and their line ranges for a file or directory.",
+            json!({"path": string, "max_depth": limit, "max_lines": limit}),
+            &["path"],
+        ),
+        make(
+            "code_slice",
+            "Read a named symbol or a 1-based inclusive line range.",
+            json!({
+                "path": string, "symbol": string, "max_bytes": limit,
+                "start": {"type": "integer", "minimum": 1}, "end": {"type": "integer", "minimum": 1}
+            }),
+            &["path"],
+        ),
+        make(
+            "code_grep",
+            "Search source lines with a regex and show their enclosing symbols. A glob without a slash matches file names at any depth.",
+            json!({"path": string, "pattern": string, "glob": string, "max_hits": limit, "max_bytes": limit}),
+            &["pattern", "path"],
+        ),
+        make(
+            "code_diff",
+            "Show compact tracked Git changes. The optional path is literal and relative to cwd. Pass a revision such as HEAD to compare against it.",
+            json!({"cwd": string, "rev": string, "path": string, "max_bytes": limit}),
+            &["cwd"],
+        ),
+        make(
+            "compaction_econ",
+            "Estimate prompt-cache compaction cost, per-turn savings, and break-even turns using prices in a common unit.",
+            json!({
+                "prefix": limit, "replaced": limit, "summary": limit, "tail": limit,
+                "instruction": limit, "summarizer_reuses_prefix": {"type": "boolean"},
+                "prices": {
+                    "type": "object", "properties": {
+                        "input": {"type": "number"}, "output": {"type": "number"},
+                        "cache_read": {"type": "number"}, "cache_write": {"type": "number"}
+                    },
+                    "required": ["input", "output", "cache_read", "cache_write"]
+                },
+                "remaining_turns": {"type": "number", "minimum": 0}
+            }),
+            &[
+                "prefix",
+                "replaced",
+                "summary",
+                "tail",
+                "instruction",
+                "summarizer_reuses_prefix",
+                "prices",
+            ],
         ),
     ]
 }

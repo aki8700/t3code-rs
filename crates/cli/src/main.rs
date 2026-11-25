@@ -46,6 +46,14 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Report orphan storage, or remove it and compact the database with --apply.
+    Gc {
+        /// Remove unreferenced storage. Stop the server first.
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// Read only project records from a legacy T3 SQLite database.
     ImportProjects {
         #[arg(long)]
@@ -108,9 +116,18 @@ enum AuthMode {
     CloudflareAccess,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run(Cli::parse()).await {
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let mut builder = match &cli.command {
+        Command::Serve(_) => tokio::runtime::Builder::new_multi_thread(),
+        _ => tokio::runtime::Builder::new_current_thread(),
+    };
+    let result = builder
+        .enable_all()
+        .build()
+        .map_err(Into::into)
+        .and_then(|runtime| runtime.block_on(run(cli)));
+    match result {
         Ok(code) => code,
         Err(error) => {
             eprintln!("t3d: {error}");
@@ -146,6 +163,12 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
             let (models, db) =
                 tokio::try_join!(t3_server::orchestration_stats(&cfg), store.db_stats())?;
             print_stats(&models, &db);
+        }
+        Command::Gc { apply, data_dir } => {
+            let cfg = local_config(data_dir);
+            let store = SqliteStore::open_for_gc(&cfg.db_path(), cfg.storage.clone(), apply)?;
+            let report = store.gc_storage(&cfg.attachments_dir(), apply).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::ImportProjects { from, data_dir } => {
             let from = from.unwrap_or_else(|| home().join(".t3/userdata/statev2.sqlite"));

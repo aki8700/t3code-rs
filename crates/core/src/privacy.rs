@@ -15,6 +15,7 @@ pub const FORBIDDEN_CREDENTIAL_PATHS: &[&str] = &[
 
 pub const FORBIDDEN_TELEMETRY_DOMAINS: &[&str] = &[
     "posthog.com",
+    "ingest.t3.codes",
     "t3.tools",
     "ping.gg",
     "clerk.accounts.dev",

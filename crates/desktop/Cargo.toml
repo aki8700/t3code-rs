@@ -1,0 +1,16 @@
+[package]
+name = "t3-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "t3code-rs-app"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+muda.workspace = true
+tao.workspace = true
+url.workspace = true
+wry.workspace = true

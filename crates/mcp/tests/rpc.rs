@@ -1,17 +1,44 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use t3_core::*;
 use t3_mcp::*;
 use uuid::Uuid;
 
 struct Backend {
     id: Uuid,
+    caller: Option<Thread>,
+    project_root: Option<PathBuf>,
+}
+
+impl Backend {
+    fn new(id: Uuid) -> Self {
+        Self {
+            id,
+            caller: None,
+            project_root: None,
+        }
+    }
 }
 
 #[async_trait]
 impl OrchestratorBackend for Backend {
-    async fn get_thread(&self, _id: Uuid) -> CoreResult<Thread> {
-        Err(CoreError::NotFound("thread".into()))
+    async fn get_thread(&self, id: Uuid) -> CoreResult<Thread> {
+        self.caller
+            .clone()
+            .filter(|thread| thread.id == id)
+            .ok_or_else(|| CoreError::NotFound("thread".into()))
+    }
+
+    async fn workspace_root(&self, thread: &Thread) -> CoreResult<PathBuf> {
+        thread
+            .worktree_path
+            .clone()
+            .or_else(|| self.project_root.clone())
+            .ok_or_else(|| CoreError::NotFound("caller workspace".into()))
     }
 
     async fn capabilities(&self) -> CoreResult<Capabilities> {
@@ -121,7 +148,7 @@ fn payload(result: Value) -> Value {
 
 #[tokio::test]
 async fn handshake_discovery_batches_and_protocol_errors() {
-    let server = McpServer::new(Backend { id: server_id() });
+    let server = McpServer::new(Backend::new(server_id()));
     let initialized = server
         .handle(
             request("initialize", json!({"protocolVersion":"2025-03-26"})),
@@ -160,7 +187,16 @@ async fn handshake_discovery_batches_and_protocol_errors() {
         .await
         .unwrap();
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 9);
+    assert_eq!(tools.len(), 14);
+    for name in [
+        "code_index",
+        "code_slice",
+        "code_grep",
+        "code_diff",
+        "compaction_econ",
+    ] {
+        assert!(tools.iter().any(|tool| tool["name"] == name), "{name}");
+    }
     for tool in tools {
         assert_eq!(tool["inputSchema"]["type"], "object");
         assert!(tool["name"].is_string());
@@ -170,7 +206,7 @@ async fn handshake_discovery_batches_and_protocol_errors() {
 #[tokio::test]
 async fn dispatches_tools_with_thread_context_and_validates_arguments() {
     let id = server_id();
-    let server = McpServer::new(Backend { id });
+    let server = McpServer::new(Backend::new(id));
     assert_eq!(
         payload(call(&server, "orchestrator_capabilities", json!({})).await)["model_tiers"],
         json!([])
@@ -232,4 +268,192 @@ async fn dispatches_tools_with_thread_context_and_validates_arguments() {
     ] {
         assert_eq!(call(&server, name, args).await["isError"], true);
     }
+}
+
+fn caller(worktree: Option<&Path>) -> Thread {
+    let now = "2026-11-25T00:00:00Z".parse().unwrap();
+    Thread {
+        id: server_id(),
+        project_id: Uuid::new_v4(),
+        parent_thread_id: None,
+        relationship: None,
+        title: "Code tools".into(),
+        model_selection: ModelSelection {
+            provider: ProviderId::Mock,
+            model: "mock".into(),
+            effort: None,
+            agent: None,
+        },
+        runtime_mode: RuntimeMode::default(),
+        interaction_mode: InteractionMode::default(),
+        status: ThreadStatus::Idle,
+        worktree_path: worktree.map(Path::to_owned),
+        branch: None,
+        provider_session_id: None,
+        archived: false,
+        pinned: false,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+async fn scoped_call(
+    server: &McpServer<Backend>,
+    caller: &Thread,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    let request = request("tools/call", json!({"name": name, "arguments": arguments}));
+    let response = server
+        .handle_scoped_bytes(request.to_string().as_bytes(), caller)
+        .await
+        .unwrap();
+    response["result"].clone()
+}
+
+#[tokio::test]
+async fn code_tools_execute_in_the_caller_worktree() {
+    let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("example.rs"),
+        "pub fn ping() {\n    let token = 1;\n}\n",
+    )
+    .unwrap();
+    let caller = caller(Some(root.path()));
+    let server = McpServer::new(Backend {
+        id: caller.id,
+        caller: Some(caller.clone()),
+        project_root: Some(project.path().to_owned()),
+    });
+    let index = payload(call(&server, "code_index", json!({"path": "example.rs"})).await);
+    assert_eq!(index["files"][0]["symbols"][0]["name"], "ping");
+    let result = payload(
+        scoped_call(
+            &server,
+            &caller,
+            "code_slice",
+            json!({"path": "example.rs", "symbol": "ping"}),
+        )
+        .await,
+    );
+    assert_eq!(result["range"], "L1-L3");
+    assert_eq!(
+        result["text"],
+        "L1: pub fn ping() {\nL2:     let token = 1;\nL3: }"
+    );
+    let result = payload(
+        scoped_call(
+            &server,
+            &caller,
+            "code_grep",
+            json!({"pattern": "tok.n", "path": "."}),
+        )
+        .await,
+    );
+    assert_eq!(result["files"][0]["matches"][0]["symbol"], "fn ping");
+    let econ = payload(call(&server, "compaction_econ", json!({
+        "prefix": 10_000, "replaced": 130_000, "summary": 4_000, "tail": 26_000, "instruction": 500,
+        "summarizer_reuses_prefix": true,
+        "prices": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25},
+        "remaining_turns": 6
+    })).await);
+    assert_eq!(econ["one_time_cost"], 69_000.0);
+    assert_eq!(econ["worth_compacting"], true);
+}
+
+#[tokio::test]
+async fn scoped_code_tools_reject_paths_outside_the_project() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let sibling = temp.path().join("project-other");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&sibling).unwrap();
+    fs::write(root.join("inside.rs"), "fn inside() {}").unwrap();
+    let outside = sibling.join("secret.rs");
+    fs::write(&outside, "fn secret() {}").unwrap();
+    let caller = caller(None);
+    let server = McpServer::new(Backend {
+        id: caller.id,
+        caller: Some(caller.clone()),
+        project_root: Some(root.clone()),
+    });
+    assert_eq!(
+        payload(call(&server, "code_index", json!({"path": "inside.rs"})).await)["files"][0]["symbols"]
+            [0]["name"],
+        "inside"
+    );
+    for (tool, arguments) in [
+        ("code_index", json!({"path": outside})),
+        ("code_slice", json!({"path": "../project-other/secret.rs"})),
+        ("code_grep", json!({"path": sibling, "pattern": "secret"})),
+        ("code_diff", json!({"cwd": ".."})),
+        (
+            "code_diff",
+            json!({"cwd": ".", "path": "../project-other/secret.rs"}),
+        ),
+    ] {
+        let result = scoped_call(&server, &caller, tool, arguments).await;
+        assert_eq!(result["isError"], true, "{tool}: {result}");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("outside"),
+            "{result}"
+        );
+    }
+    let result = call(&server, "code_slice", json!({"path": outside})).await;
+    assert_eq!(result["isError"], true);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside, root.join("link.rs")).unwrap();
+        std::os::unix::fs::symlink(&sibling, root.join("link-dir")).unwrap();
+        let result = scoped_call(&server, &caller, "code_slice", json!({"path": "link.rs"})).await;
+        assert_eq!(result["isError"], true);
+        let result = scoped_call(
+            &server,
+            &caller,
+            "code_diff",
+            json!({"cwd": ".", "path": "link-dir/secret.rs"}),
+        )
+        .await;
+        assert_eq!(result["isError"], true);
+        let result = payload(
+            scoped_call(
+                &server,
+                &caller,
+                "code_grep",
+                json!({"path": ".", "pattern": "secret"}),
+            )
+            .await,
+        );
+        assert_eq!(result["hits"], 0);
+    }
+}
+
+#[tokio::test]
+async fn scoped_diff_blocks_git_discovery_above_the_workspace() {
+    let repo = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let workspace = repo.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let nested = caller(Some(&workspace));
+    let server = McpServer::new(Backend::new(nested.id));
+    let result = scoped_call(&server, &nested, "code_diff", json!({"cwd": "."})).await;
+    assert_eq!(result["isError"], true);
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Git repository is outside")
+    );
+    let at_root = caller(Some(repo.path()));
+    let diff = payload(scoped_call(&server, &at_root, "code_diff", json!({"cwd": "."})).await);
+    assert_eq!(diff["skipped_generated"], 0);
 }

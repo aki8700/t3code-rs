@@ -1,17 +1,26 @@
 use std::{
+    collections::HashSet,
     error::Error,
-    fmt::Display,
+    fmt::{Display, Write},
+    fs::{self, File},
+    io,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Params, Row, params, types::Type};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Params, Row, TransactionBehavior, params, types::Type,
+};
 use serde::{Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde_json::Value;
 use t3_core::{
     Attachment, ContextHandoff, CoreError, CoreResult, DbStats, ModelSelection, NewTurnItem,
     OrchModelStat, Project, Run, RunStatus, SearchHit, StorageConfig, Store, Thread, ThreadStatus,
@@ -20,44 +29,255 @@ use t3_core::{
 use uuid::Uuid;
 
 const PREVIEW_BYTES: usize = 64 * 1024;
+const READER_COUNT: usize = 4;
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
+const ORPHAN_BLOBS: &str = "NOT EXISTS (
+    SELECT 1 FROM turn_items WHERE blob_hash = blob_store.hash
+)";
+
+mod prune;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GcReport {
+    pub applied: bool,
+    pub orphan_blobs_count: u64,
+    pub orphan_blobs_bytes: u64,
+    pub orphan_attachments_count: u64,
+    pub orphan_attachments_bytes: u64,
+    pub db_bytes_before: u64,
+    pub db_bytes_after: u64,
+}
 
 #[derive(Clone)]
 pub struct SqliteStore {
-    connection: Arc<Mutex<Connection>>,
+    connections: Arc<StoreConnections>,
     storage_cfg: StorageConfig,
+}
+
+struct StoreConnections {
+    writer: Mutex<Connection>,
+    readers: Vec<Mutex<Connection>>,
+    next_reader: AtomicUsize,
+    _checkpoint: Option<WalCheckpoint>,
+    _storage_lock: Option<File>,
+}
+
+impl StoreConnections {
+    fn reader(&self) -> &Mutex<Connection> {
+        if self.readers.is_empty() {
+            return &self.writer;
+        }
+        let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        &self.readers[index]
+    }
+}
+
+struct WalCheckpoint {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl WalCheckpoint {
+    fn start(path: &Path) -> CoreResult<Self> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(storage_error)?;
+        connection
+            .execute_batch("PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;")
+            .map_err(storage_error)?;
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let signal = Arc::clone(&stop);
+        let worker = thread::Builder::new()
+            .name("t3-wal-checkpoint".into())
+            .spawn(move || {
+                let (lock, wake) = &*signal;
+                loop {
+                    let stopping = lock.lock().unwrap_or_else(|error| error.into_inner());
+                    let (stopping, _) = wake
+                        .wait_timeout_while(stopping, CHECKPOINT_INTERVAL, |stop| !*stop)
+                        .unwrap_or_else(|error| error.into_inner());
+                    let shutdown = *stopping;
+                    drop(stopping);
+                    if let Err(error) = connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
+                        tracing::warn!(%error, "SQLite WAL checkpoint failed");
+                    }
+                    if shutdown {
+                        break;
+                    }
+                }
+            })
+            .map_err(storage_error)?;
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+        })
+    }
+}
+
+impl Drop for WalCheckpoint {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.stop;
+        *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        wake.notify_one();
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!("SQLite WAL checkpoint thread panicked");
+        }
+    }
 }
 
 impl SqliteStore {
     pub fn open(db_path: impl AsRef<Path>, storage_cfg: StorageConfig) -> CoreResult<Self> {
-        let db_path = db_path.as_ref();
+        let db_path = std::path::absolute(db_path.as_ref()).map_err(storage_error)?;
         #[cfg(unix)]
-        {
+        let storage_lock = {
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let lock = lock_directory(&db_path)?;
+            // The daemon holds a shared lock across attachment file and row creation.
+            lock.try_lock_shared()
+                .map_err(io::Error::from)
+                .map_err(storage_error)?;
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(false)
                 .mode(0o600)
-                .open(db_path)
+                .open(&db_path)
                 .map_err(storage_error)?;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .map_err(storage_error)?;
-        }
-        let connection = Connection::open(db_path).map_err(storage_error)?;
-        Self::initialize(connection, storage_cfg, true)
+            Some(lock)
+        };
+        #[cfg(not(unix))]
+        let storage_lock = None;
+        let connection = Connection::open(&db_path).map_err(storage_error)?;
+        Self::initialize(connection, storage_cfg, Some(&db_path), storage_lock)
     }
 
     pub fn open_in_memory(storage_cfg: StorageConfig) -> CoreResult<Self> {
         let connection = Connection::open_in_memory().map_err(storage_error)?;
-        Self::initialize(connection, storage_cfg, false)
+        Self::initialize(connection, storage_cfg, None, None)
+    }
+
+    /// Open existing storage for maintenance without schema initialization.
+    pub fn open_for_gc(
+        db_path: &Path,
+        storage_cfg: StorageConfig,
+        apply: bool,
+    ) -> CoreResult<Self> {
+        let db_path = std::path::absolute(db_path).map_err(storage_error)?;
+        match fs::metadata(&db_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !apply => {
+                return Self::open_in_memory(storage_cfg);
+            }
+            Err(error) => return Err(storage_error(error)),
+        }
+        #[cfg(unix)]
+        let (idle, storage_lock) = {
+            let lock = lock_directory(&db_path)?;
+            match lock.try_lock() {
+                Ok(()) => (true, Some(lock)),
+                Err(fs::TryLockError::WouldBlock) if !apply => (false, None),
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(storage_error(
+                        "stop the server using this data directory before applying GC",
+                    ));
+                }
+                Err(fs::TryLockError::Error(error)) => return Err(storage_error(error)),
+            }
+        };
+        #[cfg(not(unix))]
+        let (idle, storage_lock) = (true, None);
+        let connection = if apply {
+            Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map_err(storage_error)?
+        } else {
+            open_gc_read_only(&db_path, idle)?
+        };
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(storage_error)?;
+        Ok(Self {
+            connections: Arc::new(StoreConnections {
+                writer: Mutex::new(connection),
+                readers: Vec::new(),
+                next_reader: AtomicUsize::new(0),
+                _checkpoint: None,
+                _storage_lock: storage_lock,
+            }),
+            storage_cfg,
+        })
+    }
+
+    /// Inspect storage or compact it. Callers must exclude attachment uploads
+    /// when applying GC. The maintenance opener takes an exclusive daemon lock.
+    pub async fn gc_storage(&self, attachments_dir: &Path, apply: bool) -> CoreResult<GcReport> {
+        let attachments_dir = attachments_dir.to_owned();
+        self.with_writer(move |connection| {
+            let db_bytes_before = database_file_bytes(connection)?;
+            let behavior = if apply {
+                TransactionBehavior::Immediate
+            } else {
+                TransactionBehavior::Deferred
+            };
+            let transaction = connection
+                .transaction_with_behavior(behavior)
+                .map_err(storage_error)?;
+            let (orphan_blobs_count, orphan_blobs_bytes) = transaction
+                .query_row(
+                    &format!(
+                        "SELECT count(*), coalesce(sum(compressed_bytes), 0)
+                         FROM blob_store WHERE {ORPHAN_BLOBS}"
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(storage_error)?;
+            let attachments = orphan_attachment_files(&transaction, &attachments_dir)?;
+            let orphan_attachments_count = attachments.len() as u64;
+            let orphan_attachments_bytes = attachments.iter().map(|(_, bytes)| bytes).sum();
+            let db_bytes_after = if apply {
+                transaction
+                    .execute(&format!("DELETE FROM blob_store WHERE {ORPHAN_BLOBS}"), [])
+                    .map_err(storage_error)?;
+                transaction.commit().map_err(storage_error)?;
+                for (path, _) in attachments {
+                    match fs::symlink_metadata(&path) {
+                        Ok(metadata) if metadata.is_file() => {
+                            fs::remove_file(&path).map_err(storage_error)?;
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(storage_error(error)),
+                    }
+                }
+                checkpoint_truncate(connection)?;
+                connection.execute_batch("VACUUM").map_err(storage_error)?;
+                checkpoint_truncate(connection)?;
+                database_file_bytes(connection)?
+            } else {
+                db_bytes_before
+            };
+            Ok(GcReport {
+                applied: apply,
+                orphan_blobs_count,
+                orphan_blobs_bytes,
+                orphan_attachments_count,
+                orphan_attachments_bytes,
+                db_bytes_before,
+                db_bytes_after,
+            })
+        })
+        .await
     }
 
     /// Reconcile runs left in flight when the previous server stopped.
     pub fn recover_interrupted_runs(&self) -> CoreResult<()> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| storage_error("SQLite connection lock poisoned"))?;
+        let mut connection = lock_connection(&self.connections.writer)?;
         let transaction = connection.transaction().map_err(storage_error)?;
         let now = timestamp(Utc::now());
         transaction.execute(
@@ -84,15 +304,21 @@ impl SqliteStore {
     fn initialize(
         mut connection: Connection,
         storage_cfg: StorageConfig,
-        file_backed: bool,
+        db_path: Option<&Path>,
+        storage_lock: Option<File>,
     ) -> CoreResult<Self> {
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(storage_error)?;
-        if file_backed {
-            connection
-                .pragma_update(None, "journal_mode", "WAL")
+        if db_path.is_some() {
+            let mode: String = connection
+                .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
                 .map_err(storage_error)?;
+            if mode != "wal" {
+                return Err(storage_error(format!(
+                    "SQLite did not enable WAL (mode: {mode})"
+                )));
+            }
         }
         connection
             .execute_batch(
@@ -106,23 +332,64 @@ impl SqliteStore {
             .execute_batch(include_str!("schema.sql"))
             .map_err(storage_error)?;
         transaction.commit().map_err(storage_error)?;
+        let mut readers = Vec::new();
+        let checkpoint = if let Some(path) = db_path {
+            readers.reserve_exact(READER_COUNT);
+            for _ in 0..READER_COUNT {
+                let reader = Connection::open_with_flags(
+                    path,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+                .map_err(storage_error)?;
+                reader
+                    .execute_batch(
+                        "PRAGMA busy_timeout = 5000;
+                         PRAGMA query_only = ON;
+                         PRAGMA cache_size = -8000;
+                         PRAGMA temp_store = MEMORY;",
+                    )
+                    .map_err(storage_error)?;
+                readers.push(Mutex::new(reader));
+            }
+            Some(WalCheckpoint::start(path)?)
+        } else {
+            None
+        };
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            connections: Arc::new(StoreConnections {
+                writer: Mutex::new(connection),
+                readers,
+                next_reader: AtomicUsize::new(0),
+                _checkpoint: checkpoint,
+                _storage_lock: storage_lock,
+            }),
             storage_cfg,
         })
     }
 
-    async fn with_connection<T, F>(&self, operation: F) -> CoreResult<T>
+    async fn with_writer<T, F>(&self, operation: F) -> CoreResult<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> CoreResult<T> + Send + 'static,
     {
-        let connection = Arc::clone(&self.connection);
+        let connections = Arc::clone(&self.connections);
         tokio::task::spawn_blocking(move || {
-            let mut connection = connection
-                .lock()
-                .map_err(|_| storage_error("SQLite connection lock poisoned"))?;
+            let mut connection = lock_connection(&connections.writer)?;
             operation(&mut connection)
+        })
+        .await
+        .map_err(storage_error)?
+    }
+
+    async fn with_reader<T, F>(&self, operation: F) -> CoreResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> CoreResult<T> + Send + 'static,
+    {
+        let connections = Arc::clone(&self.connections);
+        tokio::task::spawn_blocking(move || {
+            let connection = lock_connection(connections.reader())?;
+            operation(&connection)
         })
         .await
         .map_err(storage_error)?
@@ -131,7 +398,7 @@ impl SqliteStore {
     /// Imports active project titles and workspace roots from a legacy database.
     pub async fn import_projects_from_t3_sqlite(&self, legacy_db_path: &Path) -> CoreResult<usize> {
         let legacy_path = legacy_db_path.to_owned();
-        self.with_connection(move |connection| {
+        self.with_writer(move |connection| {
             let legacy = Connection::open_with_flags(legacy_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(storage_error)?;
             let projects = query_all(
@@ -170,7 +437,7 @@ impl SqliteStore {
         query: &'static str,
         value: impl rusqlite::ToSql + Send + 'static,
     ) -> CoreResult<()> {
-        self.with_connection(move |connection| {
+        self.with_writer(move |connection| {
             require_change(
                 connection.execute(query, params![id.to_string(), value, timestamp(Utc::now())]),
                 "thread",
@@ -184,7 +451,7 @@ impl SqliteStore {
 #[async_trait]
 impl Store for SqliteStore {
     async fn create_project(&self, title: String, workspace_root: PathBuf) -> CoreResult<Project> {
-        self.with_connection(move |connection| {
+        self.with_writer(move |connection| {
             let now = Utc::now();
             let project = Project {
                 id: Uuid::new_v4(),
@@ -212,7 +479,7 @@ impl Store for SqliteStore {
     }
 
     async fn list_projects(&self) -> CoreResult<Vec<Project>> {
-        self.with_connection(|connection| {
+        self.with_reader(|connection| {
             query_all(
                 connection,
                 "SELECT id, title, workspace_root, default_model, created_at, updated_at
@@ -225,7 +492,7 @@ impl Store for SqliteStore {
     }
 
     async fn get_project(&self, id: Uuid) -> CoreResult<Project> {
-        self.with_connection(move |connection| {
+        self.with_reader(move |connection| {
             query_required(
                 connection,
                 "SELECT id, title, workspace_root, default_model, created_at, updated_at
@@ -239,7 +506,7 @@ impl Store for SqliteStore {
     }
 
     async fn delete_project(&self, id: Uuid) -> CoreResult<()> {
-        self.with_connection(move |connection| {
+        self.with_writer(move |connection| {
             let transaction = connection.transaction().map_err(storage_error)?;
             require_change(
                 transaction.execute("DELETE FROM projects WHERE id = ?1", [id.to_string()]),
@@ -247,12 +514,7 @@ impl Store for SqliteStore {
                 id,
             )?;
             transaction
-                .execute(
-                    "DELETE FROM blob_store WHERE NOT EXISTS (
-                    SELECT 1 FROM turn_items WHERE blob_hash = blob_store.hash
-                 )",
-                    [],
-                )
+                .execute(&format!("DELETE FROM blob_store WHERE {ORPHAN_BLOBS}"), [])
                 .map_err(storage_error)?;
             transaction.commit().map_err(storage_error)
         })
@@ -260,7 +522,7 @@ impl Store for SqliteStore {
     }
 
     async fn create_thread(&self, thread: Thread) -> CoreResult<Thread> {
-        self.with_connection(move |connection| {
+        self.with_writer(move |connection| {
             let transaction = connection.transaction().map_err(storage_error)?;
             let id = thread.id.to_string();
             transaction.execute(
@@ -294,7 +556,7 @@ impl Store for SqliteStore {
         include_archived: bool,
         limit: usize,
     ) -> CoreResult<Vec<Thread>> {
-        self.with_connection(move |connection| {
+        self.with_reader(move |connection| {
             query_all(
                 connection,
                 &format!(
@@ -313,7 +575,7 @@ impl Store for SqliteStore {
     }
 
     async fn list_child_threads(&self, parent_thread_id: Uuid) -> CoreResult<Vec<Thread>> {
-        self.with_connection(move |connection| {
+        self.with_reader(move |connection| {
             query_all(
                 connection,
                 &format!("{THREAD_SELECT} WHERE parent_thread_id = ?1 ORDER BY created_at, id"),
@@ -325,7 +587,7 @@ impl Store for SqliteStore {
     }
 
     async fn get_thread(&self, id: Uuid) -> CoreResult<Thread> {
-        self.with_connection(move |connection| {
+        self.with_reader(move |connection| {
             query_required(
                 connection,
                 &format!("{THREAD_SELECT} WHERE id = ?1"),
@@ -365,7 +627,7 @@ impl Store for SqliteStore {
     }
 
     async fn update_thread_title(&self, id: Uuid, title: String) -> CoreResult<()> {
-        self.with_connection(move |connection| {
+        self.with_writer(move |connection| {
             let transaction = connection.transaction().map_err(storage_error)?;
             let key = id.to_string();
             require_change(
@@ -397,7 +659,7 @@ impl Store for SqliteStore {
     }
 
     async fn create_run(&self, run: Run) -> CoreResult<Run> {
-        self.with_connection(move |connection| {
+        self.with_writer(move |connection| {
             connection.execute(
                 "INSERT INTO runs (
                     id, thread_id, ordinal, provider, model, effort, status, prompt, provider_session_id,
@@ -416,7 +678,7 @@ impl Store for SqliteStore {
     }
 
     async fn list_runs(&self, thread_id: Uuid) -> CoreResult<Vec<Run>> {
-        self.with_connection(move |connection| {
+        self.with_reader(move |connection| {
             query_all(
                 connection,
                 "SELECT id, thread_id, ordinal, provider, model, effort, status, prompt, provider_session_id,
@@ -439,7 +701,7 @@ impl Store for SqliteStore {
         duration_ms: u64,
         error_message: Option<String>,
     ) -> CoreResult<()> {
-        self.with_connection(move |connection| {
+        self.with_writer(move |connection| {
             require_change(
                 connection.execute(
                     "UPDATE runs SET status = ?2, provider_session_id = COALESCE(?3, provider_session_id),
@@ -459,7 +721,7 @@ impl Store for SqliteStore {
 
     async fn append_turn_item(&self, item: NewTurnItem) -> CoreResult<TurnItem> {
         let cfg = self.storage_cfg.clone();
-        self.with_connection(move |connection| append_item(connection, item, &cfg))
+        self.with_writer(move |connection| append_item(connection, item, &cfg))
             .await
     }
 
@@ -469,7 +731,7 @@ impl Store for SqliteStore {
         limit: usize,
         offset: usize,
     ) -> CoreResult<Vec<TurnItem>> {
-        self.with_connection(move |connection| {
+        self.with_reader(move |connection| {
             query_all(
                 connection,
                 "SELECT item.id, item.thread_id, item.run_id, item.ordinal, item.kind, item.summary,
@@ -485,7 +747,7 @@ impl Store for SqliteStore {
     }
 
     async fn record_handoff(&self, handoff: ContextHandoff) -> CoreResult<ContextHandoff> {
-        self.with_connection(move |connection| {
+        self.with_writer(move |connection| {
             connection.execute(
                 "INSERT INTO context_handoffs (id, source_thread_id, target_thread_id, from_model,
                     to_model, summary, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -501,7 +763,7 @@ impl Store for SqliteStore {
     }
 
     async fn list_handoffs(&self, thread_id: Uuid) -> CoreResult<Vec<ContextHandoff>> {
-        self.with_connection(move |connection| {
+        self.with_reader(move |connection| {
             query_all(
                 connection,
                 "SELECT id, source_thread_id, target_thread_id, from_model, to_model, summary, created_at
@@ -515,7 +777,7 @@ impl Store for SqliteStore {
     }
 
     async fn save_attachment(&self, attachment: Attachment) -> CoreResult<Attachment> {
-        self.with_connection(move |connection| {
+        self.with_writer(move |connection| {
             connection.execute(
                 "INSERT INTO attachments (id, thread_id, filename, mime_type, size_bytes, blake3_hash,
                     storage_path, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -531,7 +793,7 @@ impl Store for SqliteStore {
     }
 
     async fn get_attachment(&self, id: Uuid) -> CoreResult<Attachment> {
-        self.with_connection(move |connection| {
+        self.with_reader(move |connection| {
             query_required(
                 connection,
                 &format!("{ATTACHMENT_SELECT} WHERE id = ?1"),
@@ -544,7 +806,7 @@ impl Store for SqliteStore {
     }
 
     async fn list_attachments(&self, thread_id: Uuid) -> CoreResult<Vec<Attachment>> {
-        self.with_connection(move |connection| {
+        self.with_reader(move |connection| {
             query_all(
                 connection,
                 &format!("{ATTACHMENT_SELECT} WHERE thread_id = ?1 ORDER BY created_at, id"),
@@ -560,7 +822,7 @@ impl Store for SqliteStore {
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        self.with_connection(move |connection| {
+        self.with_reader(move |connection| {
             let limit = sql_limit(limit);
             if query.chars().count() >= 3 {
                 query_all(
@@ -594,7 +856,7 @@ impl Store for SqliteStore {
     }
 
     async fn orch_stats(&self) -> CoreResult<Vec<OrchModelStat>> {
-        self.with_connection(|connection| {
+        self.with_reader(|connection| {
             query_all(
                 connection,
                 "SELECT provider, model, count(*), sum(status = ?1), sum(status = ?2),
@@ -621,7 +883,7 @@ impl Store for SqliteStore {
     }
 
     async fn db_stats(&self) -> CoreResult<DbStats> {
-        self.with_connection(|connection| {
+        self.with_reader(|connection| {
             connection
                 .query_row(
                     "SELECT (SELECT page_count FROM pragma_page_count) *
@@ -659,6 +921,100 @@ impl Store for SqliteStore {
     }
 }
 
+#[cfg(unix)]
+fn lock_directory(db_path: &Path) -> CoreResult<File> {
+    let directory = db_path
+        .parent()
+        .ok_or_else(|| storage_error("database needs a parent directory"))?;
+    File::open(directory).map_err(storage_error)
+}
+
+fn open_gc_read_only(path: &Path, idle: bool) -> CoreResult<Connection> {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let wal_bytes = match fs::metadata(wal) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(storage_error(error)),
+    };
+    let mut uri = String::from("file:");
+    for &byte in path.as_os_str().as_encoded_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._".contains(&byte) {
+            uri.push(char::from(byte));
+        } else {
+            write!(uri, "%{byte:02X}").expect("format into string");
+        }
+    }
+    // Immutable opening avoids creating sidecars on a clean, idle WAL database.
+    // An active or uncheckpointed database needs its WAL and existing read-only index.
+    uri.push_str(if idle && wal_bytes == 0 {
+        "?immutable=1"
+    } else {
+        "?readonly_shm=1"
+    });
+    Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(storage_error)
+}
+
+fn database_file_bytes(connection: &Connection) -> CoreResult<u64> {
+    match connection.path().filter(|path| !path.is_empty()) {
+        Some(path) => fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .map_err(storage_error),
+        None => Ok(0),
+    }
+}
+
+fn orphan_attachment_files(connection: &Connection, dir: &Path) -> CoreResult<Vec<(PathBuf, u64)>> {
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(storage_error(error)),
+    }
+    let references: HashSet<String> = query_all(
+        connection,
+        "SELECT DISTINCT blake3_hash FROM attachments",
+        [],
+        |row| row.get(0),
+    )?
+    .into_iter()
+    .collect();
+    let mut orphans = Vec::new();
+    for entry in fs::read_dir(dir).map_err(storage_error)? {
+        let entry = entry.map_err(storage_error)?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|hash| references.contains(hash))
+        {
+            continue;
+        }
+        match entry.metadata() {
+            Ok(metadata) if metadata.is_file() => orphans.push((entry.path(), metadata.len())),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(storage_error(error)),
+        }
+    }
+    Ok(orphans)
+}
+
+fn checkpoint_truncate(connection: &Connection) -> CoreResult<()> {
+    let busy = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i32>(0)
+        })
+        .map_err(storage_error)?;
+    if busy != 0 {
+        return Err(storage_error("database is busy during WAL checkpoint"));
+    }
+    Ok(())
+}
+
 fn append_item(
     connection: &mut Connection,
     item: NewTurnItem,
@@ -675,12 +1031,7 @@ fn append_item(
     let mut text = encode(&payload)?;
     let raw_bytes = text.len();
     if raw_bytes > cfg.max_payload_bytes {
-        payload = json!({
-            "truncated": true,
-            "original_bytes": raw_bytes,
-            "preview": &text[..text.floor_char_boundary(PREVIEW_BYTES)],
-        });
-        text = encode(&payload)?;
+        (payload, text) = prune::prune_payload(payload, text, cfg.max_payload_bytes)?;
     }
 
     let body = searchable_text
@@ -933,6 +1284,12 @@ fn require_change(changed: rusqlite::Result<usize>, entity: &str, id: Uuid) -> C
 
 fn storage_error(error: impl Display) -> CoreError {
     CoreError::Storage(error.to_string())
+}
+
+fn lock_connection(connection: &Mutex<Connection>) -> CoreResult<MutexGuard<'_, Connection>> {
+    connection
+        .lock()
+        .map_err(|_| storage_error("SQLite connection lock poisoned"))
 }
 
 fn not_found(entity: &str, id: Uuid) -> CoreError {

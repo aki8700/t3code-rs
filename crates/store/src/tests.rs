@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::json;
 use std::fs;
 use t3_core::{InteractionMode, ProviderId, RuntimeMode, TurnItemKind};
 
@@ -84,6 +85,116 @@ fn item(run: &Run, payload: Value) -> NewTurnItem {
         payload,
         searchable_text: None,
     }
+}
+
+#[tokio::test]
+async fn gc_removes_only_unreferenced_blobs_and_regular_attachment_files() {
+    let dir = TempDir::new();
+    let db_path = dir.0.join("state.sqlite");
+    let attachments = dir.0.join("attachments");
+    fs::create_dir(&attachments).unwrap();
+    let store = SqliteStore::open(&db_path, StorageConfig::default()).unwrap();
+    let live = seed(&store, "Live thread").await;
+    let removed = seed(&store, "Deleted thread").await;
+    let live_payload = json!({"text": "live text ".repeat(12_000)});
+    for (run, payload) in [
+        (&live, live_payload.clone()),
+        (&removed, live_payload.clone()),
+        (&removed, json!({"text": "orphan text ".repeat(12_000)})),
+    ] {
+        assert!(
+            store
+                .append_turn_item(item(run, payload))
+                .await
+                .unwrap()
+                .compressed_bytes
+                .is_some()
+        );
+    }
+    for (run, bytes) in [(&live, b"keep".as_slice()), (&removed, b"orphan")] {
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let storage_path = attachments.join(&hash);
+        fs::write(&storage_path, bytes).unwrap();
+        store
+            .save_attachment(Attachment {
+                id: Uuid::new_v4(),
+                thread_id: Some(run.thread_id),
+                filename: "fixture".into(),
+                mime_type: "text/plain".into(),
+                size_bytes: bytes.len() as u64,
+                blake3_hash: hash,
+                storage_path,
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+    // A discarded thread can leave unreferenced blobs after the item cascade.
+    store
+        .with_writer(move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM threads WHERE id = ?1",
+                    [removed.thread_id.to_string()],
+                )
+                .map_err(storage_error)
+        })
+        .await
+        .unwrap();
+    let orphan_file = attachments.join(blake3::hash(b"orphan").to_hex().as_str());
+    let keep_file = attachments.join(blake3::hash(b"keep").to_hex().as_str());
+    let subdir = attachments.join("subdirectory");
+    fs::create_dir(&subdir).unwrap();
+    fs::write(subdir.join("keep"), b"nested").unwrap();
+    #[cfg(unix)]
+    let link = {
+        let target = dir.0.join("external");
+        fs::write(&target, b"external").unwrap();
+        let link = attachments.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        (link, target)
+    };
+
+    let dry = store.gc_storage(&attachments, false).await.unwrap();
+    assert!(!dry.applied);
+    assert_eq!(dry.orphan_blobs_count, 1);
+    assert!(dry.orphan_blobs_bytes > 0);
+    assert_eq!(dry.orphan_attachments_count, 1);
+    assert_eq!(dry.orphan_attachments_bytes, 6);
+    assert_eq!(dry.db_bytes_before, dry.db_bytes_after);
+    assert_eq!(store.db_stats().await.unwrap().dedup_blobs_count, 2);
+    assert_eq!(fs::read(&orphan_file).unwrap(), b"orphan");
+
+    let applied = store.gc_storage(&attachments, true).await.unwrap();
+    assert!(applied.applied);
+    assert_eq!(applied.orphan_blobs_count, 1);
+    assert_eq!(applied.orphan_blobs_bytes, dry.orphan_blobs_bytes);
+    assert_eq!(applied.orphan_attachments_count, 1);
+    assert_eq!(applied.orphan_attachments_bytes, 6);
+    assert_eq!(
+        applied.db_bytes_after,
+        fs::metadata(&db_path).unwrap().len()
+    );
+    assert_eq!(store.db_stats().await.unwrap().dedup_blobs_count, 1);
+    assert_eq!(
+        store.list_turn_items(live.thread_id, 10, 0).await.unwrap()[0].payload,
+        live_payload
+    );
+    assert_eq!(
+        store.list_attachments(live.thread_id).await.unwrap().len(),
+        1
+    );
+    assert_eq!(fs::read(keep_file).unwrap(), b"keep");
+    assert!(!orphan_file.exists());
+    assert_eq!(fs::read(subdir.join("keep")).unwrap(), b"nested");
+    #[cfg(unix)]
+    {
+        assert!(link.0.is_symlink());
+        assert_eq!(fs::read(link.1).unwrap(), b"external");
+    }
+    let repeat = store.gc_storage(&attachments, false).await.unwrap();
+    assert_eq!(repeat.orphan_blobs_count, 0);
+    assert_eq!(repeat.orphan_attachments_count, 0);
 }
 
 #[tokio::test]
@@ -380,7 +491,7 @@ async fn compression_deduplication_and_db_statistics() {
     assert!(stats.compression_ratio < 0.1);
 
     store
-        .with_connection(move |connection| {
+        .with_writer(move |connection| {
             let (hash, raw_bytes, compressed_bytes, blob): (String, usize, usize, Vec<u8>) =
                 connection
                     .query_row(
@@ -414,13 +525,18 @@ async fn compression_deduplication_and_db_statistics() {
 
 #[tokio::test]
 async fn oversized_payload_is_valid_utf8_and_transaction_rolls_back_on_wrong_run() {
+    let max_payload_bytes = 1024;
     let store = SqliteStore::open_in_memory(StorageConfig {
-        max_payload_bytes: 70 * 1024,
+        max_payload_bytes,
         ..StorageConfig::default()
     })
     .unwrap();
     let run = seed(&store, "Oversized").await;
-    let payload = json!({"text": "録".repeat(30_000)});
+    let payload = json!({
+        "exitCode": 1,
+        "tool": "shell",
+        "content": [{"output": format!("starting build\n{}\nerror: ビルド失敗", "録\n\"\0".repeat(10_000))}],
+    });
     let raw = serde_json::to_string(&payload).unwrap();
     let mut invalid = item(&run, payload.clone());
     invalid.thread_id = Uuid::new_v4();
@@ -428,14 +544,35 @@ async fn oversized_payload_is_valid_utf8_and_transaction_rolls_back_on_wrong_run
     assert_eq!(store.db_stats().await.unwrap().dedup_blobs_count, 0);
     let truncated = store.append_turn_item(item(&run, payload)).await.unwrap();
     assert_eq!(truncated.raw_bytes, raw.len());
-    assert_eq!(truncated.payload["truncated"], true);
-    assert_eq!(truncated.payload["original_bytes"], raw.len());
-    assert_eq!(
-        truncated.payload["preview"].as_str(),
-        Some(&raw[..raw.floor_char_boundary(PREVIEW_BYTES)]),
-    );
+    assert!(serde_json::to_vec(&truncated.payload).unwrap().len() <= max_payload_bytes);
+    assert_eq!(truncated.payload["exitCode"], 1);
+    assert_eq!(truncated.payload["tool"], "shell");
+    let output = truncated.payload["content"][0]["output"].as_str().unwrap();
+    assert!(output.starts_with("starting build"));
+    assert!(output.contains("...[pruned "));
+    assert!(output.ends_with("error: ビルド失敗"));
     let read = store.list_turn_items(run.thread_id, 10, 0).await.unwrap();
     assert_eq!(read[0].payload, truncated.payload);
+}
+
+#[tokio::test]
+async fn oversized_json_structure_uses_a_bounded_utf8_preview() {
+    let max_payload_bytes = 144;
+    let store = SqliteStore::open_in_memory(StorageConfig {
+        max_payload_bytes,
+        ..StorageConfig::default()
+    })
+    .unwrap();
+    let run = seed(&store, "Oversized structure").await;
+    let payload = json!(["開始", vec![12345; 1000], "失敗"]);
+    let raw_bytes = serde_json::to_vec(&payload).unwrap().len();
+
+    let saved = store.append_turn_item(item(&run, payload)).await.unwrap();
+    assert!(serde_json::to_vec(&saved.payload).unwrap().len() <= max_payload_bytes);
+    assert_eq!(saved.payload["original_bytes"], raw_bytes);
+    let preview = saved.payload["preview"].as_str().unwrap();
+    assert!(preview.starts_with("[\"開始\""));
+    assert!(preview.ends_with("\"失敗\"]"));
 }
 
 #[tokio::test]
@@ -557,12 +694,76 @@ async fn orchestration_aggregates_by_provider_and_model() {
 }
 
 #[tokio::test]
+async fn file_readers_query_committed_data_while_the_writer_is_busy() {
+    let dir = TempDir::new();
+    let store = SqliteStore::open(dir.0.join("state.sqlite"), StorageConfig::default()).unwrap();
+    let project = store
+        .create_project("Committed".into(), "/work/project".into())
+        .await
+        .unwrap();
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    let writer_store = store.clone();
+    let writer = tokio::spawn(async move {
+        writer_store
+            .with_writer(move |connection| {
+                let transaction = connection.transaction().unwrap();
+                transaction
+                    .execute("UPDATE projects SET title = 'Updated'", [])
+                    .unwrap();
+                started.send(()).unwrap();
+                let _ = release_rx.blocking_recv();
+                transaction.commit().map_err(storage_error)
+            })
+            .await
+    });
+    started_rx.await.unwrap();
+    let reads = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::try_join!(
+            store.list_projects(),
+            store.get_project(project.id),
+            store.db_stats(),
+            store.list_threads(None, true, 10),
+        )
+    })
+    .await;
+    release.send(()).unwrap();
+    writer.await.unwrap().unwrap();
+
+    let (projects, snapshot, stats, threads) = reads.expect("reads waited for the writer").unwrap();
+    assert_eq!(projects[0].title, "Committed");
+    assert_eq!(snapshot.title, "Committed");
+    assert_eq!(stats.threads_count, 0);
+    assert!(threads.is_empty());
+    assert_eq!(
+        store.get_project(project.id).await.unwrap().title,
+        "Updated"
+    );
+}
+
+#[tokio::test]
 async fn file_pragmas_and_reopen() {
     let dir = TempDir::new();
     let path = dir.0.join("state.sqlite");
     let store = SqliteStore::open(&path, StorageConfig::default()).unwrap();
+    assert_eq!(store.connections.readers.len(), 4);
+    for reader in &store.connections.readers {
+        let reader = reader.lock().unwrap();
+        assert!(reader.is_readonly(rusqlite::DatabaseName::Main).unwrap());
+        for (pragma, value) in [
+            ("query_only", 1),
+            ("busy_timeout", 5000),
+            ("cache_size", -8000),
+            ("temp_store", 2),
+        ] {
+            let actual: i64 = reader
+                .pragma_query_value(None, pragma, |row| row.get(0))
+                .unwrap();
+            assert_eq!(actual, value, "{pragma}");
+        }
+    }
     store
-        .with_connection(|connection| {
+        .with_writer(|connection| {
             let mode: String = connection
                 .pragma_query_value(None, "journal_mode", |row| row.get(0))
                 .unwrap();
@@ -610,6 +811,29 @@ async fn file_pragmas_and_reopen() {
             .payload,
         payload
     );
+}
+
+#[test]
+fn checkpoint_worker_exits_on_last_store_drop() {
+    let dir = TempDir::new();
+    let store = SqliteStore::open(dir.0.join("state.sqlite"), StorageConfig::default()).unwrap();
+    let worker = store.connections._checkpoint.as_ref().unwrap();
+    let lifetime = Arc::downgrade(&worker.stop);
+    assert_eq!(lifetime.strong_count(), 2);
+
+    let clone = store.clone();
+    drop(store);
+    assert_eq!(lifetime.strong_count(), 2);
+    let (done, completed) = std::sync::mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        drop(clone);
+        done.send(()).unwrap();
+    });
+    completed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("store drop did not wake and join the checkpoint worker");
+    dropper.join().unwrap();
+    assert_eq!(lifetime.strong_count(), 0);
 }
 
 #[tokio::test]

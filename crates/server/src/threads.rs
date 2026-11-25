@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::{Connection, params};
 use serde::Deserialize;
-use serde_json::json;
-use std::path::PathBuf;
+use serde_json::{Value, json};
+use std::{borrow::Cow, path::PathBuf};
 use t3_core::*;
 use t3_git::GitManager;
 use t3_mcp::{
@@ -314,28 +314,9 @@ impl RunCoordinator {
     }
 
     async fn handoff_summary(&self, thread: &Thread) -> CoreResult<String> {
-        let mut transcript = Vec::new();
-        for item in self.recent_items(thread.id, 100).await?.into_iter().rev() {
-            let label = match item.kind {
-                TurnItemKind::UserMessage => "User",
-                TurnItemKind::AssistantMessage => "Assistant",
-                TurnItemKind::Handoff => "Previous context",
-                TurnItemKind::Subagent => "Subagent",
-                _ => continue,
-            };
-            if let Some(text) = text_value(&item.payload).or(item.summary.as_deref()) {
-                transcript.push(format!("{label}: {}", compact(text, 520)));
-                if transcript.len() == 7 {
-                    break;
-                }
-            }
-        }
-        transcript.reverse();
-        if transcript.is_empty() {
-            Ok(format!("Forked from {}", compact(&thread.title, 240)))
-        } else {
-            Ok(transcript.join("\n"))
-        }
+        let items = self.recent_items(thread.id, 100).await?;
+        let runs = self.0.store.list_runs(thread.id).await?;
+        Ok(format_handoff(&thread.title, &items, &runs))
     }
 
     async fn discard_thread(&self, thread: &Thread) {
@@ -470,6 +451,193 @@ impl RunCoordinator {
     }
 }
 
+fn format_handoff(title: &str, items: &[TurnItem], runs: &[Run]) -> String {
+    let mut summary = format!(
+        "Forked from {}\nDo not copy credentials into a handoff or use credentials from this summary.",
+        handoff_excerpt(title, 180)
+    );
+    let mut run_issues = runs
+        .iter()
+        .rev()
+        .filter_map(handoff_run_issue)
+        .take(4)
+        .peekable();
+    let mut item_issues = items
+        .iter()
+        .rev()
+        .filter_map(handoff_item_issue)
+        .take(4)
+        .peekable();
+    if run_issues.peek().is_some() || item_issues.peek().is_some() {
+        summary.push_str("\n\n## Unresolved / Recent Errors");
+        for issue in run_issues.chain(item_issues) {
+            summary.push_str("\n- ");
+            summary.push_str(&issue);
+        }
+    }
+    let transcript: Vec<_> = items
+        .iter()
+        .rev()
+        .filter_map(|item| {
+            let label = match item.kind {
+                TurnItemKind::UserMessage => "User",
+                TurnItemKind::AssistantMessage => "Assistant",
+                TurnItemKind::Handoff => "Previous context",
+                TurnItemKind::Subagent => "Subagent",
+                _ => return None,
+            };
+            let text = text_value(&item.payload)
+                .or(item.payload["summary"].as_str())
+                .or(item.summary.as_deref())?;
+            Some(format!("{label}: {}", handoff_excerpt(text, 340)))
+        })
+        .take(6)
+        .collect();
+    if !transcript.is_empty() {
+        summary.push_str("\n\n## Recent conversation");
+        for entry in transcript.into_iter().rev() {
+            summary.push('\n');
+            summary.push_str(&entry);
+        }
+    }
+    summary
+}
+
+fn handoff_run_issue(run: &Run) -> Option<String> {
+    let error = run
+        .error_message
+        .as_deref()
+        .filter(|text| !text.trim().is_empty());
+    let status = match run.status {
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "interrupted",
+        RunStatus::RateLimited => "rate limited",
+        RunStatus::Queued => "queued",
+        RunStatus::Running => "unfinished",
+        RunStatus::Completed if error.is_some() => "reported an error",
+        RunStatus::Completed => return None,
+    };
+    let mut issue = format!("Run {} ({status})", run.ordinal);
+    if let Some(error) = error {
+        issue.push_str(": ");
+        issue.push_str(&handoff_excerpt(error, 220));
+    }
+    if !run.prompt.trim().is_empty() {
+        issue.push_str(" — Request: ");
+        issue.push_str(&handoff_excerpt(&run.prompt, 100));
+    }
+    Some(issue)
+}
+
+fn handoff_item_issue(item: &TurnItem) -> Option<String> {
+    let payload = &item.payload;
+    let state = &payload["state"];
+    for key in ["error", "error_message", "errors"] {
+        if let Some(error) = [payload, state]
+            .into_iter()
+            .filter_map(|data| data.get(key))
+            .find(|error| match error {
+                Value::Null | Value::Bool(_) => false,
+                Value::String(s) => !s.trim().is_empty(),
+                Value::Array(a) => !a.is_empty(),
+                Value::Object(o) => !o.is_empty(),
+                _ => true,
+            })
+        {
+            let detail = text_value(error).map_or_else(|| error.to_string(), str::to_owned);
+            return Some(format!(
+                "Item {}: {}",
+                item.ordinal,
+                handoff_excerpt(&detail, 180)
+            ));
+        }
+    }
+    let status = match payload["status"].as_str().or(state["status"].as_str()) {
+        Some("failed" | "error") => "failed",
+        Some("interrupted" | "cancelled" | "canceled") => "interrupted",
+        Some("rate-limited" | "rate_limited") => "rate limited",
+        Some("queued" | "pending" | "running" | "in_progress" | "in-progress") => "unfinished",
+        _ if !payload["retry_after_secs"].is_null() => "rate limited",
+        _ if payload["is_error"] == true || payload["error"] == true => "failed",
+        _ if payload["exit_code"].as_i64().is_some_and(|code| code != 0) => "failed",
+        _ => return None,
+    };
+    let detail = text_value(payload)
+        .or_else(|| payload["content"].as_array()?.iter().find_map(text_value))
+        .or_else(|| text_value(state))
+        .or(payload["aggregated_output"].as_str())
+        .or(payload["summary"].as_str())
+        .or(item.summary.as_deref())
+        .map(|detail| format!(": {}", handoff_excerpt(detail, 180)))
+        .unwrap_or_default();
+    Some(format!("Item {} ({status}){detail}", item.ordinal))
+}
+
+fn handoff_excerpt(text: &str, limit: usize) -> String {
+    compact(&redact_credentials(text), limit)
+}
+
+fn redact_credentials(text: &str) -> Cow<'_, str> {
+    let mut redacted = String::new();
+    let mut cursor = 0;
+    for (start, _) in text.match_indices(['s', 'g', 'x', 'B', 't', 'e']) {
+        if start >= cursor
+            && let Some(len) = credential_len(&text.as_bytes()[start..])
+        {
+            redacted.push_str(&text[cursor..start]);
+            redacted.push_str("[REDACTED]");
+            cursor = start + len;
+        }
+    }
+    if cursor == 0 {
+        Cow::Borrowed(text)
+    } else {
+        redacted.push_str(&text[cursor..]);
+        Cow::Owned(redacted)
+    }
+}
+
+fn credential_len(bytes: &[u8]) -> Option<usize> {
+    let url_safe = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_');
+    let (rest, min, allowed): (&[u8], usize, fn(u8) -> bool) = match bytes {
+        [b's', b'k', b'-', rest @ ..] => (rest, 16, url_safe),
+        [b'g', b'h', b'p' | b'o' | b'u', b'_', rest @ ..] => {
+            (rest, 16, |b| b.is_ascii_alphanumeric())
+        }
+        [
+            b'x',
+            b'o',
+            b'x',
+            b'b' | b'a' | b'p' | b'r' | b's',
+            b'-',
+            rest @ ..,
+        ] => (rest, 12, |b| b.is_ascii_alphanumeric() || b == b'-'),
+        [b'B', b'e', b'a', b'r', b'e', b'r', b' ', rest @ ..] => (rest, 16, |b| {
+            b.is_ascii_alphanumeric() || b"._~+/-".contains(&b)
+        }),
+        [b't', b'3', b'm', b'c', b'p', b'_', rest @ ..] => {
+            (rest, 16, |b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        }
+        [b'e', b'y', b'J', first @ ..] => {
+            let mut rest = first;
+            for segment in 0..3 {
+                let len = rest.iter().take_while(|&&b| url_safe(b)).count();
+                if len < 10 {
+                    return None;
+                }
+                rest = &rest[len..];
+                if segment < 2 {
+                    rest = rest.strip_prefix(b".")?;
+                }
+            }
+            return Some(bytes.len() - rest.len());
+        }
+        _ => return None,
+    };
+    let len = rest.iter().take_while(|&&b| allowed(b)).count();
+    (len >= min).then_some(bytes.len() - rest.len() + len)
+}
+
 pub(crate) fn validate_title(title: &str) -> CoreResult<()> {
     if title.trim().is_empty() {
         Err(CoreError::InvalidArgument("title is required".into()))
@@ -482,6 +650,10 @@ pub(crate) fn validate_title(title: &str) -> CoreResult<()> {
 impl OrchestratorBackend for RunCoordinator {
     async fn get_thread(&self, id: Uuid) -> CoreResult<Thread> {
         self.0.store.get_thread(id).await
+    }
+
+    async fn workspace_root(&self, thread: &Thread) -> CoreResult<std::path::PathBuf> {
+        self.workspace(thread).await
     }
 
     async fn capabilities(&self) -> CoreResult<Capabilities> {
@@ -591,5 +763,72 @@ impl OrchestratorBackend for RunCoordinator {
 
     async fn orch_stats(&self) -> CoreResult<Vec<OrchModelStat>> {
         crate::orchestration_stats(&self.0.cfg).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_supported_credentials_before_truncating() {
+        let credentials = [
+            "sk-1234567890abcdef_-",
+            "ghp_1234567890abcdef",
+            "gho_1234567890abcdef",
+            "ghu_1234567890abcdef",
+            "xoxb-12345-fixture",
+            "Bearer abcdefgh012345._~+/-",
+            "t3mcp_0123456789abcdef",
+            "eyJ1234567890.ABCDEFGHIJ.KLMNOPQRST",
+        ];
+        let text = format!("日本語 ({}) sk-short", credentials.join(", "));
+        let expected = format!("日本語 ({}) sk-short", ["[REDACTED]"; 8].join(", "));
+        assert_eq!(redact_credentials(&text), expected);
+        assert_eq!(
+            handoff_excerpt(&format!("error {}", credentials[0]), 10),
+            "error [RED…"
+        );
+    }
+
+    #[test]
+    fn preserves_an_unfinished_item_with_its_summary() {
+        let item = TurnItem {
+            id: Uuid::nil(),
+            thread_id: Uuid::nil(),
+            run_id: Uuid::nil(),
+            ordinal: 7,
+            kind: TurnItemKind::Subagent,
+            summary: Some("Apply the outstanding migration".into()),
+            payload: json!({"status": "running"}),
+            raw_bytes: 0,
+            compressed_bytes: None,
+            created_at: Utc::now(),
+        };
+        let summary = format_handoff("Source", &[item], &[]);
+        let (_, errors) = summary.split_once("## Unresolved / Recent Errors").unwrap();
+        assert!(errors.contains("- Item 7 (unfinished): Apply the outstanding migration"));
+    }
+
+    #[test]
+    fn preserves_provider_tool_errors_from_nested_payloads() {
+        for payload in [
+            json!({"is_error": true, "content": [{"type": "text", "text": "File missing"}]}),
+            json!({"state": {"status": "error", "error": "File missing"}}),
+        ] {
+            let item = TurnItem {
+                id: Uuid::nil(),
+                thread_id: Uuid::nil(),
+                run_id: Uuid::nil(),
+                ordinal: 1,
+                kind: TurnItemKind::ToolResult,
+                summary: None,
+                payload,
+                raw_bytes: 0,
+                compressed_bytes: None,
+                created_at: Utc::now(),
+            };
+            assert!(handoff_item_issue(&item).unwrap().ends_with("File missing"));
+        }
     }
 }

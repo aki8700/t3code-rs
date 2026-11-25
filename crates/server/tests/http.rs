@@ -17,7 +17,10 @@ use std::{
     },
     time::Duration,
 };
-use t3_core::{AuthConfig, ProviderId, ServerConfig, ThreadStatus, TurnItemKind, WsServerMessage};
+use t3_core::{
+    AuthConfig, NewTurnItem, ProviderId, Run, RunStatus, ServerConfig, Store, ThreadStatus,
+    TurnItemKind, WsServerMessage,
+};
 use t3_server::{ServerState, router};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
@@ -561,6 +564,93 @@ async fn rest_delegation_respects_runtime_and_plan_permissions() {
         ThreadStatus::Completed,
     )
     .await;
+}
+
+#[tokio::test]
+async fn fork_handoff_keeps_recent_failures_and_redacts_credentials() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let store = state.store.clone();
+    let app = router(state);
+    let id = create_parent(&app, &tmp.0).await;
+    let now = chrono::Utc::now();
+    let secret = "sk-fixture_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    for (ordinal, status, error) in [
+        (
+            1,
+            RunStatus::Failed,
+            Some(format!("Build failed using {secret}")),
+        ),
+        (2, RunStatus::Cancelled, None),
+        (
+            3,
+            RunStatus::RateLimited,
+            Some("Retry quota exhausted".into()),
+        ),
+        (4, RunStatus::Completed, None),
+    ] {
+        let run_id = Uuid::new_v4();
+        store
+            .create_run(Run {
+                id: run_id,
+                thread_id: id,
+                ordinal,
+                provider: ProviderId::Mock,
+                model: "mock".into(),
+                effort: None,
+                status,
+                prompt: "Finish migration".into(),
+                provider_session_id: None,
+                input_tokens: None,
+                output_tokens: None,
+                duration_ms: None,
+                error_message: error,
+                started_at: now,
+                completed_at: Some(now),
+            })
+            .await
+            .unwrap();
+        if ordinal == 4 {
+            store
+                .append_turn_item(NewTurnItem {
+                    thread_id: id,
+                    run_id,
+                    kind: TurnItemKind::ToolResult,
+                    summary: Some("migration tool".into()),
+                    payload: json!({"error": {"message": "Missing migration directory"}}),
+                    searchable_text: None,
+                })
+                .await
+                .unwrap();
+            store
+                .append_turn_item(NewTurnItem {
+                    thread_id: id,
+                    run_id,
+                    kind: TurnItemKind::UserMessage,
+                    summary: None,
+                    payload: json!({"text": format!("{} {secret}", "a".repeat(336))}),
+                    searchable_text: None,
+                })
+                .await
+                .unwrap();
+        }
+    }
+    let fork = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/fork"),
+        Some(json!({})),
+    )
+    .await;
+    let fork_id = fork["id"].as_str().unwrap();
+    let fork_detail = json_req(&app, Method::GET, &format!("/api/threads/{fork_id}"), None).await;
+    let summary = fork_detail["handoffs"][0]["summary"].as_str().unwrap();
+    let (_, errors) = summary.split_once("## Unresolved / Recent Errors").unwrap();
+    assert!(errors.contains("Build failed using [REDACTED]"));
+    assert!(errors.contains("interrupted") && errors.contains("Finish migration"));
+    assert!(errors.contains("Retry quota exhausted"));
+    assert!(errors.contains("Missing migration directory"));
+    assert!(!fork_detail.to_string().contains("sk-fixture"));
 }
 
 #[tokio::test]

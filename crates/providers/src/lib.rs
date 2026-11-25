@@ -6,6 +6,7 @@ mod mock;
 mod parsers;
 mod process;
 mod retry;
+mod watchdog;
 
 pub use cli_drivers::{AntigravityDriver, ClaudeDriver, CodexDriver, OpenCodeDriver};
 pub use mock::MockDriver;

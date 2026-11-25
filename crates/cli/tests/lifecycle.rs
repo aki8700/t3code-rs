@@ -6,13 +6,15 @@ use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Stdio, time:
 use t3_core::{ProviderBinaryConfig, ProviderId, ServerConfig, Store};
 use t3_store::SqliteStore;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
     process::{Child, Command},
     time::{sleep, timeout},
 };
 use uuid::Uuid;
 
 const TOKEN: &str = "fixture-bearer-token";
+const BRIDGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Fixture(PathBuf);
 
@@ -96,6 +98,107 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[tokio::test]
+async fn gc_dry_run_leaves_the_data_directory_untouched() {
+    let fixture = Fixture::new();
+    let cfg = ServerConfig {
+        data_dir: fixture.0.join("state ?#"),
+        ..Default::default()
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_t3d"));
+    command.arg("gc").arg("--data-dir").arg(&cfg.data_dir);
+    let empty = command.output().await.unwrap();
+    assert!(empty.status.success());
+    let report: Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert_eq!(report["db_bytes_after"], 0);
+    assert!(!cfg.data_dir.exists());
+
+    fs::create_dir_all(cfg.attachments_dir()).unwrap();
+    let orphan = cfg.attachments_dir().join("orphan");
+    fs::write(&orphan, b"unused").unwrap();
+    let store = SqliteStore::open(cfg.db_path(), cfg.storage.clone()).unwrap();
+    drop(store);
+    let original = fs::read(cfg.db_path()).unwrap();
+    let modified = fs::metadata(cfg.db_path()).unwrap().modified().unwrap();
+
+    for apply in [false, true] {
+        if apply {
+            command.arg("--apply");
+        }
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["applied"], apply);
+        assert_eq!(report["orphan_attachments_count"], 1);
+        assert_eq!(report["orphan_attachments_bytes"], 6);
+        assert_eq!(report["db_bytes_before"], original.len());
+        if !apply {
+            assert_eq!(report["db_bytes_after"], original.len());
+            assert_eq!(fs::read(cfg.db_path()).unwrap(), original);
+            assert_eq!(
+                fs::metadata(cfg.db_path()).unwrap().modified().unwrap(),
+                modified
+            );
+            assert_eq!(fs::read_dir(&cfg.data_dir).unwrap().count(), 2);
+            assert_eq!(fs::read(&orphan).unwrap(), b"unused");
+        }
+    }
+    assert!(!orphan.exists());
+}
+
+#[tokio::test]
+async fn gc_counts_live_wal_data_and_excludes_apply_while_the_store_is_open() {
+    let fixture = Fixture::new();
+    let cfg = ServerConfig {
+        data_dir: fixture.0.clone(),
+        ..Default::default()
+    };
+    fs::create_dir(cfg.attachments_dir()).unwrap();
+    let store = SqliteStore::open(cfg.db_path(), cfg.storage.clone()).unwrap();
+    let bytes = b"live fixture";
+    let hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    let path = cfg.attachments_dir().join(hash);
+    fs::write(&path, bytes).unwrap();
+    store
+        .save_attachment(t3_core::Attachment {
+            id: Uuid::new_v4(),
+            thread_id: None,
+            filename: "live".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: bytes.len() as u64,
+            blake3_hash: hash.into(),
+            storage_path: path.clone(),
+            created_at: std::time::SystemTime::now().into(),
+        })
+        .await
+        .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_t3d"));
+    command.arg("gc").arg("--data-dir").arg(&cfg.data_dir);
+    let sqlite_files = ["state.sqlite", "state.sqlite-wal", "state.sqlite-shm"];
+    let before = sqlite_files.map(|name| fs::read(cfg.data_dir.join(name)).unwrap());
+    let output = command.output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["orphan_attachments_count"], 0);
+    assert_eq!(
+        sqlite_files.map(|name| fs::read(cfg.data_dir.join(name)).unwrap()),
+        before
+    );
+
+    let output = command.arg("--apply").output().await.unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("stop the server"));
+    assert_eq!(fs::read(path).unwrap(), bytes);
 }
 
 #[tokio::test]
@@ -272,4 +375,79 @@ async fn mcp_bridge_reads_env_and_opencode_health_returns_only_curated_models() 
             .unwrap()
             .success()
     );
+}
+
+#[tokio::test]
+async fn mcp_bridge_completes_fast_requests_first_and_drains_after_eof() {
+    timeout(BRIDGE_TIMEOUT, async {
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let mut bridge = Command::new(env!("CARGO_BIN_EXE_t3d"))
+            .args(["mcp", "--url", &url])
+            .env("T3_MCP_TOKEN", TOKEN)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdin = bridge.stdin.take().unwrap();
+        let mut stdout = BufReader::new(bridge.stdout.take().unwrap()).lines();
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"delegate_task\",\"arguments\":{\"task\":\"fixture\",\"mode\":\"wait\"}}}\n")
+            .await
+            .unwrap();
+        let slow = accept_mcp_request(&server, 1).await;
+
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"thread_read\",\"arguments\":{}}}\n")
+            .await
+            .unwrap();
+        drop(stdin);
+        let fast = accept_mcp_request(&server, 2).await;
+        respond_to_mcp(fast, 2).await;
+        let first: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(first["id"], 2);
+
+        respond_to_mcp(slow, 1).await;
+        let second: Value = serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(second["id"], 1);
+        assert!(stdout.next_line().await.unwrap().is_none());
+        assert!(bridge.wait().await.unwrap().success());
+    })
+    .await
+    .expect("the bridge did not complete concurrent requests before the deadline");
+}
+
+async fn accept_mcp_request(server: &TcpListener, id: u64) -> TcpStream {
+    let (socket, _) = server.accept().await.unwrap();
+    let mut reader = BufReader::new(socket);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(line.trim_end(), "POST /mcp HTTP/1.1");
+    let mut content_length = None;
+    loop {
+        line.clear();
+        assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+        if line == "\r\n" {
+            break;
+        }
+        let (name, value) = line.split_once(':').unwrap();
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = Some(value.trim().parse().unwrap());
+        }
+    }
+    let mut body = vec![0; content_length.unwrap()];
+    reader.read_exact(&mut body).await.unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["id"], id);
+    reader.into_inner()
+}
+
+async fn respond_to_mcp(mut socket: TcpStream, id: u64) {
+    let body = json!({"jsonrpc": "2.0", "id": id, "result": {}});
+    let body = body.to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    socket.write_all(response.as_bytes()).await.unwrap();
 }

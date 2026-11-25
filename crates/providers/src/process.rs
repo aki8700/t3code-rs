@@ -1,4 +1,7 @@
-use crate::parsers::{Parser, provider_error};
+use crate::{
+    parsers::{Parser, provider_error},
+    watchdog::RepetitionWatchdog,
+};
 use serde_json::json;
 use std::{
     collections::HashMap,
@@ -56,6 +59,8 @@ pub(crate) fn prepare(cmd: &mut Command) {
         ("AGY_DISABLE_TELEMETRY", "1"),
         ("DISABLE_TELEMETRY", "1"),
         ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+        ("T3CODE_TELEMETRY_ENABLED", "false"),
+        ("T3CODE_OTEL_SDK_DISABLED", "true"),
     ])
     .env_remove("T3_BEARER_TOKEN")
     .env_remove("T3_MCP_TOKEN")
@@ -344,6 +349,7 @@ pub(crate) async fn run_turn(
     let stderr = child.stderr.take().expect("piped stderr");
     let stdin = child.stdin.take();
     let (close_tx, close_rx) = oneshot::channel();
+    let (watchdog_tx, watchdog_rx) = oneshot::channel();
     let collect = async {
         let wait = async {
             #[cfg(not(unix))]
@@ -353,11 +359,21 @@ pub(crate) async fn run_turn(
                     child.start_kill()?;
                     child.wait().await
                 }
+                Ok(()) = watchdog_rx => {
+                    child.start_kill()?;
+                    child.wait().await
+                }
             }?;
             #[cfg(unix)]
             {
                 let pid = child.id().expect("unreaped child");
-                let result = wait_for_exit(pid).await;
+                let result = tokio::select! {
+                    result = wait_for_exit(pid) => result,
+                    Ok(()) = watchdog_rx => {
+                        GroupCleanup(Some(pid)).kill();
+                        wait_for_exit(pid).await
+                    }
+                };
                 if result.is_ok() || already_reaped(&result) {
                     // Clean up descendants holding pipes before reaping the leader.
                     guard.finish(result.is_ok());
@@ -373,7 +389,7 @@ pub(crate) async fn run_turn(
         };
         tokio::try_join!(
             wait,
-            read_events(stdout, provider, secret, &tx, close_tx),
+            read_events(stdout, provider, secret, &tx, close_tx, watchdog_tx),
             read_tail(stderr),
             write_input(stdin, input, steer_rx, close_rx),
         )
@@ -383,6 +399,12 @@ pub(crate) async fn run_turn(
         result = collect => result.map_err(process_error)?,
     };
 
+    let ReadOutcome::Terminal(terminal) = terminal else {
+        let _ = tx.send(StreamEvent::Failed {
+            message: "repetition loop detected — terminated runaway provider process to save tokens/battery".into(),
+        });
+        return Ok(());
+    };
     let event = if interrupted.load(Ordering::Acquire) {
         StreamEvent::Failed {
             message: "interrupted".into(),
@@ -456,24 +478,44 @@ fn redact_value(value: &mut serde_json::Value, secret: &str) {
     }
 }
 
+enum ReadOutcome {
+    Terminal(Option<StreamEvent>),
+    Repetition,
+}
+
 async fn read_events(
     stdout: impl AsyncRead + Unpin,
     provider: ProviderId,
     secret: Option<&str>,
     tx: &mpsc::UnboundedSender<StreamEvent>,
     close_stdin: oneshot::Sender<()>,
-) -> io::Result<Option<StreamEvent>> {
+    watchdog_stop: oneshot::Sender<()>,
+) -> io::Result<ReadOutcome> {
     let mut lines = BufReader::new(stdout);
     let mut line = Vec::new();
     let mut parser = Parser::new(provider);
     let mut terminal = None;
     let mut close_stdin = Some(close_stdin);
+    let mut assistant = RepetitionWatchdog::default();
+    let mut reasoning = RepetitionWatchdog::default();
     while lines.read_until(b'\n', &mut line).await? != 0 {
         if let Ok(mut value) = serde_json::from_slice(&line) {
             if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
                 redact_value(&mut value, secret);
             }
             for event in parser.parse(&value) {
+                let repeated = match &event {
+                    StreamEvent::AssistantDelta { text } => assistant.push(text),
+                    StreamEvent::ReasoningDelta { text } => reasoning.push(text),
+                    StreamEvent::Completed {
+                        final_text: Some(text),
+                    } => RepetitionWatchdog::default().push(text),
+                    _ => false,
+                };
+                if repeated {
+                    let _ = watchdog_stop.send(());
+                    return Ok(ReadOutcome::Repetition);
+                }
                 match event {
                     StreamEvent::Completed { .. }
                     | StreamEvent::Failed { .. }
@@ -494,7 +536,7 @@ async fn read_events(
         }
         line.clear();
     }
-    Ok(terminal.or_else(|| parser.finish()))
+    Ok(ReadOutcome::Terminal(terminal.or_else(|| parser.finish())))
 }
 
 async fn read_tail(mut input: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
@@ -597,6 +639,8 @@ mod tests {
             r#"
 check_privacy() {
     [ "$DO_NOT_TRACK:$AGY_DISABLE_TELEMETRY:$DISABLE_TELEMETRY:$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" = '1:1:1:1' ]
+    [ "$T3CODE_TELEMETRY_ENABLED" = false ]
+    [ "$T3CODE_OTEL_SDK_DISABLED" = true ]
 }
 check_privacy
 if [ "$1" = --version ]; then
@@ -893,5 +937,53 @@ exit 0
             Some(StreamEvent::Completed { .. })
         ));
         driver.interrupt(run_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn repetitive_stream_terminates_the_provider_group() {
+        let line = "Repeating this exact line!\n";
+        let phrase = "We need to inspect the exact same file again. ";
+        for event in [
+            json!({
+                "type": "stream_event", "event": {"type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": line.repeat(6)}}
+            }),
+            json!({
+                "type": "stream_event", "event": {"type": "content_block_delta",
+                    "delta": {"type": "thinking_delta", "thinking": phrase.repeat(5)}}
+            }),
+            json!({"type": "result", "subtype": "success", "result": phrase.repeat(5)}),
+        ] {
+            let fixture = Fixture::new(&format!(
+                r#"
+/bin/sleep 60 &
+printf '{{"type":"system","session_id":"%s:%s"}}\n' "$$" "$!"
+printf '%s\n' '{event}'
+wait
+"#
+            ));
+            let driver = ClaudeDriver::new(fixture.binary());
+            let req = test_request(ProviderId::Claude);
+            let id = req.run_id;
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            tokio::time::timeout(Duration::from_secs(2), driver.run_turn(req, tx))
+                .await
+                .expect("repetition should stop the provider before it exits")
+                .unwrap();
+            let Some(StreamEvent::SessionStarted {
+                provider_session_id,
+            }) = receive(&mut rx).await
+            else {
+                panic!("fixture did not start");
+            };
+            let (pid, grandchild) = provider_session_id.split_once(':').unwrap();
+            assert_processes_exited(pid.parse().unwrap(), grandchild.parse().unwrap()).await;
+            assert!(matches!(
+                receive(&mut rx).await,
+                Some(StreamEvent::Failed { message }) if message == "repetition loop detected — terminated runaway provider process to save tokens/battery"
+            ));
+            assert!(receive(&mut rx).await.is_none());
+            assert!(!driver.send_steer(id, "late".into()).await.unwrap());
+        }
     }
 }

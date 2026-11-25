@@ -1,13 +1,16 @@
 use crate::CliResult;
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use t3_core::{CoreError, CoreResult};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    sync::Mutex,
     task::JoinSet,
 };
 use uuid::Uuid;
+
+const MAX_IN_FLIGHT: usize = 16;
 
 pub async fn health(server_url: &str) -> CliResult<Value> {
     let client = http_client()?;
@@ -31,20 +34,18 @@ pub async fn run_stdio_bridge(
     let url = endpoint(server_url, "mcp")
         .map_err(|error| CoreError::InvalidArgument(error.to_string()))?;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
-    let mut requests = JoinSet::<Option<Vec<u8>>>::new();
+    let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
+    let mut requests = JoinSet::<CoreResult<()>>::new();
     let mut eof = false;
     while !eof || !requests.is_empty() {
         tokio::select! {
             biased;
             result = requests.join_next(), if !requests.is_empty() => {
-                if let Some(bytes) = result.expect("an in-flight request").map_err(internal)? {
-                    stdout.write_all(&bytes).await.map_err(internal)?;
-                    stdout.write_all(b"\n").await.map_err(internal)?;
-                    stdout.flush().await.map_err(internal)?;
+                if let Some(result) = result {
+                    result.map_err(internal)??;
                 }
             }
-            line = lines.next_line(), if !eof && requests.len() < 64 => {
+            line = lines.next_line(), if !eof && requests.len() < MAX_IN_FLIGHT => {
                 match line.map_err(internal)? {
                     Some(line) if !line.trim().is_empty() => {
                         let mut req = client.post(url.clone())
@@ -55,7 +56,16 @@ pub async fn run_stdio_bridge(
                         if let Some(thread_id) = thread_id {
                             req = req.header("X-T3-Thread-Id", thread_id.to_string());
                         }
-                        requests.spawn(forward(req, line));
+                        let stdout = Arc::clone(&stdout);
+                        requests.spawn(async move {
+                            if let Some(mut bytes) = forward(req, line).await {
+                                bytes.push(b'\n');
+                                let mut stdout = stdout.lock().await;
+                                stdout.write_all(&bytes).await.map_err(internal)?;
+                                stdout.flush().await.map_err(internal)?;
+                            }
+                            Ok(())
+                        });
                     }
                     Some(_) => {}
                     None => eof = true,

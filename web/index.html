@@ -2,12 +2,11 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>t3code-rs</title>
 <meta name="description" content="t3code-rs: ゼロテレメトリのマルチプロバイダ AI コーディングエージェント UI">
-<meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#0e1014" media="(prefers-color-scheme: dark)">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#0a0a0a">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -15,110 +14,115 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
 <meta name="referrer" content="no-referrer">
 <link rel="manifest" href="manifest.json">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230e1014'/%3E%3Cpath d='M16 20h32M32 20v26' stroke='%236d9bff' stroke-width='7' stroke-linecap='round' fill='none'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23000'/%3E%3Cpath d='M11 21h19M20.5 21v24M37 21h15L43 31.5c6 0 10 2.800 10 7.200S49 45.500 44 45.500c-3.500 0-6-1.200-7.500-3.300' stroke='%23f5f5f5' stroke-width='5.500' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-<div id="app" class="app" data-sidebar="closed" data-diff="closed">
+<div id="app" class="app" data-sb="open" data-drawer="closed" data-diff="closed">
 
   <!-- ===== サイドバー ===== -->
   <aside id="sidebar" class="sidebar" aria-label="スレッド一覧">
-    <div class="sb-head">
-      <span class="brand"><span class="brand-mark" aria-hidden="true">t3</span>code-rs</span>
-      <button type="button" class="btn primary sm" id="btn-new-thread">＋ 新規スレッド</button>
-    </div>
-    <div class="sb-project">
-      <select id="project-select" class="sel" aria-label="プロジェクト"></select>
-      <button type="button" class="btn sm" id="btn-add-project" title="プロジェクトを追加・管理">＋ プロジェクト追加</button>
+    <div class="sb-head drag-region">
+      <button type="button" class="brand" id="btn-home" title="ホーム">
+        <span class="brand-t3">T3</span><span class="brand-name">Code</span><span class="brand-rs">rs</span>
+      </button>
+      <span class="grow"></span>
+      <button type="button" class="ibtn" id="btn-sb-collapse" data-icon="panel" data-kbd="B" data-title="サイドバーを閉じる" aria-label="サイドバーを閉じる"></button>
+      <button type="button" class="ibtn" id="btn-new-thread" data-icon="compose" data-kbd="N" data-title="新規スレッド" aria-label="新規スレッド"></button>
     </div>
     <div class="sb-scroll">
-      <section class="sb-section" id="shelf-section">
-        <h3 class="sb-h"><span>稼働中 <small>Working Shelf</small></span><span class="count" id="shelf-count">0</span></h3>
+      <section id="shelf" class="sb-section shelf" hidden>
+        <h3 class="sb-h"><span class="pulse" aria-hidden="true"></span><span>稼働中</span><span class="count" id="shelf-count">0</span></h3>
         <ul class="tlist" id="shelf-list"></ul>
       </section>
       <section class="sb-section">
         <h3 class="sb-h">
-          <span>スレッド</span>
-          <label class="chk"><input type="checkbox" id="chk-archived"> アーカイブ表示</label>
+          <span>プロジェクト</span><span class="grow"></span>
+          <button type="button" class="ibtn xs" id="btn-archived" data-icon="archive" title="アーカイブ済みを表示" aria-label="アーカイブ済みを表示" aria-pressed="false"></button>
         </h3>
-        <ul class="tlist" id="thread-list"></ul>
+        <div id="project-groups"></div>
+        <button type="button" class="add-project" id="btn-add-project" data-icon="folderPlus">+ プロジェクト追加</button>
       </section>
     </div>
     <div class="sb-foot">
-      <div class="conn" id="conn" title="WebSocket 接続状態"><span class="dot" id="conn-dot"></span><span id="conn-text">接続中…</span></div>
-      <div class="sb-foot-btns">
-        <button type="button" class="btn sm" id="btn-stats" title="orch-stats / プライバシー / ストレージ">統計・プライバシー</button>
-        <button type="button" class="btn sm" id="btn-theme" title="テーマ切替（自動 → ライト → ダーク）">◐ 自動</button>
-      </div>
+      <button type="button" class="foot-row" id="btn-sb-search" data-icon="search"><span>検索</span><kbd data-kbd-label="K"></kbd></button>
+      <button type="button" class="foot-row" id="btn-stats" data-icon="chart"><span>統計・プライバシー</span></button>
+      <button type="button" class="foot-row" id="btn-theme" data-icon="palette" aria-haspopup="true"><span>テーマ</span><small id="theme-name"></small></button>
+      <div class="conn" id="conn" title="WebSocket 接続状態"><span class="dot"></span><span id="conn-text">接続中…</span></div>
     </div>
   </aside>
   <div id="scrim" class="scrim" hidden></div>
 
   <!-- ===== メイン ===== -->
-  <main class="main">
-    <header class="topbar">
-      <button type="button" class="ibtn only-narrow" id="btn-menu" data-icon="menu" title="メニュー" aria-label="メニュー"></button>
-      <div class="tb-title">
-        <div class="tb-line1">
-          <button type="button" id="thread-title" class="title-btn" title="クリックして名前を変更">スレッドを選択してください</button>
-        </div>
-        <div class="tb-line2" id="thread-meta"></div>
-      </div>
+  <main class="main" id="main" data-view="hero">
+    <header class="topbar drag-region">
+      <button type="button" class="ibtn sb-open" id="btn-sb-open" data-icon="panel" data-kbd="B" data-title="サイドバーを開く" aria-label="サイドバーを開く"></button>
+      <div class="tb-title" id="tb-title"></div>
       <div class="tb-actions">
-        <button type="button" class="ibtn" id="btn-search" data-icon="search" title="全文検索 (Ctrl/Cmd+K)" aria-label="検索"></button>
-        <button type="button" class="ibtn" id="btn-diff" data-icon="diff" title="Git 差分" aria-label="差分" aria-pressed="false"></button>
+        <button type="button" class="tbtn thread-only" id="btn-fork" data-icon="fork" title="別のプロバイダ／モデルへ文脈ごと分岐 (Fork / Handoff)"><span class="lbl">分岐</span></button>
+        <button type="button" class="tbtn thread-only" id="btn-delegate" data-icon="split" title="子スレッドとして並列に委譲 (Delegate)"><span class="lbl">委譲</span></button>
+        <button type="button" class="tbtn thread-only" id="btn-diff" data-icon="diff" data-kbd="D" data-title="Git 差分" aria-pressed="false"><span class="lbl">Diff</span><span class="diff-badge" id="diff-badge" hidden></span></button>
+        <button type="button" class="ibtn wide-only" id="btn-search" data-icon="search" data-kbd="K" data-title="全文検索" aria-label="検索"></button>
+        <button type="button" class="ibtn wide-only" id="btn-top-stats" data-icon="chart" title="統計・プライバシー" aria-label="統計"></button>
       </div>
     </header>
     <div id="children-bar" class="children-bar" hidden></div>
 
     <div class="tl-wrap" id="tl-wrap">
       <div class="tl-scroll" id="tl-scroll">
-        <div id="empty" class="empty"></div>
         <div id="timeline" class="timeline"></div>
       </div>
-      <button type="button" class="jump" id="btn-jump" hidden>↓ 最新へ</button>
+      <button type="button" class="jump" id="btn-jump" data-icon="down" hidden>最新へ</button>
     </div>
 
-    <div id="approval" class="approval-stack"></div>
+    <div class="dock" id="dock">
+      <div id="hero" class="hero"></div>
+      <div id="approval" class="approval-stack"></div>
 
-    <form id="composer" class="composer" autocomplete="off">
-      <div id="att-chips" class="att-chips" hidden></div>
-      <textarea id="prompt" rows="1" placeholder="メッセージを入力（Enter で送信 / Shift+Enter で改行）" aria-label="メッセージ"></textarea>
-      <div class="cbar">
-        <div class="cbar-left">
-          <button type="button" class="ibtn" id="btn-attach" data-icon="clip" title="ファイルを添付（画像は貼り付けも可）" aria-label="添付"></button>
+      <form id="composer" class="composer" autocomplete="off">
+        <div id="att-chips" class="att-chips" hidden></div>
+        <textarea id="prompt" rows="1" aria-label="メッセージ"></textarea>
+        <div class="cbar">
+          <button type="button" class="ibtn round" id="btn-attach" data-icon="plus" title="ファイルを添付（画像は貼り付け・ドロップも可）" aria-label="添付"></button>
           <input type="file" id="file-input" multiple hidden>
-          <div id="model-picker" class="picker"></div>
-        </div>
-        <div class="cbar-right">
-          <button type="button" class="btn sm" id="btn-fork" title="別のプロバイダ／モデルへ文脈ごと分岐"><span data-icon="fork"></span><span class="lbl">分岐・モデル切替</span></button>
-          <button type="button" class="btn sm" id="btn-delegate" title="子スレッドとして並列に委譲"><span data-icon="split"></span><span class="lbl">並列委譲</span></button>
-          <div class="seg run-only" id="behavior" role="radiogroup" aria-label="実行中の送信方法" hidden>
-            <button type="button" role="radio" data-b="steer" class="on" title="実行中のターンに割り込んで指示を送る">Steer<small>割り込み送信</small></button>
-            <button type="button" role="radio" data-b="queue" title="現在のターン終了後に送る">Queue<small>予約</small></button>
+          <button type="button" class="chip-btn" id="btn-perm" aria-haspopup="dialog"></button>
+          <button type="button" class="chip-btn plan" id="btn-plan-chip" aria-haspopup="dialog" hidden>Plan</button>
+          <span class="grow"></span>
+          <button type="button" class="model-pill" id="btn-model" aria-haspopup="dialog" aria-expanded="false"></button>
+          <div class="seg mini run-only" id="behavior" role="radiogroup" aria-label="実行中の送信方法" hidden>
+            <button type="button" role="radio" data-b="steer" title="実行中のターンに割り込んで指示を送る">Steer</button>
+            <button type="button" role="radio" data-b="queue" title="現在のターン終了後に送る">Queue</button>
           </div>
-          <button type="button" class="btn danger sm run-only" id="btn-stop" hidden title="実行を停止 (Interrupt)"><span data-icon="stop"></span>停止<small>Interrupt</small></button>
-          <button type="submit" class="btn primary" id="btn-send"><span data-icon="send"></span><span id="send-lbl">送信</span></button>
+          <button type="button" class="round-btn stop run-only" id="btn-stop" data-icon="stop" title="停止 (Interrupt)" aria-label="停止" hidden></button>
+          <button type="submit" class="round-btn send" id="btn-send" data-icon="arrowUp" title="送信" aria-label="送信" disabled></button>
         </div>
-      </div>
-    </form>
+      </form>
+
+      <div id="hero-extra" class="hero-extra"></div>
+      <button type="button" class="stat-pill" id="stat-pill" title="orch-stats / DB / プライバシーの詳細を開く"></button>
+    </div>
+    <div class="drop-hint" id="drop-hint" hidden><span>ドロップして添付</span></div>
   </main>
 
   <!-- ===== 右: Git 差分 ===== -->
   <aside id="diff-panel" class="diff-panel" aria-label="Git 差分" hidden>
-    <div class="dp-head">
-      <strong>Git 差分</strong>
+    <div class="dp-head drag-region">
+      <strong>差分</strong>
       <span class="dp-sum" id="diff-sum"></span>
       <span class="grow"></span>
-      <label class="chk" title="空白の差を無視"><input type="checkbox" id="chk-ws" checked> 空白無視</label>
       <button type="button" class="ibtn sm" id="btn-diff-expand" data-icon="expand" title="全て展開／折りたたみ" aria-label="全て展開／折りたたみ"></button>
       <button type="button" class="ibtn sm" id="btn-diff-refresh" data-icon="refresh" title="更新" aria-label="更新"></button>
       <button type="button" class="ibtn sm" id="btn-diff-close" data-icon="close" title="閉じる" aria-label="閉じる"></button>
     </div>
+    <div class="dp-sub">
+      <span class="dp-branch" id="diff-branch"></span>
+      <span class="grow"></span>
+      <label class="switch"><input type="checkbox" id="chk-ws" checked><i></i><span>空白の差を無視</span></label>
+    </div>
     <div class="dp-body" id="diff-body"></div>
   </aside>
 </div>
-<div id="toasts" class="toasts" aria-live="polite"></div>
+<div id="toasts" class="toasts" popover="manual" aria-live="polite"></div>
 <script type="module" src="app.js"></script>
 </body>
 </html>
