@@ -103,6 +103,22 @@ pub enum WsServerMessage {
         thread_id: Uuid,
         board: SwarmBoardSnapshot,
     },
+    ShellOutput {
+        exec_id: Uuid,
+        thread_id: Option<Uuid>,
+        stream: String,
+        chunk: String,
+    },
+    ShellFinished {
+        exec_id: Uuid,
+        thread_id: Option<Uuid>,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        timed_out: bool,
+        cancelled: bool,
+        truncated: bool,
+        item_id: Option<Uuid>,
+    },
     Resync {
         thread_id: Option<Uuid>,
     },
@@ -118,4 +134,59 @@ pub enum WsClientMessage {
     Subscribe { thread_id: Uuid },
     Unsubscribe { thread_id: Uuid },
     Ping,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_ws_messages_serde_roundtrip() {
+        let exec_id = Uuid::new_v4();
+        let thread_id = Some(Uuid::new_v4());
+        let out = WsServerMessage::ShellOutput {
+            exec_id,
+            thread_id,
+            stream: "stdout".into(),
+            chunk: "hello\n".into(),
+        };
+        let encoded = serde_json::to_value(&out).unwrap();
+        assert_eq!(encoded["type"], "shell_output");
+        assert_eq!(encoded["stream"], "stdout");
+        assert_eq!(encoded["chunk"], "hello\n");
+        let decoded: WsServerMessage = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(
+            decoded,
+            WsServerMessage::ShellOutput {
+                exec_id: id,
+                thread_id: tid,
+                ..
+            } if id == exec_id && tid == thread_id
+        ));
+
+        let item_id = Some(Uuid::new_v4());
+        let fin = WsServerMessage::ShellFinished {
+            exec_id,
+            thread_id,
+            exit_code: Some(0),
+            duration_ms: 42,
+            timed_out: false,
+            cancelled: true,
+            truncated: false,
+            item_id,
+        };
+        let encoded = serde_json::to_value(&fin).unwrap();
+        assert_eq!(encoded["type"], "shell_finished");
+        assert_eq!(encoded["cancelled"], true);
+        let decoded: WsServerMessage = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(
+            decoded,
+            WsServerMessage::ShellFinished {
+                exec_id: id,
+                cancelled: true,
+                item_id: iid,
+                ..
+            } if id == exec_id && iid == item_id
+        ));
+    }
 }

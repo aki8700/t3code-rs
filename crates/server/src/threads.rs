@@ -7,11 +7,17 @@ use chrono::Utc;
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{borrow::Cow, path::PathBuf};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
+};
 use t3_core::*;
-use t3_git::GitManager;
+use t3_git::{GitManager, MergeOutcome};
 use t3_mcp::{
-    Capabilities, DelegateMode, DelegatedTask, ForkOptions, OrchestratorBackend, ThreadRead,
+    Capabilities, DelegateMode, DelegatedTask, ForkOptions, OrchestratorBackend, TaskMergeResult,
+    ThreadRead,
 };
 use t3_providers::ProviderRegistry;
 use uuid::Uuid;
@@ -142,6 +148,218 @@ impl RunCoordinator {
     pub async fn diff(&self, id: Uuid, ignore_whitespace: bool) -> CoreResult<DiffSummary> {
         let thread = self.0.store.get_thread(id).await?;
         GitManager::diff_summary(&self.workspace(&thread).await?, ignore_whitespace).await
+    }
+
+    pub async fn child_worktree_diff(
+        &self,
+        parent_id: Uuid,
+        child_id: Uuid,
+        ignore_whitespace: bool,
+    ) -> CoreResult<DiffSummary> {
+        let ctx = self.resolve_child_worktree(parent_id, child_id).await?;
+        GitManager::branch_diff_summary(
+            &ctx.parent_workspace,
+            "HEAD",
+            &ctx.child_branch,
+            ignore_whitespace,
+        )
+        .await
+    }
+
+    pub async fn merge_child_worktree(
+        &self,
+        parent_id: Uuid,
+        child_id: Uuid,
+        commit_message: Option<String>,
+        cleanup: bool,
+    ) -> CoreResult<TaskMergeResult> {
+        let ctx = self.resolve_child_worktree(parent_id, child_id).await?;
+        let (active_plan, child_active) = {
+            let active = self.0.active.lock().await;
+            (
+                active
+                    .get(&ctx.parent.id)
+                    .is_some_and(|run| run.interaction_mode == InteractionMode::Plan),
+                active.contains_key(&ctx.child.id),
+            )
+        };
+        if ctx.parent.interaction_mode == InteractionMode::Plan || active_plan {
+            return Err(CoreError::InvalidArgument(
+                "cannot merge a child worktree in plan mode".into(),
+            ));
+        }
+        if child_active {
+            return Err(CoreError::InvalidArgument(
+                "cannot merge while child thread has an active run".into(),
+            ));
+        }
+
+        let merge_lock = workspace_merge_lock(&ctx.canonical_parent);
+        let _merge_guard = merge_lock.lock().await;
+
+        if self.0.active.lock().await.contains_key(&ctx.child.id) {
+            return Err(CoreError::InvalidArgument(
+                "cannot merge while child thread has an active run".into(),
+            ));
+        }
+
+        if GitManager::has_merge_in_progress(&ctx.parent_workspace).await? {
+            return Err(CoreError::InvalidArgument(
+                "parent workspace already has a merge in progress".into(),
+            ));
+        }
+        if GitManager::has_uncommitted_changes(&ctx.child_worktree).await? {
+            return Err(CoreError::InvalidArgument(
+                "child worktree has uncommitted changes; commit or discard them before merging"
+                    .into(),
+            ));
+        }
+
+        match GitManager::merge_branch_checked(
+            &ctx.parent_workspace,
+            &ctx.child_branch,
+            commit_message.as_deref(),
+        )
+        .await?
+        {
+            MergeOutcome::Conflict {
+                conflict_files,
+                message,
+            } => Ok(TaskMergeResult {
+                merged: false,
+                child_thread_id: ctx.child.id,
+                branch: ctx.child_branch,
+                summary: message,
+                conflict_files,
+                cleaned_up: false,
+            }),
+            MergeOutcome::Merged { sha, summary } => {
+                let mut result_summary = if summary.is_empty() {
+                    format!("Merged {} at {sha}", ctx.child_branch)
+                } else {
+                    format!("{summary} ({sha})")
+                };
+                let mut cleaned_up = false;
+                if cleanup {
+                    let active = self.0.active.lock().await;
+                    if active.contains_key(&ctx.child.id) {
+                        result_summary
+                            .push_str(" (cleanup skipped: child thread has an active run)");
+                    } else {
+                        let remove_res = self
+                            .0
+                            .git
+                            .remove_worktree(&ctx.parent_workspace, &ctx.child_worktree)
+                            .await;
+                        let branch_res =
+                            if remove_res.is_ok() && ctx.child_branch.starts_with("t3rs/") {
+                                GitManager::delete_branch(&ctx.parent_workspace, &ctx.child_branch)
+                                    .await
+                            } else {
+                                Ok(())
+                            };
+                        let prune_res = self.0.git.prune_worktrees(&ctx.parent_workspace).await;
+                        match (remove_res, branch_res, prune_res) {
+                            (Ok(()), Ok(()), Ok(())) => {
+                                cleaned_up = true;
+                                let cid = ctx.child.id.to_string();
+                                let now =
+                                    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                                if let Err(error) = self
+                                    .sql(move |db| {
+                                        db.execute(
+                                            "UPDATE threads SET worktree_path = NULL, branch = NULL, updated_at = ?2 WHERE id = ?1",
+                                            params![cid, now],
+                                        )
+                                    })
+                                    .await
+                                {
+                                    tracing::warn!(%error, child_id = %ctx.child.id, "Could not clear merged child worktree metadata");
+                                }
+                            }
+                            (r, b, p) => {
+                                let mut errs = Vec::new();
+                                if let Err(error) = r {
+                                    tracing::warn!(%error, child_id = %ctx.child.id, "Could not remove merged child worktree");
+                                    errs.push(error.to_string());
+                                }
+                                if let Err(error) = b {
+                                    tracing::warn!(%error, branch = %ctx.child_branch, "Could not delete merged child branch");
+                                    errs.push(error.to_string());
+                                }
+                                if let Err(error) = p {
+                                    tracing::warn!(%error, "Could not prune worktrees after merge");
+                                    errs.push(error.to_string());
+                                }
+                                result_summary.push_str(&format!(
+                                    " (cleanup incomplete: {})",
+                                    errs.join("; ")
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(TaskMergeResult {
+                    merged: true,
+                    child_thread_id: ctx.child.id,
+                    branch: ctx.child_branch,
+                    summary: result_summary,
+                    conflict_files: Vec::new(),
+                    cleaned_up,
+                })
+            }
+        }
+    }
+
+    async fn resolve_child_worktree(
+        &self,
+        parent_id: Uuid,
+        child_id: Uuid,
+    ) -> CoreResult<ChildWorktreeContext> {
+        let parent = self.0.store.get_thread(parent_id).await?;
+        let child = self.0.store.get_thread(child_id).await?;
+        if child.parent_thread_id != Some(parent.id) || child.project_id != parent.project_id {
+            return Err(CoreError::InvalidArgument(
+                "child thread does not belong to parent thread".into(),
+            ));
+        }
+        let parent_workspace = self.workspace(&parent).await?;
+        let child_worktree = child.worktree_path.clone().ok_or_else(|| {
+            CoreError::InvalidArgument("child thread does not have a dedicated worktree".into())
+        })?;
+        let canonical_parent = canonicalize_or_self(&parent_workspace).await;
+        let canonical_child = canonicalize_or_self(&child_worktree).await;
+        if child_worktree == parent_workspace || canonical_child == canonical_parent {
+            return Err(CoreError::InvalidArgument(
+                "child thread shares the parent workspace".into(),
+            ));
+        }
+        let child_branch = child
+            .branch
+            .clone()
+            .filter(|branch| !branch.trim().is_empty())
+            .ok_or_else(|| {
+                CoreError::InvalidArgument("child thread does not have a dedicated branch".into())
+            })?;
+        let live_parent_branch = GitManager::current_branch(&parent_workspace)
+            .await
+            .ok()
+            .flatten();
+        if parent.branch.as_ref() == Some(&child_branch)
+            || live_parent_branch.as_ref() == Some(&child_branch)
+        {
+            return Err(CoreError::InvalidArgument(
+                "child thread shares the parent branch".into(),
+            ));
+        }
+        Ok(ChildWorktreeContext {
+            parent,
+            child,
+            parent_workspace,
+            canonical_parent,
+            child_worktree,
+            child_branch,
+        })
     }
 
     pub(crate) async fn new_thread(
@@ -637,10 +855,10 @@ fn handoff_excerpt(text: &str, limit: usize) -> String {
     compact(&redact_credentials(text), limit)
 }
 
-fn redact_credentials(text: &str) -> Cow<'_, str> {
+pub(crate) fn redact_credentials(text: &str) -> Cow<'_, str> {
     let mut redacted = String::new();
     let mut cursor = 0;
-    for (start, _) in text.match_indices(['s', 'g', 'x', 'B', 't', 'e']) {
+    for (start, _) in text.match_indices(['s', 'g', 'x', 'B', 't', 'e', 'A']) {
         if start >= cursor
             && let Some(len) = credential_len(&text.as_bytes()[start..])
         {
@@ -664,6 +882,22 @@ fn credential_len(bytes: &[u8]) -> Option<usize> {
         [b'g', b'h', b'p' | b'o' | b'u', b'_', rest @ ..] => {
             (rest, 16, |b| b.is_ascii_alphanumeric())
         }
+        [
+            b'g',
+            b'i',
+            b't',
+            b'h',
+            b'u',
+            b'b',
+            b'_',
+            b'p',
+            b'a',
+            b't',
+            b'_',
+            rest @ ..,
+        ] => (rest, 16, url_safe),
+        [b'A', b'I', b'z', b'a', rest @ ..] => (rest, 16, url_safe),
+        [b'A', b'K', b'I', b'A', rest @ ..] => (rest, 16, |b| b.is_ascii_alphanumeric()),
         [
             b'x',
             b'o',
@@ -704,6 +938,35 @@ pub(crate) fn validate_title(title: &str) -> CoreResult<()> {
     } else {
         Ok(())
     }
+}
+
+struct ChildWorktreeContext {
+    parent: Thread,
+    child: Thread,
+    parent_workspace: PathBuf,
+    canonical_parent: PathBuf,
+    child_worktree: PathBuf,
+    child_branch: String,
+}
+
+async fn canonicalize_or_self(path: &Path) -> PathBuf {
+    tokio::fs::canonicalize(path)
+        .await
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn workspace_merge_lock(canonical_workspace: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static MERGE_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let locks = MERGE_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(
+        guard
+            .entry(canonical_workspace.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
 }
 
 #[async_trait]
@@ -817,6 +1080,22 @@ impl OrchestratorBackend for RunCoordinator {
         self.delegated_thread(task_id).await?;
         self.interrupt(task_id).await?;
         self.task_status(task_id).await
+    }
+
+    async fn task_diff(&self, caller_id: Uuid, child_thread_id: Uuid) -> CoreResult<DiffSummary> {
+        self.child_worktree_diff(caller_id, child_thread_id, false)
+            .await
+    }
+
+    async fn task_merge(
+        &self,
+        caller_id: Uuid,
+        child_thread_id: Uuid,
+        commit_message: Option<String>,
+        cleanup: bool,
+    ) -> CoreResult<TaskMergeResult> {
+        self.merge_child_worktree(caller_id, child_thread_id, commit_message, cleanup)
+            .await
     }
 
     async fn thread_list(
@@ -963,5 +1242,287 @@ mod tests {
             };
             assert!(handoff_item_issue(&item).unwrap().ends_with("File missing"));
         }
+    }
+
+    async fn run_git_cmd(dir: &Path, args: &[&str]) {
+        let output = tokio::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    async fn test_coordinator() -> (PathBuf, PathBuf, RunCoordinator, Project) {
+        let root = std::env::temp_dir().join(format!("t3-threads-merge-{}", Uuid::new_v4()));
+        let repo = root.join("repo");
+        let data = root.join("data");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+
+        run_git_cmd(&repo, &["init", "--initial-branch=main"]).await;
+        run_git_cmd(&repo, &["config", "user.name", "Test User"]).await;
+        run_git_cmd(&repo, &["config", "user.email", "test@example.invalid"]).await;
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        run_git_cmd(&repo, &["add", "--", "base.txt"]).await;
+        run_git_cmd(&repo, &["commit", "-m", "initial"]).await;
+
+        let cfg = ServerConfig {
+            data_dir: data,
+            default_model: ModelSelection {
+                provider: ProviderId::Mock,
+                model: "mock".into(),
+                effort: None,
+                agent: None,
+            },
+            enabled_providers: vec![ProviderId::Mock],
+            ..ServerConfig::default()
+        };
+        let store = t3_store::SqliteStore::open(cfg.db_path(), cfg.storage.clone()).unwrap();
+        let project = store
+            .create_project("Test".into(), repo.clone())
+            .await
+            .unwrap();
+        let coordinator = RunCoordinator::new(
+            cfg,
+            store,
+            McpInjectionSpec {
+                binary_path: PathBuf::from("/bin/true"),
+                server_url: "http://127.0.0.1:0".into(),
+                internal_token: "token".into(),
+                thread_id: Uuid::nil(),
+            },
+        );
+        (root, repo, coordinator, project)
+    }
+
+    #[tokio::test]
+    async fn child_worktree_diff_and_merge_enforce_safety_invariants() {
+        let (root, repo, coordinator, project) = test_coordinator().await;
+        let parent = coordinator
+            .create_thread(CreateThread {
+                project_id: project.id,
+                title: "Parent".into(),
+                model_selection: None,
+                runtime_mode: RuntimeMode::FullAccess,
+                interaction_mode: InteractionMode::Default,
+                isolation: IsolationMode::Shared,
+                base_ref: None,
+            })
+            .await
+            .unwrap();
+
+        // Shared-workspace child must be rejected by both diff and merge.
+        let shared_child = coordinator
+            .new_thread(
+                CreateThread {
+                    project_id: project.id,
+                    title: "Shared child".into(),
+                    model_selection: None,
+                    runtime_mode: RuntimeMode::FullAccess,
+                    interaction_mode: InteractionMode::Default,
+                    isolation: IsolationMode::Shared,
+                    base_ref: None,
+                },
+                Some((&parent, "delegated")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            coordinator
+                .child_worktree_diff(parent.id, shared_child.id, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            coordinator
+                .merge_child_worktree(parent.id, shared_child.id, None, true)
+                .await
+                .is_err()
+        );
+
+        // Unrelated thread (not a child of parent) must be rejected.
+        let unrelated = coordinator
+            .create_thread(CreateThread {
+                project_id: project.id,
+                title: "Unrelated".into(),
+                model_selection: None,
+                runtime_mode: RuntimeMode::FullAccess,
+                interaction_mode: InteractionMode::Default,
+                isolation: IsolationMode::Worktree,
+                base_ref: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            coordinator
+                .child_worktree_diff(parent.id, unrelated.id, false)
+                .await
+                .is_err()
+        );
+
+        // Create isolated worktree child.
+        let child = coordinator
+            .new_thread(
+                CreateThread {
+                    project_id: project.id,
+                    title: "Worker".into(),
+                    model_selection: None,
+                    runtime_mode: RuntimeMode::FullAccess,
+                    interaction_mode: InteractionMode::Default,
+                    isolation: IsolationMode::Worktree,
+                    base_ref: None,
+                },
+                Some((&parent, "delegated")),
+            )
+            .await
+            .unwrap();
+        let child_wt = child.worktree_path.clone().unwrap();
+        let child_branch = child.branch.clone().unwrap();
+        assert!(child_branch.starts_with("t3rs/"));
+
+        // Uncommitted changes in child worktree must reject merge.
+        std::fs::write(child_wt.join("worker.txt"), "hello from worker\n").unwrap();
+        let uncommitted_err = coordinator
+            .merge_child_worktree(parent.id, child.id, None, true)
+            .await
+            .unwrap_err();
+        assert!(uncommitted_err.to_string().contains("uncommitted"));
+
+        // Commit changes in child worktree.
+        run_git_cmd(&child_wt, &["add", "--", "worker.txt"]).await;
+        run_git_cmd(&child_wt, &["commit", "-m", "worker change"]).await;
+
+        // child_worktree_diff reports the committed branch diff.
+        let diff = coordinator
+            .child_worktree_diff(parent.id, child.id, false)
+            .await
+            .unwrap();
+        assert!(!diff.clean);
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(diff.files[0].path, "worker.txt");
+        assert!(diff.files[0].patch.contains("+hello from worker"));
+
+        // Plan mode parent must reject merge.
+        coordinator
+            .0
+            .store
+            .update_thread_modes(parent.id, RuntimeMode::FullAccess, InteractionMode::Plan)
+            .await
+            .unwrap();
+        let plan_err = coordinator
+            .merge_child_worktree(parent.id, child.id, None, true)
+            .await
+            .unwrap_err();
+        assert!(plan_err.to_string().contains("plan"));
+        coordinator
+            .0
+            .store
+            .update_thread_modes(parent.id, RuntimeMode::FullAccess, InteractionMode::Default)
+            .await
+            .unwrap();
+
+        // Merge with cleanup=true succeeds, merges file, removes worktree, deletes t3rs/* branch.
+        let merged = coordinator
+            .merge_child_worktree(parent.id, child.id, Some("Merge worker".into()), true)
+            .await
+            .unwrap();
+        assert!(merged.merged);
+        assert!(merged.cleaned_up);
+        assert!(merged.conflict_files.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.join("worker.txt")).unwrap(),
+            "hello from worker\n"
+        );
+        assert!(!child_wt.exists());
+        assert!(
+            !GitManager::list_branches(&repo)
+                .await
+                .unwrap()
+                .iter()
+                .any(|branch| branch == &child_branch)
+        );
+
+        // Verify per-workspace lock identity.
+        let lock_a = workspace_merge_lock(&repo);
+        let lock_b = workspace_merge_lock(&repo);
+        assert!(Arc::ptr_eq(&lock_a, &lock_b));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn merge_child_worktree_reports_conflict_and_preserves_user_merge() {
+        let (root, repo, coordinator, project) = test_coordinator().await;
+        let parent = coordinator
+            .create_thread(CreateThread {
+                project_id: project.id,
+                title: "Parent".into(),
+                model_selection: None,
+                runtime_mode: RuntimeMode::FullAccess,
+                interaction_mode: InteractionMode::Default,
+                isolation: IsolationMode::Shared,
+                base_ref: None,
+            })
+            .await
+            .unwrap();
+        let child = coordinator
+            .new_thread(
+                CreateThread {
+                    project_id: project.id,
+                    title: "Conflicting worker".into(),
+                    model_selection: None,
+                    runtime_mode: RuntimeMode::FullAccess,
+                    interaction_mode: InteractionMode::Default,
+                    isolation: IsolationMode::Worktree,
+                    base_ref: None,
+                },
+                Some((&parent, "delegated")),
+            )
+            .await
+            .unwrap();
+        let child_wt = child.worktree_path.clone().unwrap();
+
+        std::fs::write(child_wt.join("base.txt"), "child edit\n").unwrap();
+        run_git_cmd(&child_wt, &["commit", "-am", "child edit"]).await;
+
+        std::fs::write(repo.join("base.txt"), "parent edit\n").unwrap();
+        run_git_cmd(&repo, &["commit", "-am", "parent edit"]).await;
+
+        // Conflicting merge returns merged=false with conflict_files, does not clean up.
+        let result = coordinator
+            .merge_child_worktree(parent.id, child.id, None, true)
+            .await
+            .unwrap();
+        assert!(!result.merged);
+        assert!(!result.cleaned_up);
+        assert_eq!(result.conflict_files, vec!["base.txt".to_owned()]);
+        assert!(child_wt.exists());
+        assert!(!GitManager::has_merge_in_progress(&repo).await.unwrap());
+
+        // Start a user merge in parent repo and ensure merge_child_worktree rejects without aborting it.
+        let manual = tokio::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["merge", "--no-edit", child.branch.as_deref().unwrap()])
+            .output()
+            .await
+            .unwrap();
+        assert!(!manual.status.success());
+        assert!(GitManager::has_merge_in_progress(&repo).await.unwrap());
+
+        let err = coordinator
+            .merge_child_worktree(parent.id, child.id, None, true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("merge in progress"));
+        assert!(GitManager::has_merge_in_progress(&repo).await.unwrap());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

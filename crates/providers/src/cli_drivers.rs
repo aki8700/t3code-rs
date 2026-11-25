@@ -60,7 +60,7 @@ impl Cli {
         provider: ProviderId,
         mut req: TurnRequest,
         tx: mpsc::UnboundedSender<StreamEvent>,
-        build: fn(&mut Command, &TurnRequest) -> Input,
+        build: impl FnOnce(&mut Command, &TurnRequest) -> Input,
     ) -> CoreResult<()> {
         req.workspace_dir = std::path::absolute(&req.workspace_dir)
             .map_err(|err| CoreError::InvalidArgument(format!("CLI workspace: {err}")))?;
@@ -134,14 +134,83 @@ macro_rules! cli_driver {
 
 cli_driver!(ClaudeDriver, Claude, claude_args, true);
 cli_driver!(CodexDriver, Codex, codex_args, true);
-cli_driver!(AntigravityDriver, Antigravity, antigravity_args, false);
 cli_driver!(OpenCodeDriver, OpenCode, opencode_args, true);
 
+/// Local CLI driver for Antigravity.
+#[derive(Clone)]
+pub struct AntigravityDriver {
+    cli: Cli,
+    mcp_enabled: bool,
+}
+
 impl AntigravityDriver {
+    pub fn new(binary: impl Into<PathBuf>) -> Self {
+        Self {
+            cli: Cli::new(binary.into()),
+            mcp_enabled: false,
+        }
+    }
+
     pub fn with_data_dir(binary: impl Into<PathBuf>, data_dir: impl Into<PathBuf>) -> Self {
         let mut driver = Self::new(binary);
-        driver.0.data_dir = Some(data_dir.into());
+        driver.cli.data_dir = Some(data_dir.into());
         driver
+    }
+
+    pub fn with_mcp(mut self, enabled: bool) -> Self {
+        self.mcp_enabled = enabled;
+        self
+    }
+
+    #[cfg(test)]
+    fn build_command(&self, req: &TurnRequest) -> (Command, Input) {
+        let mut cmd = self.cli.command();
+        let input = antigravity_args(&mut cmd, req, self.mcp_enabled);
+        (cmd, input)
+    }
+}
+
+#[async_trait]
+impl ProviderDriver for AntigravityDriver {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::Antigravity
+    }
+
+    fn supports_mcp(&self) -> bool {
+        self.mcp_enabled
+    }
+
+    async fn health_check(&self) -> ProviderHealth {
+        self.cli.health(self.provider_id()).await
+    }
+
+    async fn run_turn(
+        &self,
+        req: TurnRequest,
+        tx: mpsc::UnboundedSender<StreamEvent>,
+    ) -> CoreResult<()> {
+        let mcp_enabled = self.mcp_enabled;
+        self.cli
+            .run(self.provider_id(), req, tx, |cmd, req| {
+                antigravity_args(cmd, req, mcp_enabled)
+            })
+            .await
+    }
+
+    async fn send_steer(&self, run_id: Uuid, message: String) -> CoreResult<bool> {
+        Ok(process::send_steer(&self.cli.active, run_id, message))
+    }
+
+    async fn respond_request(&self, run_id: Uuid, resp: PendingResponse) -> CoreResult<bool> {
+        Ok(process::send_control_response(
+            &self.cli.active,
+            run_id,
+            &resp,
+        ))
+    }
+
+    async fn interrupt(&self, run_id: Uuid) -> CoreResult<()> {
+        process::interrupt(&self.cli.active, run_id).await
     }
 }
 
@@ -240,7 +309,7 @@ fn codex_args(cmd: &mut Command, req: &TurnRequest) -> Input {
     Input::Text(prompt_with_paths(req, true))
 }
 
-fn antigravity_args(cmd: &mut Command, req: &TurnRequest) -> Input {
+fn antigravity_args(cmd: &mut Command, req: &TurnRequest, mcp_enabled: bool) -> Input {
     cmd.args(["--output-format", "stream-json"]);
     model_effort_args(cmd, req);
     match (req.interaction_mode, req.runtime_mode) {
@@ -253,6 +322,13 @@ fn antigravity_args(cmd: &mut Command, req: &TurnRequest) -> Input {
     };
     if let Some(session) = &req.resume_session_id {
         cmd.args(["--conversation", session]);
+    }
+    if mcp_enabled && let Some(spec) = &req.mcp_injection {
+        cmd.env("T3_SERVER_URL", &spec.server_url);
+        cmd.env("T3_THREAD_ID", spec.thread_id.to_string());
+        if !spec.internal_token.is_empty() {
+            cmd.env("T3_MCP_TOKEN", &spec.internal_token);
+        }
     }
     cmd.arg("--print").arg(prompt_with_paths(req, false));
     Input::None
@@ -536,8 +612,7 @@ mod tests {
                     assert_eq!(&codex[..4], ["exec", "-s", "read-only", "resume"]);
                 }
 
-                let mut cmd = AntigravityDriver::new("agy").0.command();
-                antigravity_args(&mut cmd, &req);
+                let (cmd, _) = AntigravityDriver::new("agy").build_command(&req);
                 let agy = args(&cmd);
                 let permissions: Vec<_> = agy
                     .iter()
@@ -572,10 +647,9 @@ mod tests {
     async fn antigravity_uses_standalone_streaming_and_isolated_data_dir() {
         let mut req = request(ProviderId::Antigravity);
         req.runtime_mode = RuntimeMode::AutoAcceptEdits;
-        let mut cmd = AntigravityDriver::with_data_dir("/opt/homebrew/bin/agy", "/isolated state")
-            .0
-            .command();
-        assert!(matches!(antigravity_args(&mut cmd, &req), Input::None));
+        let driver = AntigravityDriver::with_data_dir("/opt/homebrew/bin/agy", "/isolated state");
+        let (cmd, input) = driver.build_command(&req);
+        assert!(matches!(input, Input::None));
         assert_eq!(cmd.as_std().get_program(), "/opt/homebrew/bin/agy");
         assert_eq!(
             args(&cmd),
@@ -644,6 +718,83 @@ mod tests {
         assert!(CodexDriver::new("codex").supports_mcp());
         assert!(OpenCodeDriver::new("opencode").supports_mcp());
         assert!(!AntigravityDriver::new("agy").supports_mcp());
+        assert!(AntigravityDriver::new("agy").with_mcp(true).supports_mcp());
+        assert!(
+            !AntigravityDriver::new("agy")
+                .with_mcp(true)
+                .with_mcp(false)
+                .supports_mcp()
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_mcp_env_injection_enabled_and_disabled_without_disk_writes() {
+        let data_dir = std::env::temp_dir().join(format!("t3-agy-mcp-test-{}", Uuid::new_v4()));
+        let req = request(ProviderId::Antigravity);
+        let expected_thread_id = req.mcp_injection.as_ref().unwrap().thread_id.to_string();
+
+        // Disabled by default: never injects T3_SERVER_URL / T3_THREAD_ID / T3_MCP_TOKEN.
+        let disabled = AntigravityDriver::with_data_dir("agy", &data_dir);
+        assert!(!disabled.supports_mcp());
+        let (disabled_cmd, input) = disabled.build_command(&req);
+        assert!(matches!(input, Input::None));
+        assert!(
+            args(&disabled_cmd)
+                .iter()
+                .all(|arg| !arg.contains("fixture-token"))
+        );
+        assert!(
+            disabled_cmd
+                .as_std()
+                .get_envs()
+                .all(|(key, _)| key != "T3_SERVER_URL" && key != "T3_THREAD_ID")
+        );
+        assert!(
+            disabled_cmd
+                .as_std()
+                .get_envs()
+                .any(|(key, value)| key == "T3_MCP_TOKEN" && value.is_none())
+        );
+
+        // Enabled: injects per-run env vars ONLY, never in args and never written to disk.
+        let enabled = AntigravityDriver::with_data_dir("agy", &data_dir).with_mcp(true);
+        assert!(enabled.supports_mcp());
+        let (enabled_cmd, input) = enabled.build_command(&req);
+        assert!(matches!(input, Input::None));
+        assert!(
+            args(&enabled_cmd)
+                .iter()
+                .all(|arg| !arg.contains("fixture-token"))
+        );
+        assert_token_env(&enabled_cmd);
+        assert!(enabled_cmd.as_std().get_envs().any(|(key, value)| {
+            key == "T3_SERVER_URL" && value.is_some_and(|val| val == "http://127.0.0.1:3780")
+        }));
+        assert!(enabled_cmd.as_std().get_envs().any(|(key, value)| {
+            key == "T3_THREAD_ID" && value.is_some_and(|val| val == expected_thread_id.as_str())
+        }));
+
+        // Enabled with empty token: sets URL/thread ID but omits T3_MCP_TOKEN.
+        let mut no_tok_req = request(ProviderId::Antigravity);
+        no_tok_req
+            .mcp_injection
+            .as_mut()
+            .unwrap()
+            .internal_token
+            .clear();
+        let (no_tok_cmd, _) = enabled.build_command(&no_tok_req);
+        assert!(
+            no_tok_cmd
+                .as_std()
+                .get_envs()
+                .any(|(key, value)| key == "T3_MCP_TOKEN" && value.is_none())
+        );
+        assert!(no_tok_cmd.as_std().get_envs().any(|(key, value)| {
+            key == "T3_SERVER_URL" && value.is_some_and(|val| val == "http://127.0.0.1:3780")
+        }));
+
+        // Zero token or config written to disk.
+        assert!(!data_dir.exists());
     }
 
     #[tokio::test]
@@ -692,14 +843,18 @@ mod tests {
         let plain_req = test_request(ProviderId::OpenCode);
         let mut plain_cmd = OpenCodeDriver::new("opencode").0.command();
         opencode_args(&mut plain_cmd, &plain_req);
-        assert!(plain_cmd
-            .as_std()
-            .get_envs()
-            .any(|(key, value)| key == "T3_MCP_TOKEN" && value.is_none()));
-        assert!(plain_cmd
-            .as_std()
-            .get_envs()
-            .all(|(key, _)| key != "OPENCODE_CONFIG_CONTENT"));
+        assert!(
+            plain_cmd
+                .as_std()
+                .get_envs()
+                .any(|(key, value)| key == "T3_MCP_TOKEN" && value.is_none())
+        );
+        assert!(
+            plain_cmd
+                .as_std()
+                .get_envs()
+                .all(|(key, _)| key != "OPENCODE_CONFIG_CONTENT")
+        );
     }
 
     #[tokio::test]
@@ -707,7 +862,7 @@ mod tests {
         for cli in [
             ClaudeDriver::new("claude").0,
             CodexDriver::new("codex").0,
-            AntigravityDriver::new("agy").0,
+            AntigravityDriver::new("agy").cli,
             OpenCodeDriver::new("opencode").0,
         ] {
             let command = cli.command();

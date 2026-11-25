@@ -3246,6 +3246,7 @@ dependencies = [
  "subtle",
  "t3-core",
  "t3-git",
+ "t3-maki",
  "t3-mcp",
  "t3-providers",
  "t3-store",

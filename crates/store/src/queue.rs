@@ -9,6 +9,12 @@ pub struct QueuedRunInput {
     pub wake_depth: u8,
     #[serde(default)]
     pub mode_ceiling: Option<(RuntimeMode, InteractionMode)>,
+    #[serde(default)]
+    pub verify_fix_depth: u8,
+    #[serde(default)]
+    pub last_verify_signature: Option<String>,
+    #[serde(default)]
+    pub fallback_attempts: u8,
 }
 
 pub struct QueuedRun {

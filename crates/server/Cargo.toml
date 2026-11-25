@@ -23,6 +23,7 @@ serde_json.workspace = true
 subtle = "2.6"
 t3-core.workspace = true
 t3-git.workspace = true
+t3-maki.workspace = true
 t3-mcp.workspace = true
 t3-providers.workspace = true
 t3-store.workspace = true

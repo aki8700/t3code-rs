@@ -208,11 +208,7 @@ fn checked_pid(pid: u32) -> io::Result<libc::pid_t> {
 }
 
 #[cfg(unix)]
-fn classify_group_signal_error(
-    pid: libc::pid_t,
-    signal: i32,
-    error: io::Error,
-) -> io::Result<()> {
+fn classify_group_signal_error(pid: libc::pid_t, signal: i32, error: io::Error) -> io::Result<()> {
     match error.raw_os_error() {
         Some(libc::ESRCH) => Ok(()),
         Some(libc::EPERM) if signal != 0 => {
@@ -327,12 +323,12 @@ pub(crate) fn send_control_response(
     run_id: Uuid,
     resp: &PendingResponse,
 ) -> bool {
-    let Some(request) = active
-        .lock()
-        .unwrap()
-        .get(&run_id)
-        .and_then(|run| run.control_requests.lock().unwrap().remove(&resp.request_id))
-    else {
+    let Some(request) = active.lock().unwrap().get(&run_id).and_then(|run| {
+        run.control_requests
+            .lock()
+            .unwrap()
+            .remove(&resp.request_id)
+    }) else {
         return false;
     };
     let response = if resp.approved {
@@ -1400,7 +1396,9 @@ wait
         }
         assert_eq!(
             failed_message.as_deref(),
-            Some("tool call repetition loop detected — terminated runaway provider process to save tokens/battery")
+            Some(
+                "tool call repetition loop detected — terminated runaway provider process to save tokens/battery"
+            )
         );
         assert!(!driver.send_steer(id, "late".into()).await.unwrap());
     }
@@ -1458,7 +1456,7 @@ wait
             r#"
 printf '{"type":"system","session_id":"active-stream"}\n'
 for i in 1 2 3 4 5; do
-    /bin/sleep 0.1
+    /bin/sleep 0.15
     printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"tick "}}}\n'
 done
 printf '{"type":"result","subtype":"success","result":"done"}\n'
@@ -1478,7 +1476,7 @@ printf '{"type":"result","subtype":"success","result":"done"}\n'
                 Input::None,
                 None,
                 tx,
-                Duration::from_millis(300),
+                Duration::from_millis(600),
             ),
         )
         .await

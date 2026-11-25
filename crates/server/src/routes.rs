@@ -26,6 +26,7 @@ use uuid::Uuid;
 pub fn router(state: ServerState) -> Router {
     let api = Router::new()
         .route("/api/meta", get(meta))
+        .route("/api/monitor", get(monitor))
         .route("/api/providers", get(providers))
         .route("/api/projects", get(projects).post(create_project))
         .route(
@@ -33,6 +34,7 @@ pub fn router(state: ServerState) -> Router {
             axum::routing::patch(patch_project).delete(delete_project),
         )
         .route("/api/projects/{id}/exec", post(project_exec))
+        .route("/api/projects/{id}/exec/stream", post(project_exec_stream))
         .route(
             "/api/projects/{id}/workspace-meta",
             get(project_workspace_meta),
@@ -41,6 +43,8 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/threads/{id}", get(thread_detail).patch(patch_thread))
         .route("/api/threads/{id}/messages", post(send_message))
         .route("/api/threads/{id}/exec", post(thread_exec))
+        .route("/api/threads/{id}/exec/stream", post(thread_exec_stream))
+        .route("/api/exec/{exec_id}/cancel", post(cancel_exec))
         .route("/api/threads/{id}/interrupt", post(interrupt))
         .route("/api/threads/{id}/queue", get(thread_queue))
         .route(
@@ -57,6 +61,14 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/threads/{id}/fork", post(fork_thread))
         .route("/api/threads/{id}/respond", post(respond))
         .route("/api/threads/{id}/diff", get(diff))
+        .route(
+            "/api/threads/{id}/children/{child_id}/diff",
+            get(child_worktree_diff),
+        )
+        .route(
+            "/api/threads/{id}/children/{child_id}/merge",
+            post(merge_child_worktree),
+        )
         .route("/api/threads/{id}/delegate", post(delegate))
         .route("/api/threads/{id}/swarm", get(swarm_board))
         .route("/api/threads/{id}/swarm/messages", post(swarm_message))
@@ -154,6 +166,17 @@ async fn meta(
         "privacy": audit_privacy(&state.config), "follow_up_behavior": state.config.follow_up_behavior,
         "default_model": state.config.default_model,
     }))
+}
+
+async fn monitor(
+    State(state): State<ServerState>,
+) -> ApiResult<Json<crate::coordinator::MonitorSnapshot>> {
+    Ok(Json(
+        state
+            .coordinator
+            .monitor_snapshot(state.shells.active_count())
+            .await?,
+    ))
 }
 
 async fn providers(State(state): State<ServerState>) -> Json<Vec<ProviderHealth>> {
@@ -367,8 +390,10 @@ async fn build_thread_context(
     runs: &[Run],
     breakdown: &[crate::coordinator::ItemBreakdown],
 ) -> Value {
-    let context_window =
-        t3_providers::context_window_for(thread.model_selection.provider, &thread.model_selection.model);
+    let context_window = t3_providers::context_window_for(
+        thread.model_selection.provider,
+        &thread.model_selection.model,
+    );
     let total_input_tokens: u64 = runs.iter().filter_map(|r| r.input_tokens).sum();
     let total_output_tokens: u64 = runs.iter().filter_map(|r| r.output_tokens).sum();
     let total_duration_ms: u64 = runs.iter().filter_map(|r| r.duration_ms).sum();
@@ -494,6 +519,54 @@ async fn build_thread_context(
         0.0
     };
 
+    let utilization_pct = if context_window > 0 {
+        ((used_tokens as f64 / context_window as f64) * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+    let compaction = if used_tokens >= 8_000 {
+        let [input_rate, output_rate, cache_read_rate, cache_write_rate] =
+            crate::usage::model_rates_per_million(
+                thread.model_selection.provider,
+                &thread.model_selection.model,
+            )
+            .unwrap_or([3.0, 15.0, 0.30, 3.75]);
+        let prefix = (used_tokens * 15) / 100;
+        let tail = (used_tokens * 20) / 100;
+        let replaced = used_tokens.saturating_sub(prefix + tail);
+        let summary = (replaced / 8).clamp(800, 4_000);
+        let econ = t3_maki::compaction_econ(t3_maki::CompactionEconInput {
+            prefix,
+            replaced,
+            summary,
+            tail,
+            instruction: 600,
+            summarizer_reuses_prefix: true,
+            prices: t3_maki::Prices {
+                input: input_rate / 1_000_000.0,
+                output: output_rate / 1_000_000.0,
+                cache_read: cache_read_rate / 1_000_000.0,
+                cache_write: cache_write_rate / 1_000_000.0,
+            },
+            remaining_turns: Some(6.0),
+        });
+        let recommended = utilization_pct >= 80.0 && econ.worth_compacting == Some(true);
+        json!({
+            "utilization_pct": utilization_pct,
+            "one_time_cost": econ.one_time_cost,
+            "saving_per_turn": econ.saving_per_turn,
+            "break_even_turns": econ.break_even_turns,
+            "worth_compacting": econ.worth_compacting,
+            "recommended": recommended,
+        })
+    } else {
+        json!({
+            "utilization_pct": utilization_pct,
+            "worth_compacting": false,
+            "recommended": false,
+        })
+    };
+
     json!({
         "context_window": context_window,
         "used_tokens": used_tokens,
@@ -509,6 +582,7 @@ async fn build_thread_context(
         "items_breakdown": breakdown,
         "run_costs": run_costs,
         "estimated_cost_usd": estimated_cost_usd,
+        "compaction": compaction,
     })
 }
 
@@ -569,12 +643,44 @@ async fn thread_exec(
     Ok(Json(crate::shell::exec_in_thread(&state, id, req).await?))
 }
 
+async fn thread_exec_stream(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<crate::shell::ShellExecRequest>,
+) -> ApiResult<Json<crate::shell::ShellStreamStart>> {
+    let shells = state.shells.clone();
+    Ok(Json(
+        crate::shell::exec_in_thread_streaming(state, shells, id, req).await?,
+    ))
+}
+
 async fn project_exec(
     State(state): State<ServerState>,
     Path(id): Path<Uuid>,
     Json(req): Json<crate::shell::ShellExecRequest>,
 ) -> ApiResult<Json<crate::shell::ShellExecOutput>> {
     Ok(Json(crate::shell::exec_in_project(&state, id, req).await?))
+}
+
+async fn project_exec_stream(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<crate::shell::ShellExecRequest>,
+) -> ApiResult<Json<crate::shell::ShellStreamStart>> {
+    let shells = state.shells.clone();
+    Ok(Json(
+        crate::shell::exec_in_project_streaming(state, shells, id, req).await?,
+    ))
+}
+
+async fn cancel_exec(
+    State(state): State<ServerState>,
+    Path(exec_id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    if !state.shells.cancel(exec_id) {
+        return Err(CoreError::NotFound("active shell execution".into()).into());
+    }
+    Ok(Json(json!({"cancelled": true, "exec_id": exec_id})))
 }
 
 async fn interrupt(
@@ -679,6 +785,44 @@ async fn diff(
         state
             .coordinator
             .diff(id, query.ignore_whitespace.unwrap_or(true))
+            .await?,
+    ))
+}
+
+async fn child_worktree_diff(
+    State(state): State<ServerState>,
+    Path((id, child_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<DiffQuery>,
+) -> ApiResult<Json<DiffSummary>> {
+    Ok(Json(
+        state
+            .coordinator
+            .child_worktree_diff(id, child_id, query.ignore_whitespace.unwrap_or(true))
+            .await?,
+    ))
+}
+
+#[derive(Deserialize, Default)]
+struct MergeChildRequest {
+    commit_message: Option<String>,
+    cleanup: Option<bool>,
+}
+
+async fn merge_child_worktree(
+    State(state): State<ServerState>,
+    Path((id, child_id)): Path<(Uuid, Uuid)>,
+    body: Option<Json<MergeChildRequest>>,
+) -> ApiResult<Json<t3_mcp::TaskMergeResult>> {
+    let input = body.map(|Json(v)| v).unwrap_or_default();
+    Ok(Json(
+        state
+            .coordinator
+            .merge_child_worktree(
+                id,
+                child_id,
+                input.commit_message,
+                input.cleanup.unwrap_or(true),
+            )
             .await?,
     ))
 }

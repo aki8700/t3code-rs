@@ -403,11 +403,7 @@ mod tests {
                 &Value::Null
             ));
         }
-        assert!(!watchdog.push(
-            TurnItemKind::FileChange,
-            Some("src/lib.rs"),
-            &Value::Null
-        ));
+        assert!(!watchdog.push(TurnItemKind::FileChange, Some("src/lib.rs"), &Value::Null));
         assert!(!watchdog.push(
             TurnItemKind::CommandExecution,
             Some("cargo check"),

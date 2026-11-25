@@ -86,10 +86,7 @@ pub async fn usage_limits(
     send_json(req).await
 }
 
-fn with_bearer_auth(
-    req: reqwest::RequestBuilder,
-    token: Option<&str>,
-) -> reqwest::RequestBuilder {
+fn with_bearer_auth(req: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
     match resolve_token(token, env::var(BEARER_TOKEN_ENV).ok().as_deref()) {
         Some(token) => req.bearer_auth(token),
         None => req,
@@ -447,9 +444,7 @@ mod tests {
             "http://127.0.0.1:3774/api/threads/00000000-0000-0000-0000-000000000000/messages"
         );
         assert_eq!(
-            interrupt_url("http://127.0.0.1:3774", id)
-                .unwrap()
-                .as_str(),
+            interrupt_url("http://127.0.0.1:3774", id).unwrap().as_str(),
             "http://127.0.0.1:3774/api/threads/00000000-0000-0000-0000-000000000000/interrupt"
         );
         assert_eq!(

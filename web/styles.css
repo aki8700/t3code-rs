@@ -1402,3 +1402,49 @@ body.resizing-rail { cursor: col-resize !important; user-select: none; -webkit-u
   *, *::before, *::after { animation: none !important; transition: none !important; }
   .shimmer { color: var(--text-muted); }
 }
+
+/* ───────────────────────── Tier 4 Wave B: ライブシェル・Worktree マージ・稼働モニター・コンパクション推奨 ───────────────────────── */
+
+/* ライブシェル出力カード（#timeline 末尾 / #approval 直下） */
+.shell-live { margin: 12px 0; border: 1px solid var(--border); border-radius: 11px; background: var(--surface); overflow: hidden; }
+.shell-live-head { display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.shell-live-head .iw { flex: none; }
+.shell-live-cmd { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font: 12px/1.5 var(--mono); }
+.shell-live-status { display: inline-flex; align-items: center; gap: 6px; flex: none; font-size: 11.5px; color: var(--text-muted); }
+.shell-live-cwd { padding: 6px 10px 0; font-size: 11px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.shell-live-out { max-height: 260px; margin: 8px 10px 10px; padding: 9px 11px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--code-bg); font: 11.5px/1.6 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.shell-live-out:empty { display: none; }
+.shell-live-out .sh-err { color: var(--warning); background: color-mix(in srgb, var(--warning) 9%, transparent); }
+.shell-live.done { border-color: color-mix(in srgb, var(--text) 12%, var(--border)); }
+.shell-live.done .shell-live-status { gap: 5px; }
+
+/* 子スレッド一覧ポップオーバーの Worktree 行 */
+.popover.kids-pop { width: 480px; }
+.kid-row { display: flex; align-items: center; gap: 4px; padding: 0 2px; }
+.kid-row .menu-item { flex: 1; min-width: 0; }
+.kid-row .menu-item > span.t { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.kid-acts { display: flex; align-items: center; gap: 4px; flex: none; }
+.merge-ctl { display: inline-flex; align-items: center; gap: 4px; }
+.merge-q { font-size: 11.5px; color: var(--warning); white-space: nowrap; }
+
+/* 親との差分バナー（#diff-panel 上部） */
+.dp-parent-banner { display: flex; align-items: center; gap: 8px; margin: 10px 12px 0; padding: 8px 10px; border-radius: 8px; border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); background: color-mix(in srgb, var(--accent) 10%, transparent); font-size: 12px; }
+.dp-parent-banner .iw { flex: none; }
+.dp-parent-label { font-weight: 600; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+/* コンパクション推奨カード */
+.ctx-compact-card { gap: 8px; }
+.ctx-compact-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--text-muted); }
+.ctx-compact-meta span:first-child { font-weight: 600; color: var(--text); }
+.ctx-wt-row { font-size: 12px; overflow-wrap: anywhere; }
+
+/* 稼働モニターダイアログ */
+.mon-head { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+.mon-card { gap: 0; padding: 4px 0; }
+.mon-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; }
+.mon-row + .mon-row { border-top: 1px solid var(--border); }
+.mon-main { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.mon-title { font-size: 12.5px; font-weight: 600; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.mon-sub { font-size: 11.5px; color: var(--text-muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.mon-acts { display: flex; gap: 6px; flex: none; }
+.mon-empty { padding: 10px 12px; font-size: 12px; }

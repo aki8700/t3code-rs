@@ -6,14 +6,19 @@ use t3_core::{
 use tokio::sync::mpsc;
 
 /// Longest rate-limit wait worth sleeping through; anything longer is treated as a hard stop.
-const MAX_RETRY_AFTER_SECS: u64 = 120;
+pub const MAX_RETRY_AFTER_SECS: u64 = 120;
 
 /// Account-level exhaustion (weekly or plan quota) cannot be cleared by waiting a few minutes.
-fn is_quota_exhausted(message: &str) -> bool {
+pub fn is_quota_exhausted(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     ["weekly", "usage limit", "hit your limit", "quota"]
         .iter()
         .any(|needle| message.contains(needle))
+}
+
+/// Returns true when a rate-limit event should not be retried on the same model.
+pub fn is_hard_rate_limit(retry_after_secs: u64, message: &str) -> bool {
+    retry_after_secs > MAX_RETRY_AFTER_SECS || is_quota_exhausted(message)
 }
 
 /// Stream each attempt and resume the latest provider session after rate limiting.
@@ -45,8 +50,7 @@ pub async fn run_turn_with_retry(
                     retry_after_secs,
                     message,
                 } => {
-                    hard_limit |=
-                        *retry_after_secs > MAX_RETRY_AFTER_SECS || is_quota_exhausted(message);
+                    hard_limit |= is_hard_rate_limit(*retry_after_secs, message);
                     retry_after = Some(
                         retry_after.map_or(*retry_after_secs, |secs| secs.max(*retry_after_secs)),
                     );
@@ -269,6 +273,24 @@ mod tests {
     fn quota_detection_is_case_insensitive() {
         assert!(is_quota_exhausted("WEEKLY cap"));
         assert!(is_quota_exhausted("Usage Limit"));
+        assert!(is_quota_exhausted("You've HIT YOUR LIMIT"));
+        assert!(is_quota_exhausted("Account QUOTA exceeded"));
         assert!(!is_quota_exhausted("rate limited, retry shortly"));
+    }
+
+    #[test]
+    fn hard_rate_limit_triggers_on_long_wait_or_quota_exhaustion() {
+        assert!(!is_hard_rate_limit(0, "temporary rate limit"));
+        assert!(!is_hard_rate_limit(
+            MAX_RETRY_AFTER_SECS,
+            "temporary rate limit"
+        ));
+        assert!(is_hard_rate_limit(
+            MAX_RETRY_AFTER_SECS + 1,
+            "temporary rate limit"
+        ));
+        assert!(is_hard_rate_limit(0, "Weekly usage limit reached"));
+        assert!(is_hard_rate_limit(15, "You've hit your limit"));
+        assert!(is_hard_rate_limit(30, "Quota exceeded"));
     }
 }

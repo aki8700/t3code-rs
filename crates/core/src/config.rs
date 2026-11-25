@@ -93,6 +93,10 @@ impl Default for StorageConfig {
     }
 }
 
+fn default_verify_max_auto_fixes() -> u32 {
+    2
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub host: String,
@@ -110,6 +114,15 @@ pub struct ServerConfig {
     /// Opt-in direct Antigravity Cloud Code quota query (`retrieveUserQuotaSummary`).
     #[serde(default)]
     pub antigravity_quota_probe: bool,
+    /// Ordered fallback models to try after a hard rate limit or quota exhaustion.
+    #[serde(default)]
+    pub fallback_models: Vec<ModelSelection>,
+    /// Maximum automatic fix attempts when a project's verify command fails.
+    #[serde(default = "default_verify_max_auto_fixes")]
+    pub verify_max_auto_fixes: u32,
+    /// Opt-in per-run env injection for a pre-registered Antigravity (`agy`) MCP entry.
+    #[serde(default)]
+    pub antigravity_mcp_enabled: bool,
 }
 
 impl Default for ServerConfig {
@@ -137,6 +150,9 @@ impl Default for ServerConfig {
                 ProviderId::OpenCode,
             ],
             antigravity_quota_probe: false,
+            fallback_models: Vec::new(),
+            verify_max_auto_fixes: default_verify_max_auto_fixes(),
+            antigravity_mcp_enabled: false,
         }
     }
 }
@@ -368,5 +384,24 @@ mod tests {
             };
             assert_eq!(cfg.validate().is_ok(), allowed, "{url}");
         }
+    }
+
+    #[test]
+    fn omitted_tier4_fields_deserialize_to_defaults() {
+        let mut json = serde_json::to_value(ServerConfig::default()).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("fallback_models");
+        obj.remove("verify_max_auto_fixes");
+        obj.remove("antigravity_mcp_enabled");
+
+        let parsed: ServerConfig = serde_json::from_value(json).unwrap();
+        assert!(parsed.fallback_models.is_empty());
+        assert_eq!(parsed.verify_max_auto_fixes, 2);
+        assert!(!parsed.antigravity_mcp_enabled);
+
+        let defaults = ServerConfig::default();
+        assert!(defaults.fallback_models.is_empty());
+        assert_eq!(defaults.verify_max_auto_fixes, 2);
+        assert!(!defaults.antigravity_mcp_enabled);
     }
 }

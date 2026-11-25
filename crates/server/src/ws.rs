@@ -74,6 +74,10 @@ async fn run(mut socket: WebSocket, coordinator: RunCoordinator, identity: AuthI
                             | WsServerMessage::RunUsageUpdated { thread_id, .. } => {
                                 subscriptions.contains(thread_id)
                             }
+                            WsServerMessage::ShellOutput { thread_id, .. }
+                            | WsServerMessage::ShellFinished { thread_id, .. } => {
+                                thread_id.is_none_or(|tid| subscriptions.contains(&tid))
+                            }
                             WsServerMessage::SwarmUpdated { board, .. } => board.members.iter().any(|member| subscriptions.contains(&member.thread_id)),
                             _ => true,
                         };

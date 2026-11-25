@@ -11,7 +11,9 @@ mod watchdog;
 pub use catalog::context_window_for;
 pub use cli_drivers::{AntigravityDriver, ClaudeDriver, CodexDriver, OpenCodeDriver};
 pub use mock::MockDriver;
-pub use retry::run_turn_with_retry;
+pub use retry::{
+    MAX_RETRY_AFTER_SECS, is_hard_rate_limit, is_quota_exhausted, run_turn_with_retry,
+};
 
 use std::{collections::HashMap, sync::Arc};
 use t3_core::{
@@ -43,10 +45,13 @@ impl ProviderRegistry {
                     ProviderId::Codex => {
                         Arc::new(CodexDriver::new(cfg.providers.codex_bin.clone()))
                     }
-                    ProviderId::Antigravity => Arc::new(AntigravityDriver::with_data_dir(
-                        cfg.providers.antigravity_bin.clone(),
-                        cfg.antigravity_dir(),
-                    )),
+                    ProviderId::Antigravity => Arc::new(
+                        AntigravityDriver::with_data_dir(
+                            cfg.providers.antigravity_bin.clone(),
+                            cfg.antigravity_dir(),
+                        )
+                        .with_mcp(cfg.antigravity_mcp_enabled),
+                    ),
                     ProviderId::OpenCode => {
                         Arc::new(OpenCodeDriver::new(cfg.providers.opencode_bin.clone()))
                     }

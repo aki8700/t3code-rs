@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format, Lint, Test & Asset Checks
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting (rustfmt)
+        run: cargo fmt --all -- --check
+
+      - name: Clippy lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Setup Node.js (for ESM syntax check)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check frontend JavaScript syntax
+        run: |
+          for f in web/*.js web/js/*.js; do
+            echo "Checking $f"
+            node --check "$f"
+          done
+
+      - name: Verify Info.plist version matches Cargo.toml
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          import re
+          import tomllib
+          from pathlib import Path
+
+          cargo = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))
+          cargo_version = (
+              cargo.get("workspace", {}).get("package", {}).get("version")
+              or cargo.get("package", {}).get("version")
+          )
+          if not cargo_version:
+              raise SystemExit("Could not find version in Cargo.toml")
+
+          checked = 0
+
+          build_script = Path("scripts/build-macos-app.sh")
+          if build_script.exists():
+              script_text = build_script.read_text(encoding="utf-8")
+              match = re.search(r"<\?xml.*?</plist>", script_text, flags=re.DOTALL)
+              if not match:
+                  raise SystemExit("Could not locate embedded Info.plist in scripts/build-macos-app.sh")
+              plist = plistlib.loads(match.group(0).encode("utf-8"))
+              for key in ("CFBundleVersion", "CFBundleShortVersionString"):
+                  val = plist.get(key)
+                  if val != cargo_version:
+                      raise SystemExit(
+                          f"Version mismatch in scripts/build-macos-app.sh Info.plist: "
+                          f"{key}={val!r} != Cargo.toml version {cargo_version!r}"
+                      )
+              checked += 1
+
+          for plist_path in sorted(Path(".").rglob("Info.plist")):
+              if any(part in {"target", "dist", ".git"} for part in plist_path.parts):
+                  continue
+              plist = plistlib.loads(plist_path.read_bytes())
+              for key in ("CFBundleVersion", "CFBundleShortVersionString"):
+                  val = plist.get(key)
+                  if val != cargo_version:
+                      raise SystemExit(
+                          f"Version mismatch in {plist_path}: "
+                          f"{key}={val!r} != Cargo.toml version {cargo_version!r}"
+                      )
+              checked += 1
+
+          if checked == 0:
+              raise SystemExit("No Info.plist found to verify against Cargo.toml")
+
+          print(f"Verified {checked} Info.plist definition(s) match Cargo.toml version {cargo_version}")
+          PY

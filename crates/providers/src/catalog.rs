@@ -67,7 +67,11 @@ pub fn context_window_for(provider: ProviderId, model: &str) -> u64 {
         }
         ProviderId::Antigravity => 1_000_000,
         ProviderId::OpenCode => {
-            if lower.contains("9b") || lower.contains("4b") || lower.contains("7b") || lower.contains("8b") {
+            if lower.contains("9b")
+                || lower.contains("4b")
+                || lower.contains("7b")
+                || lower.contains("8b")
+            {
                 32_768
             } else {
                 128_000

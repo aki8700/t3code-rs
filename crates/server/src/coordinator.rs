@@ -13,7 +13,7 @@ use std::{
 };
 use t3_core::*;
 use t3_git::GitManager;
-use t3_providers::{ProviderRegistry, run_turn_with_retry};
+use t3_providers::{ProviderRegistry, is_hard_rate_limit, run_turn_with_retry};
 use t3_store::{QueuedRun, QueuedRunInput, SqliteStore};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use uuid::Uuid;
@@ -92,6 +92,25 @@ pub(crate) struct RunTicket {
     pub(crate) done: watch::Receiver<bool>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MonitorActiveRun {
+    pub thread_id: Uuid,
+    pub project_id: Uuid,
+    pub run_id: Uuid,
+    pub title: String,
+    pub model_selection: ModelSelection,
+    pub status: ThreadStatus,
+    pub pending_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MonitorSnapshot {
+    pub active_runs: Vec<MonitorActiveRun>,
+    pub pending_requests: Vec<PendingRequest>,
+    pub queued_thread_ids: Vec<Uuid>,
+    pub active_shells: usize,
+}
+
 struct Outcome {
     provider: ProviderId,
     model: String,
@@ -100,6 +119,8 @@ struct Outcome {
     output: Option<u64>,
     has_context_usage: bool,
     had_file_changes: bool,
+    had_side_effects: bool,
+    hard_rate_limited: bool,
     assistant: String,
     reasoning: String,
     terminal: Option<(RunStatus, Option<String>)>,
@@ -292,7 +313,9 @@ impl RunCoordinator {
                         cache_read_tokens = excluded.cache_read_tokens,
                         cache_write_tokens = excluded.cache_write_tokens,
                         updated_at = excluded.updated_at",
-                    rusqlite::params![id, run_id, provider, model, session_id, ctx, inp, out, cr, cw, now],
+                    rusqlite::params![
+                        id, run_id, provider, model, session_id, ctx, inp, out, cr, cw, now
+                    ],
                 )
             })
             .await
@@ -341,6 +364,46 @@ impl RunCoordinator {
             Ok(rows)
         })
         .await
+    }
+
+    pub async fn monitor_snapshot(&self, active_shells: usize) -> CoreResult<MonitorSnapshot> {
+        let (entries, pending_requests) = {
+            let active = self.0.active.lock().await;
+            let mut entries = Vec::with_capacity(active.len());
+            let mut pending = Vec::new();
+            for (&thread_id, run) in active.iter() {
+                entries.push((
+                    thread_id,
+                    run.project_id,
+                    run.id,
+                    run.model.clone(),
+                    run.pending.len(),
+                ));
+                pending.extend(run.pending.values().cloned());
+            }
+            (entries, pending)
+        };
+        let mut active_runs = Vec::with_capacity(entries.len());
+        for (thread_id, project_id, run_id, model_selection, pending_count) in entries {
+            if let Ok(thread) = self.0.store.get_thread(thread_id).await {
+                active_runs.push(MonitorActiveRun {
+                    thread_id,
+                    project_id,
+                    run_id,
+                    title: thread.title,
+                    model_selection,
+                    status: thread.status,
+                    pending_count,
+                });
+            }
+        }
+        let queued_thread_ids = self.0.store.queued_threads().await?;
+        Ok(MonitorSnapshot {
+            active_runs,
+            pending_requests,
+            queued_thread_ids,
+            active_shells,
+        })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<WsServerMessage> {
@@ -467,6 +530,30 @@ impl RunCoordinator {
         wake_depth: u8,
         busy: bool,
     ) -> CoreResult<Uuid> {
+        self.enqueue_with_meta(
+            thread,
+            message,
+            QueuedMeta {
+                notify_parent,
+                wake_depth,
+                mode_ceiling: (wake_depth != 0)
+                    .then_some((thread.runtime_mode, thread.interaction_mode)),
+                verify_fix_depth: 0,
+                last_verify_signature: None,
+                fallback_attempts: 0,
+            },
+            busy,
+        )
+        .await
+    }
+
+    async fn enqueue_with_meta(
+        &self,
+        thread: &Thread,
+        message: Message,
+        meta: QueuedMeta,
+        busy: bool,
+    ) -> CoreResult<Uuid> {
         let id = Uuid::new_v4();
         let item = prompt_item(thread.id, id, &message);
         let selection = message
@@ -497,10 +584,12 @@ impl RunCoordinator {
                 QueuedRunInput {
                     model_selection: selection,
                     attachment_ids: message.attachment_ids,
-                    notify_parent,
-                    wake_depth,
-                    mode_ceiling: (wake_depth != 0)
-                        .then_some((thread.runtime_mode, thread.interaction_mode)),
+                    notify_parent: meta.notify_parent,
+                    wake_depth: meta.wake_depth,
+                    mode_ceiling: meta.mode_ceiling,
+                    verify_fix_depth: meta.verify_fix_depth,
+                    last_verify_signature: meta.last_verify_signature,
+                    fallback_attempts: meta.fallback_attempts,
                 },
             )
             .await?;
@@ -609,6 +698,7 @@ impl RunCoordinator {
             .filter(|run| run.provider == selection.provider && run.model == selection.model)
             .and_then(|run| run.provider_session_id.clone());
         let project = store.get_project(thread.project_id).await?;
+        let original_prompt = queued.prompt.clone();
         let mut prompt = queued.prompt;
         if previous_run.is_some() && resume_session_id.is_none() {
             let handoff = self.handoff_summary(&thread).await?;
@@ -636,9 +726,8 @@ impl RunCoordinator {
             prompt = format!("Project instructions:\n{instructions}\n\n{prompt}");
         }
         let workspace_dir = self.workspace(&thread).await?;
-        let attachments = self
-            .attachments(thread.id, &queued.input.attachment_ids)
-            .await?;
+        let attachment_ids = queued.input.attachment_ids.clone();
+        let attachments = self.attachments(thread.id, &attachment_ids).await?;
         let swarm = self
             .get_board(thread.id)
             .await?
@@ -658,22 +747,6 @@ impl RunCoordinator {
         } else {
             (None, None)
         };
-        if thread.interaction_mode != InteractionMode::Plan {
-            match GitManager::snapshot_tree(&workspace_dir).await {
-                Ok(Some(pre_tree)) => {
-                    if let Err(error) = store
-                        .save_run_checkpoint(run_id, thread.id, pre_tree)
-                        .await
-                    {
-                        tracing::debug!(%error, %run_id, "Could not save pre-run git checkpoint");
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::debug!(%error, %run_id, "Could not snapshot workspace before run");
-                }
-            }
-        }
         let request = TurnRequest {
             thread_id: thread.id,
             run_id,
@@ -727,10 +800,18 @@ impl RunCoordinator {
         let turn = RunningTurn {
             thread,
             request,
+            original_prompt,
+            attachment_ids,
             cancellation,
             done,
+            chained_dones: Vec::new(),
             driver,
             notify_parent: queued.input.notify_parent,
+            wake_depth: queued.input.wake_depth,
+            mode_ceiling: queued.input.mode_ceiling,
+            verify_fix_depth: queued.input.verify_fix_depth,
+            last_verify_signature: queued.input.last_verify_signature,
+            fallback_attempts: queued.input.fallback_attempts,
             mcp_token,
             swarm,
             started_at: run_started_at,
@@ -826,10 +907,18 @@ impl RunCoordinator {
         let RunningTurn {
             thread,
             request,
+            original_prompt,
+            attachment_ids,
             mut cancellation,
             done,
+            mut chained_dones,
             driver,
             notify_parent,
+            wake_depth,
+            mode_ceiling,
+            verify_fix_depth,
+            last_verify_signature,
+            fallback_attempts,
             mcp_token,
             swarm,
             started_at: run_started_at,
@@ -839,6 +928,33 @@ impl RunCoordinator {
         let started = Instant::now();
         let thread_id = thread.id;
         let run_id = request.run_id;
+        let current_selection = request.model_selection.clone();
+
+        // Capture pre-run Git tree snapshot outside the global `active` lock (Astra B1)
+        // so slow git subprocesses never block unrelated threads.
+        let pre_tree = if thread.interaction_mode != InteractionMode::Plan {
+            match GitManager::snapshot_tree(&workspace_dir).await {
+                Ok(Some(tree)) => {
+                    if let Err(error) = self
+                        .0
+                        .store
+                        .save_run_checkpoint(run_id, thread_id, tree.clone())
+                        .await
+                    {
+                        tracing::debug!(%error, %run_id, "Could not save pre-run git checkpoint");
+                    }
+                    Some(tree)
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::debug!(%error, %run_id, "Could not snapshot workspace before run");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut outcome = Outcome {
             provider: request.model_selection.provider,
             model: request.model_selection.model.clone(),
@@ -847,6 +963,8 @@ impl RunCoordinator {
             output: None,
             has_context_usage: false,
             had_file_changes: false,
+            had_side_effects: false,
+            hard_rate_limited: false,
             assistant: String::new(),
             reasoning: String::new(),
             terminal: None,
@@ -898,80 +1016,120 @@ impl RunCoordinator {
         };
         drop(mcp_token);
 
+        let mut verify_failure: Option<(String, String)> = None;
+        let mut verify_cancelled = false;
+        let mut verify_failed_error: Option<String> = None;
         if !*cancellation.borrow()
             && result.is_ok()
             && matches!(outcome.terminal, Some((RunStatus::Completed, _)))
             && thread.interaction_mode != InteractionMode::Plan
-            && outcome.had_file_changes
             && let Some(cmd) = verify_command
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
         {
-            match crate::shell::run_shell(
-                &workspace_dir,
-                crate::shell::ShellExecRequest {
-                    command: cmd.to_owned(),
-                    timeout_secs: Some(60),
-                },
-            )
-            .await
-            {
-                Ok(out) => {
-                    let mut combined = String::new();
-                    if !out.stdout.is_empty() {
-                        combined.push_str(&out.stdout);
-                    }
-                    if !out.stderr.is_empty() {
-                        if !combined.is_empty() && !combined.ends_with('\n') {
-                            combined.push('\n');
+            let post_tree = GitManager::snapshot_tree(&workspace_dir)
+                .await
+                .ok()
+                .flatten();
+            let tree_changed = pre_tree.is_some() && post_tree != pre_tree;
+            if outcome.had_file_changes || verify_fix_depth > 0 || tree_changed {
+                match crate::shell::run_shell_cancellable(
+                    &workspace_dir,
+                    crate::shell::ShellExecRequest {
+                        command: cmd.to_owned(),
+                        timeout_secs: Some(60),
+                    },
+                    cancellation.clone(),
+                )
+                .await
+                {
+                    Ok(out) => {
+                        let mut combined = String::new();
+                        if !out.stdout.is_empty() {
+                            combined.push_str(&out.stdout);
                         }
-                        combined.push_str(&out.stderr);
-                    }
-                    if out.timed_out {
-                        if !combined.is_empty() && !combined.ends_with('\n') {
-                            combined.push('\n');
+                        if !out.stderr.is_empty() {
+                            if !combined.is_empty() && !combined.ends_with('\n') {
+                                combined.push('\n');
+                            }
+                            combined.push_str(&out.stderr);
                         }
-                        combined.push_str("[タイムアウトにより強制終了しました]");
+                        if out.cancelled {
+                            if !combined.is_empty() && !combined.ends_with('\n') {
+                                combined.push('\n');
+                            }
+                            combined.push_str("[キャンセルされました]");
+                        } else if out.timed_out {
+                            if !combined.is_empty() && !combined.ends_with('\n') {
+                                combined.push('\n');
+                            }
+                            combined.push_str("[タイムアウトにより強制終了しました]");
+                        }
+                        let summary = out.command.chars().take(240).collect::<String>();
+                        let _ = self
+                            .append(NewTurnItem {
+                                thread_id,
+                                run_id,
+                                kind: TurnItemKind::CommandExecution,
+                                summary: Some(summary),
+                                payload: json!({
+                                    "command": out.command,
+                                    "cwd": out.cwd,
+                                    "exit_code": out.exit_code,
+                                    "stdout": out.stdout,
+                                    "stderr": out.stderr,
+                                    "output": combined,
+                                    "duration_ms": out.duration_ms,
+                                    "timed_out": out.timed_out,
+                                    "cancelled": out.cancelled,
+                                    "truncated": out.truncated,
+                                    "source": "verify_hook",
+                                }),
+                                searchable_text: Some(format!("{}\n{}", out.command, combined)),
+                            })
+                            .await;
+                        if out.cancelled {
+                            verify_cancelled = true;
+                        } else if out.timed_out || out.exit_code != Some(0) {
+                            let tail = redact_and_tail(&combined, 4_000);
+                            let sig_input = format!(
+                                "{:?}|{}|{}",
+                                out.exit_code,
+                                post_tree.as_deref().unwrap_or(""),
+                                tail
+                            );
+                            let sig = blake3::hash(sig_input.as_bytes()).to_hex().to_string();
+                            let prompt = format!(
+                                "The project verify command (`{}`) failed (exit_code={:?}, timed_out={}). Fix the reported issues so the verify command passes cleanly.\n\nDiagnostic output (redacted tail):\n```\n{}\n```",
+                                out.command, out.exit_code, out.timed_out, tail
+                            );
+                            verify_failure = Some((prompt, sig));
+                            verify_failed_error = Some(if out.timed_out {
+                                format!("verify_command timed out: {}", out.command)
+                            } else {
+                                format!(
+                                    "verify_command failed (exit {:?}): {}",
+                                    out.exit_code, out.command
+                                )
+                            });
+                        }
                     }
-                    let summary = out.command.chars().take(240).collect::<String>();
-                    let _ = self
-                        .append(NewTurnItem {
-                            thread_id,
-                            run_id,
-                            kind: TurnItemKind::CommandExecution,
-                            summary: Some(summary),
-                            payload: json!({
-                                "command": out.command,
-                                "cwd": out.cwd,
-                                "exit_code": out.exit_code,
-                                "stdout": out.stdout,
-                                "stderr": out.stderr,
-                                "output": combined,
-                                "duration_ms": out.duration_ms,
-                                "timed_out": out.timed_out,
-                                "truncated": out.truncated,
-                                "source": "verify_hook",
-                            }),
-                            searchable_text: Some(format!("{}\n{}", out.command, combined)),
-                        })
-                        .await;
-                }
-                Err(err) => {
-                    tracing::warn!(%err, %run_id, "Post-turn verify_command failed to launch");
+                    Err(err) => {
+                        tracing::warn!(%err, %run_id, "Post-turn verify_command failed to launch");
+                    }
                 }
             }
         }
 
         let mut active = self.0.active.lock().await;
-        let cancelled = *cancellation.borrow();
+        let cancelled = *cancellation.borrow() || verify_cancelled;
         let (mut status, mut error) = if cancelled {
             (RunStatus::Cancelled, Some("Interrupted".into()))
         } else if let Err(error) = result {
             (RunStatus::Failed, Some(error.to_string()))
         } else {
             match outcome.terminal.take() {
-                Some((RunStatus::RateLimited, error)) => (RunStatus::Failed, error),
                 Some(terminal) => terminal,
                 None => (
                     RunStatus::Failed,
@@ -979,7 +1137,103 @@ impl RunCoordinator {
                 ),
             }
         };
+
+        let mut scheduled_auto_followup: Option<(Message, QueuedMeta)> = None;
+        let mut verify_passed = true;
         if status == RunStatus::Completed
+            && let Some((fix_prompt, sig)) = verify_failure
+        {
+            verify_passed = false;
+            let max_fixes = self.0.cfg.verify_max_auto_fixes.min(10) as u8;
+            let made_progress = last_verify_signature.as_deref() != Some(sig.as_str());
+            if verify_fix_depth < max_fixes && made_progress {
+                let next_depth = verify_fix_depth + 1;
+                let notice = format!(
+                    "verify_command が失敗したため自動修正を試行します ({next_depth}/{max_fixes})"
+                );
+                let _ = self
+                    .append(NewTurnItem {
+                        thread_id,
+                        run_id,
+                        kind: TurnItemKind::SystemNotice,
+                        summary: Some(notice.clone()),
+                        payload: json!({
+                            "message": notice,
+                            "verify_fix_depth": next_depth,
+                            "verify_max_auto_fixes": max_fixes,
+                        }),
+                        searchable_text: None,
+                    })
+                    .await;
+                scheduled_auto_followup = Some((
+                    Message {
+                        prompt: fix_prompt,
+                        behavior: None,
+                        attachment_ids: Vec::new(),
+                        model_selection: Some(current_selection.clone()),
+                    },
+                    QueuedMeta {
+                        notify_parent,
+                        wake_depth,
+                        mode_ceiling: Some(
+                            mode_ceiling.unwrap_or((thread.runtime_mode, thread.interaction_mode)),
+                        ),
+                        verify_fix_depth: next_depth,
+                        last_verify_signature: Some(sig),
+                        fallback_attempts,
+                    },
+                ));
+            } else {
+                status = RunStatus::Failed;
+                error = verify_failed_error.or_else(|| Some("verify_command failed".into()));
+            }
+        } else if status == RunStatus::RateLimited
+            && outcome.hard_rate_limited
+            && !outcome.had_side_effects
+            && let Some((fallback_model, next_fallback_idx)) =
+                self.pick_fallback_model(&current_selection, fallback_attempts)
+        {
+            let notice = format!(
+                "クォータ上限を検知したためフォールバックモデル {}/{} へ自動切替します",
+                fallback_model.provider.as_str(),
+                fallback_model.model
+            );
+            let _ = self
+                .append(NewTurnItem {
+                    thread_id,
+                    run_id,
+                    kind: TurnItemKind::SystemNotice,
+                    summary: Some(notice.clone()),
+                    payload: json!({
+                        "message": notice,
+                        "fallback_provider": fallback_model.provider,
+                        "fallback_model": fallback_model.model,
+                    }),
+                    searchable_text: None,
+                })
+                .await;
+            scheduled_auto_followup = Some((
+                Message {
+                    prompt: original_prompt,
+                    behavior: None,
+                    attachment_ids,
+                    model_selection: Some(fallback_model),
+                },
+                QueuedMeta {
+                    notify_parent,
+                    wake_depth,
+                    mode_ceiling: Some(
+                        mode_ceiling.unwrap_or((thread.runtime_mode, thread.interaction_mode)),
+                    ),
+                    verify_fix_depth,
+                    last_verify_signature,
+                    fallback_attempts: next_fallback_idx,
+                },
+            ));
+        }
+
+        if status == RunStatus::Completed
+            && verify_passed
             && let Some(swarm) = &swarm
             && let Err(failure) = self
                 .apply_swarm_actions(&mut active, thread_id, swarm.actions(&outcome.assistant))
@@ -1012,6 +1266,7 @@ impl RunCoordinator {
         let thread_status = match status {
             RunStatus::Completed => ThreadStatus::Completed,
             RunStatus::Cancelled => ThreadStatus::Interrupted,
+            RunStatus::RateLimited => ThreadStatus::RateLimited,
             _ => ThreadStatus::Failed,
         };
         let store = &self.0.store;
@@ -1038,7 +1293,23 @@ impl RunCoordinator {
             }
             self.persist_context(thread_id, &snap).await;
         }
+        let mut enqueued_followup = false;
+        if let Some((followup_msg, followup_meta)) = scheduled_auto_followup {
+            match self
+                .enqueue_with_meta(&thread, followup_msg, followup_meta, true)
+                .await
+            {
+                Ok(_) => {
+                    enqueued_followup = true;
+                }
+                Err(error) => {
+                    tracing::error!(%error, %thread_id, "Could not enqueue automatic follow-up run");
+                }
+            }
+        }
+        let defer_completion = enqueued_followup && !self.0.shutting_down.load(Ordering::Relaxed);
         if notify_parent
+            && !defer_completion
             && let Err(error) = self
                 .record_child_completion(&thread, thread_status, error.as_deref())
                 .await
@@ -1048,12 +1319,14 @@ impl RunCoordinator {
         if let Err(error) = store.update_thread_status(thread_id, thread_status).await {
             tracing::error!(%error, %run_id, "Could not persist thread status");
         }
-        if (swarm.is_some() || thread.relationship.as_deref() == Some("swarm-worker"))
+        if !defer_completion
+            && (swarm.is_some() || thread.relationship.as_deref() == Some("swarm-worker"))
             && let Err(error) = self.swarm_state(thread_id, "waiting").await
         {
             tracing::error!(%error, %run_id, "Could not persist swarm member state");
         }
-        if (swarm.is_some() || thread.relationship.as_deref() == Some("swarm-worker"))
+        if !defer_completion
+            && (swarm.is_some() || thread.relationship.as_deref() == Some("swarm-worker"))
             && !(thread.model_selection.provider == ProviderId::Mock
                 && status == RunStatus::Completed)
             && let Err(error) = self
@@ -1079,7 +1352,10 @@ impl RunCoordinator {
             thread_id,
             status: thread_status,
         });
-        if notify_parent && let Some(parent_thread_id) = thread.parent_thread_id {
+        if notify_parent
+            && !defer_completion
+            && let Some(parent_thread_id) = thread.parent_thread_id
+        {
             self.emit(WsServerMessage::SubagentUpdated {
                 parent_thread_id,
                 child_thread_id: thread_id,
@@ -1087,15 +1363,36 @@ impl RunCoordinator {
             });
         }
         active.remove(&thread_id);
-        done.send_replace(true);
         let next = async {
             let thread = store.get_thread(thread_id).await?;
             self.start_next(&mut active, &thread, None).await
         }
         .await;
         match next {
-            Ok(next) => next.map(|(_, turn)| turn),
+            Ok(Some((_, mut next_turn))) => {
+                if defer_completion {
+                    chained_dones.push(done);
+                    next_turn.chained_dones.extend(chained_dones);
+                } else {
+                    done.send_replace(true);
+                    for waiter in chained_dones {
+                        waiter.send_replace(true);
+                    }
+                }
+                Some(next_turn)
+            }
+            Ok(None) => {
+                done.send_replace(true);
+                for waiter in chained_dones {
+                    waiter.send_replace(true);
+                }
+                None
+            }
             Err(error) => {
+                done.send_replace(true);
+                for waiter in chained_dones {
+                    waiter.send_replace(true);
+                }
                 tracing::error!(%error, %thread_id, "Could not start next queued run");
                 self.emit(WsServerMessage::Error {
                     message: error.to_string(),
@@ -1137,6 +1434,9 @@ impl RunCoordinator {
                 out.session = Some(provider_session_id);
             }
             StreamEvent::AssistantDelta { text } => {
+                if !text.trim().is_empty() {
+                    out.had_side_effects = true;
+                }
                 push_capped(&mut out.assistant, &text, out.reasoning.len());
                 self.update_live_stream(thread_id, run_id, &out.assistant, &out.reasoning)
                     .await;
@@ -1165,6 +1465,15 @@ impl RunCoordinator {
             } => {
                 if kind == TurnItemKind::FileChange {
                     out.had_file_changes = true;
+                }
+                if matches!(
+                    kind,
+                    TurnItemKind::FileChange
+                        | TurnItemKind::ToolCall
+                        | TurnItemKind::CommandExecution
+                        | TurnItemKind::AssistantMessage
+                ) {
+                    out.had_side_effects = true;
                 }
                 if kind == TurnItemKind::Reasoning {
                     out.reasoning.clear();
@@ -1245,6 +1554,9 @@ impl RunCoordinator {
                     status: RunStatus::RateLimited,
                     error: Some(message.clone()),
                 });
+                if is_hard_rate_limit(retry_after_secs, &message) {
+                    out.hard_rate_limited = true;
+                }
                 out.terminal = Some((RunStatus::RateLimited, Some(message)));
             }
             StreamEvent::Usage {
@@ -1393,20 +1705,86 @@ impl RunCoordinator {
             },
         );
     }
+    fn pick_fallback_model(
+        &self,
+        current: &ModelSelection,
+        start_index: u8,
+    ) -> Option<(ModelSelection, u8)> {
+        self.0
+            .cfg
+            .fallback_models
+            .iter()
+            .enumerate()
+            .skip(start_index as usize)
+            .find(|(_, m)| {
+                !(m.provider == current.provider && m.model == current.model)
+                    && self.0.providers.get(m.provider).is_some()
+            })
+            .map(|(idx, m)| (m.clone(), (idx + 1).min(u8::MAX as usize) as u8))
+    }
+}
+
+struct QueuedMeta {
+    notify_parent: bool,
+    wake_depth: u8,
+    mode_ceiling: Option<(RuntimeMode, InteractionMode)>,
+    verify_fix_depth: u8,
+    last_verify_signature: Option<String>,
+    fallback_attempts: u8,
 }
 
 struct RunningTurn {
     thread: Thread,
     request: TurnRequest,
+    original_prompt: String,
+    attachment_ids: Vec<Uuid>,
     cancellation: watch::Receiver<bool>,
     done: watch::Sender<bool>,
+    chained_dones: Vec<watch::Sender<bool>>,
     driver: Arc<dyn ProviderDriver>,
     notify_parent: bool,
+    wake_depth: u8,
+    mode_ceiling: Option<(RuntimeMode, InteractionMode)>,
+    verify_fix_depth: u8,
+    last_verify_signature: Option<String>,
+    fallback_attempts: u8,
     mcp_token: Option<RunMcpToken>,
     swarm: Option<SwarmTurn>,
     started_at: chrono::DateTime<Utc>,
     workspace_dir: std::path::PathBuf,
     verify_command: Option<String>,
+}
+
+fn redact_and_tail(text: &str, max_chars: usize) -> String {
+    let cred_scrubbed = crate::threads::redact_credentials(text);
+    let mut cleaned = Vec::new();
+    for line in cred_scrubbed.lines() {
+        let mut out_tokens = Vec::new();
+        for token in line.split_whitespace() {
+            if let Some(eq) = token.find('=') {
+                let lhs = token[..eq]
+                    .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .to_ascii_uppercase();
+                if lhs.ends_with("_KEY")
+                    || lhs.ends_with("_TOKEN")
+                    || lhs.ends_with("_SECRET")
+                    || lhs.ends_with("_PASSWORD")
+                {
+                    out_tokens.push(format!("{}=[REDACTED]", &token[..eq]));
+                    continue;
+                }
+            }
+            out_tokens.push(token.to_owned());
+        }
+        cleaned.push(out_tokens.join(" "));
+    }
+    let joined = cleaned.join("\n");
+    let count = joined.chars().count();
+    if count <= max_chars {
+        joined
+    } else {
+        joined.chars().skip(count - max_chars).collect()
+    }
 }
 
 fn push_capped(buffer: &mut String, text: &str, other_len: usize) {

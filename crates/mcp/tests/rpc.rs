@@ -187,8 +187,10 @@ async fn handshake_discovery_batches_and_protocol_errors() {
         .await
         .unwrap();
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 19);
+    assert_eq!(tools.len(), 21);
     for name in [
+        "task_diff",
+        "task_merge",
         "swarm_status",
         "swarm_add_worker",
         "swarm_post_message",

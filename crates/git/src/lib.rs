@@ -1,14 +1,30 @@
 use std::{
+    collections::HashMap,
     ffi::OsStr,
     path::{Path, PathBuf},
     process::{Output, Stdio},
 };
 
 use t3_core::{CoreError, CoreResult, DiffFile, DiffSummary};
-use tokio::process::Command;
+use tokio::{io::AsyncReadExt, process::Command};
 use uuid::Uuid;
 
 const PATCH_LIMIT: usize = 200 * 1024;
+const MAX_TOTAL_PATCH_BYTES: usize = 2 * 1024 * 1024;
+const PATCH_TRUNCATED_MARKER: &str = "\n... [truncated]";
+const BUDGET_TRUNCATED_MARKER: &str = "[truncated: total diff patch budget exceeded]";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    Merged {
+        sha: String,
+        summary: String,
+    },
+    Conflict {
+        conflict_files: Vec<String>,
+        message: String,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct GitManager {
@@ -190,18 +206,103 @@ impl GitManager {
         Ok(String::from_utf8_lossy(&sha).trim().to_owned())
     }
 
+    pub async fn has_merge_in_progress(workspace: &Path) -> CoreResult<bool> {
+        let output = git(workspace)
+            .args(["rev-parse", "--verify", "-q", "MERGE_HEAD"])
+            .output()
+            .await
+            .map_err(git_error)?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(command_error(&output)),
+        }
+    }
+
+    pub async fn has_uncommitted_changes(workspace: &Path) -> CoreResult<bool> {
+        let filters = disabled_filters(workspace).await?;
+        let mut command = git_with_filters(workspace, &filters);
+        command.args(["status", "--porcelain"]);
+        let output = checked_output(command, false).await?;
+        Ok(!output.trim_ascii().is_empty())
+    }
+
     pub async fn merge_branch(repo_root: &Path, branch: &str) -> CoreResult<String> {
         validate_branch(repo_root, branch).await?;
+        if Self::has_merge_in_progress(repo_root).await? {
+            return Err(git_error("a merge is already in progress"));
+        }
         let mut command = git(repo_root);
         command.args(["merge", "--no-edit", "--", branch]);
         if let Err(error) = checked_output(command, false).await {
-            let mut abort = git(repo_root);
-            abort.args(["merge", "--abort"]);
-            let _ = checked_output(abort, false).await;
+            if Self::has_merge_in_progress(repo_root)
+                .await
+                .unwrap_or(false)
+            {
+                let mut abort = git(repo_root);
+                abort.args(["merge", "--abort"]);
+                let _ = checked_output(abort, false).await;
+            }
             return Err(error);
         }
         let sha = git_output(repo_root, &["rev-parse", "HEAD"]).await?;
         Ok(String::from_utf8_lossy(&sha).trim().to_owned())
+    }
+
+    pub async fn merge_branch_checked(
+        repo_root: &Path,
+        branch: &str,
+        commit_message: Option<&str>,
+    ) -> CoreResult<MergeOutcome> {
+        validate_branch(repo_root, branch).await?;
+        if Self::has_merge_in_progress(repo_root).await? {
+            return Err(git_error("a merge is already in progress"));
+        }
+        let mut command = git(repo_root);
+        command.args(["merge", "--no-edit"]);
+        if let Some(message) = commit_message
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        {
+            command.args(["--no-ff", "-m", message]);
+        }
+        command.args(["--", branch]);
+        let output = command.output().await.map_err(git_error)?;
+        if output.status.success() {
+            let sha = git_output(repo_root, &["rev-parse", "HEAD"]).await?;
+            let sha = String::from_utf8_lossy(&sha).trim().to_owned();
+            let summary = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            return Ok(MergeOutcome::Merged { sha, summary });
+        }
+        if Self::has_merge_in_progress(repo_root)
+            .await
+            .unwrap_or(false)
+        {
+            let conflicts =
+                git_output(repo_root, &["diff", "--name-only", "--diff-filter=U", "-z"])
+                    .await
+                    .unwrap_or_default();
+            let conflict_files = nul_fields(&conflicts)
+                .filter(|field| !field.is_empty())
+                .map(|field| String::from_utf8_lossy(field).into_owned())
+                .collect::<Vec<_>>();
+            let mut abort = git(repo_root);
+            abort.args(["merge", "--abort"]);
+            let _ = checked_output(abort, false).await;
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let message = match (stdout.is_empty(), stderr.is_empty()) {
+                (false, false) => format!("{stdout}\n{stderr}"),
+                (false, true) => stdout,
+                (true, false) => stderr,
+                (true, true) => "merge conflict".to_owned(),
+            };
+            return Ok(MergeOutcome::Conflict {
+                conflict_files,
+                message,
+            });
+        }
+        Err(command_error(&output))
     }
 
     pub async fn delete_branch(repo_root: &Path, branch: &str) -> CoreResult<()> {
@@ -279,6 +380,14 @@ impl GitManager {
     }
 
     pub async fn diff_summary(dir: &Path, ignore_whitespace: bool) -> CoreResult<DiffSummary> {
+        Self::diff_summary_with_budget(dir, ignore_whitespace, MAX_TOTAL_PATCH_BYTES).await
+    }
+
+    async fn diff_summary_with_budget(
+        dir: &Path,
+        ignore_whitespace: bool,
+        max_total_patch_bytes: usize,
+    ) -> CoreResult<DiffSummary> {
         let root = git_output(dir, &["rev-parse", "--show-toplevel"]).await?;
         let root = git_path(root.strip_suffix(b"\n").unwrap_or(&root));
         let branch = Self::current_branch(&root).await?;
@@ -289,6 +398,7 @@ impl GitManager {
         let entries = status_entries(&status)?;
         let base = diff_base(&root, &entries).await?;
 
+        let mut remaining_patch_bytes = max_total_patch_bytes;
         let mut files = Vec::with_capacity(entries.len());
         for entry in entries {
             let path = git_path(entry.path);
@@ -301,25 +411,162 @@ impl GitManager {
                 untracked: entry.status == b"??",
                 ignore_whitespace,
             };
-            let patch = diff.output("--patch").await?;
-            if patch.is_empty() && ignore_whitespace && !diff.untracked {
-                continue;
-            }
-
-            let (additions, deletions) = numstat(&diff.output("--numstat").await?)?;
-            let patch = String::from_utf8_lossy(&patch);
+            let (additions, deletions, patch) =
+                if remaining_patch_bytes < PATCH_TRUNCATED_MARKER.len() {
+                    let numstat_raw = diff.output("--numstat").await?;
+                    if numstat_raw.is_empty() && ignore_whitespace && !diff.untracked {
+                        continue;
+                    }
+                    let (additions, deletions) = numstat(&numstat_raw)?;
+                    (additions, deletions, BUDGET_TRUNCATED_MARKER.to_owned())
+                } else {
+                    let file_limit = PATCH_LIMIT.min(remaining_patch_bytes);
+                    let (raw_patch, truncated) = diff.bounded_output("--patch", file_limit).await?;
+                    if raw_patch.is_empty() && ignore_whitespace && !diff.untracked {
+                        continue;
+                    }
+                    let (additions, deletions) = numstat(&diff.output("--numstat").await?)?;
+                    let patch = format_patch(&raw_patch, file_limit, truncated);
+                    let consumed = if truncated { file_limit } else { patch.len() };
+                    remaining_patch_bytes = remaining_patch_bytes.saturating_sub(consumed);
+                    (additions, deletions, patch)
+                };
             files.push(DiffFile {
                 path: path.to_string_lossy().into_owned(),
                 status: String::from_utf8_lossy(entry.status).into_owned(),
                 additions,
                 deletions,
-                patch: patch[..patch.floor_char_boundary(PATCH_LIMIT)].to_owned(),
+                patch,
             });
         }
 
         Ok(DiffSummary {
             workspace_path: dir.to_owned(),
             branch,
+            clean: files.is_empty(),
+            total_additions: files.iter().map(|file| file.additions).sum(),
+            total_deletions: files.iter().map(|file| file.deletions).sum(),
+            files,
+        })
+    }
+
+    pub async fn branch_diff_summary(
+        workspace: &Path,
+        base_ref: &str,
+        head_ref: &str,
+        ignore_whitespace: bool,
+    ) -> CoreResult<DiffSummary> {
+        Self::branch_diff_summary_with_budget(
+            workspace,
+            base_ref,
+            head_ref,
+            ignore_whitespace,
+            MAX_TOTAL_PATCH_BYTES,
+        )
+        .await
+    }
+
+    async fn branch_diff_summary_with_budget(
+        workspace: &Path,
+        base_ref: &str,
+        head_ref: &str,
+        ignore_whitespace: bool,
+        max_total_patch_bytes: usize,
+    ) -> CoreResult<DiffSummary> {
+        let root = git_output(workspace, &["rev-parse", "--show-toplevel"]).await?;
+        let root = git_path(root.strip_suffix(b"\n").unwrap_or(&root));
+        let base_sha = resolve_commit(&root, base_ref).await?;
+        let head_sha = resolve_commit(&root, head_ref).await?;
+        let range = format!("{base_sha}...{head_sha}");
+        let filters = disabled_filters(&root).await?;
+
+        let mut name_status_cmd = git_with_filters(&root, &filters);
+        name_status_cmd.args([
+            "--literal-pathspecs",
+            "diff",
+            "--name-status",
+            "-z",
+            "--find-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+        ]);
+        if ignore_whitespace {
+            name_status_cmd.arg("-w");
+        }
+        name_status_cmd.args([&range, "--"]);
+        let name_status_raw = checked_output(name_status_cmd, false).await?;
+        let entries = parse_name_status(&name_status_raw)?;
+
+        let mut numstat_cmd = git_with_filters(&root, &filters);
+        numstat_cmd.args([
+            "--literal-pathspecs",
+            "diff",
+            "--numstat",
+            "-z",
+            "--find-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+        ]);
+        if ignore_whitespace {
+            numstat_cmd.arg("-w");
+        }
+        numstat_cmd.args([&range, "--"]);
+        let numstat_raw = checked_output(numstat_cmd, false).await?;
+        let stats = parse_numstat_map(&numstat_raw)?;
+
+        let mut remaining_patch_bytes = max_total_patch_bytes;
+        let mut files = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let (additions, deletions) = stats.get(&entry.path).copied().unwrap_or((0, 0));
+            let path = git_path(&entry.path);
+            let patch = if remaining_patch_bytes < PATCH_TRUNCATED_MARKER.len() {
+                if ignore_whitespace && additions == 0 && deletions == 0 {
+                    continue;
+                }
+                BUDGET_TRUNCATED_MARKER.to_owned()
+            } else {
+                let mut patch_cmd = git_with_filters(&root, &filters);
+                patch_cmd.args([
+                    "--literal-pathspecs",
+                    "diff",
+                    "--patch",
+                    "--find-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-color",
+                ]);
+                if ignore_whitespace {
+                    patch_cmd.arg("-w");
+                }
+                patch_cmd.arg(&range).arg("--").arg(&path);
+                if let Some(source) = &entry.rename_from {
+                    patch_cmd.arg(git_path(source));
+                }
+                let file_limit = PATCH_LIMIT.min(remaining_patch_bytes);
+                let (raw_patch, truncated) =
+                    checked_output_bounded(patch_cmd, false, file_limit).await?;
+                if raw_patch.is_empty() && ignore_whitespace {
+                    continue;
+                }
+                let patch = format_patch(&raw_patch, file_limit, truncated);
+                let consumed = if truncated { file_limit } else { patch.len() };
+                remaining_patch_bytes = remaining_patch_bytes.saturating_sub(consumed);
+                patch
+            };
+            files.push(DiffFile {
+                path: path.to_string_lossy().into_owned(),
+                status: entry.status,
+                additions,
+                deletions,
+                patch,
+            });
+        }
+
+        Ok(DiffSummary {
+            workspace_path: workspace.to_owned(),
+            branch: Some(head_ref.to_owned()),
             clean: files.is_empty(),
             total_additions: files.iter().map(|file| file.additions).sum(),
             total_deletions: files.iter().map(|file| file.deletions).sum(),
@@ -400,7 +647,7 @@ struct FileDiff<'a> {
 }
 
 impl FileDiff<'_> {
-    async fn output(&self, format: &str) -> CoreResult<Vec<u8>> {
+    fn command(&self, format: &str) -> Command {
         let mut command = git_with_filters(self.root, self.filters);
         command.args([
             "--literal-pathspecs",
@@ -430,7 +677,155 @@ impl FileDiff<'_> {
                 command.arg(source);
             }
         }
-        checked_output(command, self.untracked).await
+        command
+    }
+
+    async fn output(&self, format: &str) -> CoreResult<Vec<u8>> {
+        checked_output(self.command(format), self.untracked).await
+    }
+
+    async fn bounded_output(&self, format: &str, max_bytes: usize) -> CoreResult<(Vec<u8>, bool)> {
+        checked_output_bounded(self.command(format), self.untracked, max_bytes).await
+    }
+}
+
+struct BranchDiffEntry {
+    status: String,
+    path: Vec<u8>,
+    rename_from: Option<Vec<u8>>,
+}
+
+fn parse_name_status(bytes: &[u8]) -> CoreResult<Vec<BranchDiffEntry>> {
+    let mut fields = nul_fields(bytes);
+    let mut entries = Vec::new();
+    while let Some(status_bytes) = fields.next() {
+        if status_bytes.is_empty() {
+            continue;
+        }
+        let status = String::from_utf8_lossy(status_bytes).into_owned();
+        if matches!(status_bytes[0], b'R' | b'C') {
+            let old_path = fields
+                .next()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| git_error("missing source path in Git diff name-status"))?;
+            let new_path = fields
+                .next()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| git_error("missing destination path in Git diff name-status"))?;
+            entries.push(BranchDiffEntry {
+                status,
+                path: new_path.to_vec(),
+                rename_from: Some(old_path.to_vec()),
+            });
+        } else {
+            let path = fields
+                .next()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| git_error("missing path in Git diff name-status"))?;
+            entries.push(BranchDiffEntry {
+                status,
+                path: path.to_vec(),
+                rename_from: None,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn parse_numstat_map(bytes: &[u8]) -> CoreResult<HashMap<Vec<u8>, (usize, usize)>> {
+    let mut fields = nul_fields(bytes);
+    let mut stats = HashMap::new();
+    while let Some(entry) = fields.next() {
+        if entry.is_empty() {
+            continue;
+        }
+        let mut columns = entry.splitn(3, |byte| *byte == b'\t');
+        let (Some(added), Some(deleted), Some(path)) =
+            (columns.next(), columns.next(), columns.next())
+        else {
+            return Err(git_error("invalid Git numstat entry"));
+        };
+        let additions = line_count(added)?;
+        let deletions = line_count(deleted)?;
+        let key = if path.is_empty() {
+            let _old = fields
+                .next()
+                .ok_or_else(|| git_error("missing source path in Git numstat rename"))?;
+            let new = fields
+                .next()
+                .ok_or_else(|| git_error("missing destination path in Git numstat rename"))?;
+            new.to_vec()
+        } else {
+            path.to_vec()
+        };
+        stats.insert(key, (additions, deletions));
+    }
+    Ok(stats)
+}
+
+async fn resolve_commit(repo_root: &Path, rev: &str) -> CoreResult<String> {
+    if rev.trim().is_empty() {
+        return Err(git_error("git ref must not be empty"));
+    }
+    let commit = git_output(
+        repo_root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )
+    .await?;
+    Ok(String::from_utf8_lossy(&commit).trim().to_owned())
+}
+
+fn trim_incomplete_utf8_tail(bytes: &[u8]) -> &[u8] {
+    let len = bytes.len();
+    let start = len.saturating_sub(3);
+    for i in (start..len).rev() {
+        let b = bytes[i];
+        if (b & 0xC0) != 0x80 {
+            let expected = if b < 0x80 {
+                1
+            } else if (b & 0xE0) == 0xC0 {
+                2
+            } else if (b & 0xF0) == 0xE0 {
+                3
+            } else if (b & 0xF8) == 0xF0 {
+                4
+            } else {
+                return bytes;
+            };
+            return if len - i < expected {
+                &bytes[..i]
+            } else {
+                bytes
+            };
+        }
+    }
+    bytes
+}
+
+fn format_patch(bytes: &[u8], limit: usize, truncated: bool) -> String {
+    let clean = if truncated {
+        trim_incomplete_utf8_tail(bytes)
+    } else {
+        bytes
+    };
+    let text = String::from_utf8_lossy(clean);
+    if !truncated && text.len() <= limit {
+        return text.into_owned();
+    }
+    if limit >= PATCH_TRUNCATED_MARKER.len() {
+        let cap = (limit - PATCH_TRUNCATED_MARKER.len()).min(text.len());
+        let keep = text.floor_char_boundary(cap);
+        let mut out = String::with_capacity(keep + PATCH_TRUNCATED_MARKER.len());
+        out.push_str(&text[..keep]);
+        out.push_str(PATCH_TRUNCATED_MARKER);
+        out
+    } else {
+        text[..text.floor_char_boundary(limit.min(text.len()))].to_owned()
     }
 }
 
@@ -551,6 +946,59 @@ async fn checked_output(mut command: Command, allow_differences: bool) -> CoreRe
         Ok(output.stdout)
     } else {
         Err(command_error(&output))
+    }
+}
+
+async fn checked_output_bounded(
+    mut command: Command,
+    allow_differences: bool,
+    max_bytes: usize,
+) -> CoreResult<(Vec<u8>, bool)> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(git_error)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| git_error("failed to capture git stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| git_error("failed to capture git stderr"))?;
+
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr.take(64 * 1024).read_to_end(&mut buf).await;
+        buf
+    });
+
+    let read_limit = max_bytes.saturating_add(1);
+    let mut stdout_buf = Vec::with_capacity(read_limit.min(64 * 1024));
+    stdout
+        .take(read_limit as u64)
+        .read_to_end(&mut stdout_buf)
+        .await
+        .map_err(git_error)?;
+
+    let truncated = stdout_buf.len() > max_bytes;
+    if truncated {
+        stdout_buf.truncate(max_bytes);
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        stderr_task.abort();
+        return Ok((stdout_buf, true));
+    }
+
+    let status = child.wait().await.map_err(git_error)?;
+    let stderr_buf = stderr_task.await.unwrap_or_default();
+    if status.success() || (allow_differences && status.code() == Some(1) && stderr_buf.is_empty())
+    {
+        Ok((stdout_buf, false))
+    } else {
+        Err(command_error(&Output {
+            status,
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+        }))
     }
 }
 
@@ -732,6 +1180,188 @@ mod primitive_tests {
                 .unwrap()
                 .iter()
                 .any(|branch| branch == "feature")
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_summary_enforces_patch_and_total_budget_truncation() {
+        let repo = Repo::new().await;
+        let payload = "0123456789abcdef0123456789abcdef\n".repeat(7_000); // ~231 KiB > PATCH_LIMIT
+        for i in 0..12 {
+            fs::write(repo.0.join(format!("big_{i:02}.txt")), &payload).unwrap();
+        }
+        let diff = GitManager::diff_summary(&repo.0, false).await.unwrap();
+        assert_eq!(diff.files.len(), 12);
+        assert_eq!(diff.total_additions, 12 * 7_000);
+        // First 10 files each consume PATCH_LIMIT (200 KiB) -> 2000 KiB; 11th consumes 48 KiB;
+        // 12th hits exhausted budget without invoking extra patch diffs.
+        for file in &diff.files[..11] {
+            assert!(file.patch.len() <= PATCH_LIMIT, "{}", file.path);
+            assert!(
+                file.patch.ends_with(PATCH_TRUNCATED_MARKER),
+                "{} did not end with truncation marker",
+                file.path
+            );
+        }
+        assert_eq!(diff.files[11].patch, BUDGET_TRUNCATED_MARKER);
+        let non_marker_bytes: usize = diff.files[..11].iter().map(|f| f.patch.len()).sum();
+        assert!(non_marker_bytes <= MAX_TOTAL_PATCH_BYTES);
+    }
+
+    #[tokio::test]
+    async fn has_merge_in_progress_detects_active_merge_and_protects_user_merge() {
+        let repo = Repo::new().await;
+        assert!(!GitManager::has_merge_in_progress(&repo.0).await.unwrap());
+
+        git_output(&repo.0, &["checkout", "-b", "conflict-branch"])
+            .await
+            .unwrap();
+        fs::write(repo.0.join("tracked.txt"), "branch side\n").unwrap();
+        git_output(&repo.0, &["commit", "-am", "branch edit"])
+            .await
+            .unwrap();
+
+        git_output(&repo.0, &["checkout", "main"]).await.unwrap();
+        fs::write(repo.0.join("tracked.txt"), "main side\n").unwrap();
+        git_output(&repo.0, &["commit", "-am", "main edit"])
+            .await
+            .unwrap();
+
+        // Start a conflicting merge manually (simulating a user merge in progress).
+        let merge = git(&repo.0)
+            .args(["merge", "--no-edit", "conflict-branch"])
+            .output()
+            .await
+            .unwrap();
+        assert!(!merge.status.success());
+        assert!(GitManager::has_merge_in_progress(&repo.0).await.unwrap());
+
+        // merge_branch_checked MUST reject and MUST NOT abort the user's merge.
+        let err = GitManager::merge_branch_checked(&repo.0, "conflict-branch", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("merge is already in progress"));
+        assert!(GitManager::has_merge_in_progress(&repo.0).await.unwrap());
+
+        // Abort the manual merge and confirm MERGE_HEAD clears.
+        git_output(&repo.0, &["merge", "--abort"]).await.unwrap();
+        assert!(!GitManager::has_merge_in_progress(&repo.0).await.unwrap());
+
+        // Now merge_branch_checked reports Conflict with conflict_files and aborts its own merge cleanly.
+        let outcome = GitManager::merge_branch_checked(&repo.0, "conflict-branch", None)
+            .await
+            .unwrap();
+        match outcome {
+            MergeOutcome::Conflict { conflict_files, .. } => {
+                assert_eq!(conflict_files, vec!["tracked.txt".to_owned()]);
+            }
+            MergeOutcome::Merged { .. } => panic!("expected merge conflict"),
+        }
+        assert!(!GitManager::has_merge_in_progress(&repo.0).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn has_uncommitted_changes_tracks_working_tree_state() {
+        let repo = Repo::new().await;
+        assert!(!GitManager::has_uncommitted_changes(&repo.0).await.unwrap());
+
+        fs::write(repo.0.join("untracked.txt"), "new\n").unwrap();
+        assert!(GitManager::has_uncommitted_changes(&repo.0).await.unwrap());
+
+        git_output(&repo.0, &["add", "--", "untracked.txt"])
+            .await
+            .unwrap();
+        assert!(GitManager::has_uncommitted_changes(&repo.0).await.unwrap());
+
+        git_output(&repo.0, &["commit", "-m", "add untracked"])
+            .await
+            .unwrap();
+        assert!(!GitManager::has_uncommitted_changes(&repo.0).await.unwrap());
+
+        fs::write(repo.0.join("tracked.txt"), "modified\n").unwrap();
+        assert!(GitManager::has_uncommitted_changes(&repo.0).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn branch_diff_summary_reports_three_dot_diff_and_enforces_budget() {
+        let repo = Repo::new().await;
+        fs::write(repo.0.join("space.txt"), "one two\n").unwrap();
+        fs::write(repo.0.join("rename_me.txt"), "same line\n".repeat(20)).unwrap();
+        git_output(&repo.0, &["add", "--", "."]).await.unwrap();
+        git_output(&repo.0, &["commit", "-m", "setup"])
+            .await
+            .unwrap();
+
+        // Create feature branch with added, renamed, and whitespace-only changes.
+        git_output(&repo.0, &["checkout", "-b", "t3rs/feat"])
+            .await
+            .unwrap();
+        fs::write(repo.0.join("space.txt"), "one   two\n").unwrap();
+        fs::write(repo.0.join("added.txt"), "hello\nworld\n").unwrap();
+        git_output(&repo.0, &["mv", "rename_me.txt", "renamed.txt"])
+            .await
+            .unwrap();
+        git_output(&repo.0, &["add", "--", "."]).await.unwrap();
+        git_output(&repo.0, &["commit", "-m", "feature changes"])
+            .await
+            .unwrap();
+
+        // Advance main with an unrelated commit that three-dot diff must NOT include.
+        git_output(&repo.0, &["checkout", "main"]).await.unwrap();
+        fs::write(repo.0.join("main_only.txt"), "on main\n").unwrap();
+        git_output(&repo.0, &["add", "--", "main_only.txt"])
+            .await
+            .unwrap();
+        git_output(&repo.0, &["commit", "-m", "main commit"])
+            .await
+            .unwrap();
+
+        let full = GitManager::branch_diff_summary(&repo.0, "main", "t3rs/feat", false)
+            .await
+            .unwrap();
+        assert_eq!(full.branch.as_deref(), Some("t3rs/feat"));
+        assert!(!full.clean);
+        assert!(!full.files.iter().any(|f| f.path == "main_only.txt"));
+        assert!(full.files.iter().any(|f| f.path == "space.txt"));
+        let added = full.files.iter().find(|f| f.path == "added.txt").unwrap();
+        assert_eq!(
+            (added.status.as_str(), added.additions, added.deletions),
+            ("A", 2, 0)
+        );
+        assert!(added.patch.contains("+hello\n+world"));
+        let renamed = full.files.iter().find(|f| f.path == "renamed.txt").unwrap();
+        assert!(renamed.status.starts_with('R'));
+        assert!(renamed.patch.contains("rename from rename_me.txt"));
+
+        let ignore_ws = GitManager::branch_diff_summary(&repo.0, "main", "t3rs/feat", true)
+            .await
+            .unwrap();
+        assert!(!ignore_ws.files.iter().any(|f| f.path == "space.txt"));
+        assert!(ignore_ws.files.iter().any(|f| f.path == "added.txt"));
+
+        // Invalid ref is rejected.
+        assert!(
+            GitManager::branch_diff_summary(&repo.0, "--bad-ref", "t3rs/feat", false)
+                .await
+                .is_err()
+        );
+
+        // Budget enforcement on branch_diff_summary truncates once budget is exhausted.
+        let tiny_budget =
+            GitManager::branch_diff_summary_with_budget(&repo.0, "main", "t3rs/feat", false, 40)
+                .await
+                .unwrap();
+        assert!(
+            tiny_budget
+                .files
+                .iter()
+                .any(|f| f.patch.ends_with(PATCH_TRUNCATED_MARKER))
+        );
+        assert!(
+            tiny_budget
+                .files
+                .iter()
+                .any(|f| f.patch == BUDGET_TRUNCATED_MARKER)
         );
     }
 }

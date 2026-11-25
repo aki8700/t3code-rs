@@ -33,12 +33,21 @@ enum Command {
     Serve(ServeArgs),
     /// Forward newline-delimited MCP JSON-RPC between stdio and the server.
     Mcp {
-        #[arg(long, default_value = DEFAULT_URL)]
+        #[arg(long, env = "T3_SERVER_URL", default_value = DEFAULT_URL)]
         url: String,
         #[arg(long, env = "T3_MCP_TOKEN", hide_env_values = true)]
         token: String,
-        #[arg(long)]
+        #[arg(long, env = "T3_THREAD_ID")]
         thread_id: Option<Uuid>,
+    },
+    /// Register or remove the static zero-secret `t3rs` MCP entry in Antigravity (`agy`).
+    SetupAgyMcp {
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        remove: bool,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Query the server's health endpoint.
     Status {
@@ -206,6 +215,11 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
             token,
             thread_id,
         } => client::run_stdio_bridge(&url, &token, thread_id).await?,
+        Command::SetupAgyMcp {
+            url,
+            remove,
+            dry_run,
+        } => return run_setup_agy_mcp(url, remove, dry_run).await,
         Command::Status { url } => {
             let health = client::health(&url).await?;
             println!("{}", serde_json::to_string_pretty(&health)?);
@@ -591,6 +605,82 @@ fn print_tunnel(hostname: &str, port: u16) -> CliResult<()> {
         "\n# Zero Trust Access\n# - Create a self-hosted Access application for {hostname}.\n# - Add an Allow policy for the intended identities.\n# - Enable the application for the entire hostname, including /ws.\n# - Start t3d with --auth cloudflare-access --cf-team-domain <team-domain>\n#   --cf-audience <application-audience> --port {port}."
     );
     Ok(())
+}
+
+fn setup_agy_mcp_args(executable: &Path, url: Option<&str>, remove: bool) -> Vec<String> {
+    if remove {
+        vec!["mcp".into(), "remove".into(), "t3rs".into()]
+    } else {
+        let mut args = vec![
+            "mcp".into(),
+            "add".into(),
+            "t3rs".into(),
+            executable.to_string_lossy().into_owned(),
+            "--".into(),
+            "mcp".into(),
+        ];
+        if let Some(server_url) = url {
+            args.push("--url".into());
+            args.push(server_url.into());
+        }
+        args
+    }
+}
+
+fn format_agy_mcp_command(args: &[String]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push("agy".to_string());
+    for arg in args {
+        if arg.chars().any(char::is_whitespace) {
+            parts.push(format!("'{}'", arg.replace('\'', "'\\''")));
+        } else {
+            parts.push(arg.clone());
+        }
+    }
+    parts.join(" ")
+}
+
+async fn run_setup_agy_mcp(
+    url: Option<String>,
+    remove: bool,
+    dry_run: bool,
+) -> CliResult<ExitCode> {
+    let executable = std::env::current_exe()?;
+    let args = setup_agy_mcp_args(&executable, url.as_deref(), remove);
+    let rendered = format_agy_mcp_command(&args);
+    if dry_run {
+        println!("{rendered}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let status = match tokio::process::Command::new("agy")
+        .args(&args)
+        .env_remove("T3_BEARER_TOKEN")
+        .env_remove("T3_MCP_TOKEN")
+        .status()
+        .await
+    {
+        Ok(status) => status,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            let fallback = ServerConfig::default().providers.antigravity_bin;
+            tokio::process::Command::new(&fallback)
+                .args(&args)
+                .env_remove("T3_BEARER_TOKEN")
+                .env_remove("T3_MCP_TOKEN")
+                .status()
+                .await
+                .map_err(|_| {
+                    format!(
+                        "could not execute `agy` (tried PATH and {})",
+                        fallback.display()
+                    )
+                })?
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if !status.success() {
+        return Err(format!("`{rendered}` exited with {status}").into());
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn print_plist(port: u16, config: Option<PathBuf>) -> CliResult<()> {
@@ -981,5 +1071,115 @@ mod tests {
         assert!(limits_out.contains("25%"));
         assert!(limits_out.contains("75%"));
         assert!(limits_out.contains("not signed in"));
+    }
+
+    #[test]
+    fn mcp_command_configures_env_fallbacks_and_parses_flags() {
+        use clap::CommandFactory;
+
+        let cmd = Cli::command();
+        let mcp = cmd
+            .find_subcommand("mcp")
+            .expect("mcp subcommand should exist");
+        let url_arg = mcp
+            .get_arguments()
+            .find(|arg| arg.get_id() == "url")
+            .expect("url arg");
+        assert_eq!(
+            url_arg.get_env().and_then(|v| v.to_str()),
+            Some("T3_SERVER_URL")
+        );
+        let thread_arg = mcp
+            .get_arguments()
+            .find(|arg| arg.get_id() == "thread_id")
+            .expect("thread_id arg");
+        assert_eq!(
+            thread_arg.get_env().and_then(|v| v.to_str()),
+            Some("T3_THREAD_ID")
+        );
+
+        let tid = Uuid::new_v4();
+        let tid_str = tid.to_string();
+        let cli = Cli::try_parse_from([
+            "t3d",
+            "mcp",
+            "--url",
+            "http://127.0.0.1:4100",
+            "--token",
+            "tok",
+            "--thread-id",
+            &tid_str,
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Mcp {
+                url,
+                token,
+                thread_id,
+            } => {
+                assert_eq!(url, "http://127.0.0.1:4100");
+                assert_eq!(token, "tok");
+                assert_eq!(thread_id, Some(tid));
+            }
+            _ => panic!("expected Mcp command"),
+        }
+    }
+
+    #[test]
+    fn setup_agy_mcp_parses_and_builds_zero_secret_commands() {
+        let cli = Cli::try_parse_from(["t3d", "setup-agy-mcp", "--dry-run"]).unwrap();
+        match cli.command {
+            Command::SetupAgyMcp {
+                url,
+                remove,
+                dry_run,
+            } => {
+                assert_eq!(url, None);
+                assert!(!remove);
+                assert!(dry_run);
+            }
+            _ => panic!("expected SetupAgyMcp command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "t3d",
+            "setup-agy-mcp",
+            "--url",
+            "http://127.0.0.1:4200",
+            "--remove",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::SetupAgyMcp {
+                url,
+                remove,
+                dry_run,
+            } => {
+                assert_eq!(url.as_deref(), Some("http://127.0.0.1:4200"));
+                assert!(remove);
+                assert!(!dry_run);
+            }
+            _ => panic!("expected SetupAgyMcp command"),
+        }
+
+        let add_args = setup_agy_mcp_args(Path::new("/usr/local/bin/t3d"), None, false);
+        assert_eq!(
+            format_agy_mcp_command(&add_args),
+            "agy mcp add t3rs /usr/local/bin/t3d -- mcp"
+        );
+        assert!(add_args.iter().all(|arg| !arg.contains("token")));
+
+        let custom_args = setup_agy_mcp_args(
+            Path::new("/usr/local/bin/t3d"),
+            Some("http://127.0.0.1:3999"),
+            false,
+        );
+        assert_eq!(
+            format_agy_mcp_command(&custom_args),
+            "agy mcp add t3rs /usr/local/bin/t3d -- mcp --url http://127.0.0.1:3999"
+        );
+
+        let remove_args = setup_agy_mcp_args(Path::new("/usr/local/bin/t3d"), None, true);
+        assert_eq!(format_agy_mcp_command(&remove_args), "agy mcp remove t3rs");
     }
 }

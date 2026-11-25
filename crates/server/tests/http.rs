@@ -1655,8 +1655,16 @@ async fn thread_detail_returns_context_and_items_breakdown() {
     assert_eq!(ctx["total_input_tokens"], 1);
     assert_eq!(ctx["total_output_tokens"], 1);
     let breakdown = ctx["items_breakdown"].as_array().unwrap();
-    assert!(breakdown.iter().any(|b| b["kind"] == "user_message" && b["count"].as_u64().unwrap() >= 1));
-    assert!(breakdown.iter().any(|b| b["kind"] == "assistant_message" && b["count"].as_u64().unwrap() >= 1));
+    assert!(
+        breakdown
+            .iter()
+            .any(|b| b["kind"] == "user_message" && b["count"].as_u64().unwrap() >= 1)
+    );
+    assert!(
+        breakdown
+            .iter()
+            .any(|b| b["kind"] == "assistant_message" && b["count"].as_u64().unwrap() >= 1)
+    );
 
     // Drop in-memory live context to simulate restart; stored DB context must survive.
     drop(app);
@@ -1668,11 +1676,25 @@ async fn thread_detail_returns_context_and_items_breakdown() {
     assert_eq!(after_restart["context"]["context_window"], 200_000);
 
     // Embedded ES modules under /js/{name} serve .js files and reject traversal/non-js paths.
-    let js_ok = request(&app2, Request::get("/js/util.js").body(Body::empty()).unwrap()).await;
+    let js_ok = request(
+        &app2,
+        Request::get("/js/util.js").body(Body::empty()).unwrap(),
+    )
+    .await;
     assert_eq!(js_ok.status(), StatusCode::OK);
-    let js_bad = request(&app2, Request::get("/js/..%2Findex.html").body(Body::empty()).unwrap()).await;
+    let js_bad = request(
+        &app2,
+        Request::get("/js/..%2Findex.html")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
     assert_eq!(js_bad.status(), StatusCode::NOT_FOUND);
-    let js_non = request(&app2, Request::get("/js/util.txt").body(Body::empty()).unwrap()).await;
+    let js_non = request(
+        &app2,
+        Request::get("/js/util.txt").body(Body::empty()).unwrap(),
+    )
+    .await;
     assert_eq!(js_non.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1738,7 +1760,13 @@ async fn shell_exec_runs_in_thread_and_project_and_records_history() {
     assert!(thr_res["stderr"].as_str().unwrap().contains("err-line"));
     assert!(thr_res["item_id"].is_string());
 
-    let detail = json_req(&app, Method::GET, &format!("/api/threads/{thread_id}"), None).await;
+    let detail = json_req(
+        &app,
+        Method::GET,
+        &format!("/api/threads/{thread_id}"),
+        None,
+    )
+    .await;
     let items = detail["items"].as_array().unwrap();
     assert!(items.iter().any(|it| {
         it["kind"] == "command_execution"
@@ -1770,7 +1798,13 @@ async fn shell_exec_runs_in_thread_and_project_and_records_history() {
     .await;
     let mut after = Value::Null;
     for _ in 0..40 {
-        after = json_req(&app, Method::GET, &format!("/api/threads/{thread_id}"), None).await;
+        after = json_req(
+            &app,
+            Method::GET,
+            &format!("/api/threads/{thread_id}"),
+            None,
+        )
+        .await;
         if after["thread"]["status"] == "completed" {
             break;
         }
@@ -2005,4 +2039,374 @@ async fn project_patch_workspace_meta_and_instructions_injection() {
         .and_then(|item| item["payload"]["text"].as_str())
         .unwrap();
     assert!(reply.contains("Project instructions:\nAlways respond in Japanese."));
+}
+
+#[tokio::test]
+async fn tier4_streaming_shell_cancel_monitor_and_worktree_merge_routes() {
+    let tmp = TempDir::new();
+    let workspace = tmp.0.join("repo");
+    std::fs::create_dir(&workspace).unwrap();
+    git(&workspace, &["init", "-q"]);
+    std::fs::write(workspace.join("base.txt"), "base\n").unwrap();
+    git(&workspace, &["add", "base.txt"]);
+    git(
+        &workspace,
+        &[
+            "-c",
+            "user.name=T3 Test",
+            "-c",
+            "user.email=t3@example.test",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+
+    let proj = json_req(
+        &app,
+        Method::POST,
+        "/api/projects",
+        Some(json!({"title": "Tier4 Proj", "workspace_root": workspace})),
+    )
+    .await;
+    let project_id = proj["id"].as_str().unwrap();
+
+    let parent = json_req(
+        &app,
+        Method::POST,
+        "/api/threads",
+        Some(json!({
+            "project_id": project_id,
+            "title": "Parent",
+            "model_selection": {"provider": "mock", "model": "mock"},
+            "runtime_mode": "full-access"
+        })),
+    )
+    .await;
+    let parent_id: Uuid = parent["id"].as_str().unwrap().parse().unwrap();
+
+    // 1. Streaming shell in thread emits ShellOutput + ShellFinished and persists 1 TurnItem.
+    let started = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{parent_id}/exec/stream"),
+        Some(json!({"command": "echo stream-ok"})),
+    )
+    .await;
+    let exec_id: Uuid = started["exec_id"].as_str().unwrap().parse().unwrap();
+    let mut saw_chunk = false;
+    let mut saw_finished = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && !saw_finished {
+        if let Ok(Ok(msg)) = tokio::time::timeout(Duration::from_secs(2), events.recv()).await {
+            match msg {
+                WsServerMessage::ShellOutput {
+                    exec_id: id, chunk, ..
+                } if id == exec_id && chunk.contains("stream-ok") => {
+                    saw_chunk = true;
+                }
+                WsServerMessage::ShellFinished {
+                    exec_id: id,
+                    exit_code,
+                    cancelled,
+                    item_id,
+                    ..
+                } if id == exec_id => {
+                    assert_eq!(exit_code, Some(0));
+                    assert!(!cancelled);
+                    assert!(item_id.is_some());
+                    saw_finished = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_chunk, "expected ShellOutput chunk");
+    assert!(saw_finished, "expected ShellFinished event");
+
+    // 2. Streaming project shell can be cancelled via POST /api/exec/{exec_id}/cancel.
+    let slow_shell = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/projects/{project_id}/exec/stream"),
+        Some(json!({"command": "sleep 10", "timeout_secs": 20})),
+    )
+    .await;
+    let slow_exec_id: Uuid = slow_shell["exec_id"].as_str().unwrap().parse().unwrap();
+    let mon = json_req(&app, Method::GET, "/api/monitor", None).await;
+    assert!(mon["active_shells"].as_u64().unwrap() >= 1);
+    let cancel = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/exec/{slow_exec_id}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(cancel["cancelled"], true);
+    let mut saw_cancelled = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && !saw_cancelled {
+        if let Ok(Ok(WsServerMessage::ShellFinished {
+            exec_id: id,
+            cancelled,
+            ..
+        })) = tokio::time::timeout(Duration::from_secs(2), events.recv()).await
+            && id == slow_exec_id
+        {
+            assert!(cancelled);
+            saw_cancelled = true;
+        }
+    }
+    assert!(saw_cancelled, "expected cancelled ShellFinished event");
+
+    // 3. Worktree child thread HTTP diff + merge endpoints.
+    let delegated = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{parent_id}/delegate"),
+        Some(json!({
+            "parent_thread_id": parent_id,
+            "title": "Child Feature",
+            "task": "prepare feature",
+            "model_selection": {"provider": "mock", "model": "mock"},
+            "runtime_mode": "full-access",
+            "interaction_mode": "default",
+            "isolation": "worktree"
+        })),
+    )
+    .await;
+    let child_id: Uuid = delegated["thread"]["id"].as_str().unwrap().parse().unwrap();
+    let child_wt = std::path::PathBuf::from(
+        delegated["thread"]["worktree_path"]
+            .as_str()
+            .expect("child worktree"),
+    );
+    wait_for_thread(&mut events, child_id, ThreadStatus::Completed).await;
+
+    std::fs::write(child_wt.join("feature.txt"), "hello from worktree\n").unwrap();
+    git(&child_wt, &["add", "feature.txt"]);
+    git(
+        &child_wt,
+        &[
+            "-c",
+            "user.name=T3 Test",
+            "-c",
+            "user.email=t3@example.test",
+            "commit",
+            "-qm",
+            "add feature",
+        ],
+    );
+
+    let child_diff = json_req(
+        &app,
+        Method::GET,
+        &format!("/api/threads/{parent_id}/children/{child_id}/diff"),
+        None,
+    )
+    .await;
+    assert!(
+        child_diff["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "feature.txt")
+    );
+
+    let merged = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{parent_id}/children/{child_id}/merge"),
+        Some(json!({"cleanup": true})),
+    )
+    .await;
+    assert_eq!(merged["merged"], true);
+    assert_eq!(merged["cleaned_up"], true);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("feature.txt")).unwrap(),
+        "hello from worktree\n"
+    );
+
+    // 4. Thread detail includes compaction_econ payload.
+    let detail = json_req(
+        &app,
+        Method::GET,
+        &format!("/api/threads/{parent_id}"),
+        None,
+    )
+    .await;
+    assert!(detail["context"]["compaction"]["utilization_pct"].is_f64());
+    assert!(detail["context"]["compaction"]["recommended"].is_boolean());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn tier4_verify_autofix_loop_and_quota_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new();
+    let workspace = tmp.0.join("repo");
+    std::fs::create_dir(&workspace).unwrap();
+    git(&workspace, &["init", "-q"]);
+    std::fs::write(workspace.join("a.txt"), "v0\n").unwrap();
+    git(&workspace, &["add", "a.txt"]);
+    git(
+        &workspace,
+        &[
+            "-c",
+            "user.name=T3 Test",
+            "-c",
+            "user.email=t3@example.test",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+
+    // Fake Claude CLI:
+    // - On prompt containing "quota-trigger": emits a weekly quota RateLimited error with no side effects.
+    // - On normal prompt: modifies a.txt (triggering git tree diff) without creating ok.txt.
+    // - On verify auto-fix prompt (contains "verify command"): creates ok.txt so verify_command passes!
+    let fake_claude = tmp.0.join("fake-claude-t4");
+    let count_file = tmp.0.join("claude-runs.txt");
+    std::fs::write(
+        &fake_claude,
+        format!(
+            r#"#!/bin/sh
+IFS= read -r line
+printf 'run\n' >> "{count}"
+case "$line" in
+  *quota-trigger*)
+    printf '%s\n' '{{"type":"result","is_error":true,"result":"You have hit your weekly usage limit"}}'
+    exit 0
+    ;;
+  *"verify command"*)
+    printf 'fixed\n' > ok.txt
+    printf '%s\n' '{{"type":"system","session_id":"sess-fix"}}'
+    printf '%s\n' '{{"type":"result","subtype":"success","result":"fixed ok.txt"}}'
+    exit 0
+    ;;
+  *)
+    printf 'v1\n' > a.txt
+    printf '%s\n' '{{"type":"system","session_id":"sess-1"}}'
+    printf '%s\n' '{{"type":"result","subtype":"success","result":"edited a.txt"}}'
+    exit 0
+    ;;
+esac
+"#,
+            count = count_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut cfg = ServerConfig {
+        data_dir: tmp.0.join("server"),
+        enabled_providers: vec![ProviderId::Claude, ProviderId::Mock],
+        verify_max_auto_fixes: 2,
+        fallback_models: vec![t3_core::ModelSelection {
+            provider: ProviderId::Mock,
+            model: "mock".into(),
+            effort: None,
+            agent: None,
+        }],
+        rate_limit_initial_backoff_secs: 0,
+        ..Default::default()
+    };
+    cfg.providers.claude_bin = fake_claude;
+    let state = ServerState::new(cfg, "http://127.0.0.1:3774".into()).unwrap();
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+
+    let proj = json_req(
+        &app,
+        Method::POST,
+        "/api/projects",
+        Some(json!({"title": "Verify Proj", "workspace_root": workspace})),
+    )
+    .await;
+    let pid = proj["id"].as_str().unwrap();
+    json_req(
+        &app,
+        Method::PATCH,
+        &format!("/api/projects/{pid}"),
+        Some(json!({"verify_command": "test -f ok.txt"})),
+    )
+    .await;
+
+    // 1. Verify auto-fix loop: run 1 mutates a.txt (fails verify), auto-fix run 2 creates ok.txt and succeeds!
+    let thread = json_req(
+        &app,
+        Method::POST,
+        "/api/threads",
+        Some(json!({
+            "project_id": pid,
+            "title": "AutoFix Thread",
+            "model_selection": {"provider": "claude", "model": "claude-sonnet-4-5"},
+            "runtime_mode": "full-access"
+        })),
+    )
+    .await;
+    let tid: Uuid = thread["id"].as_str().unwrap().parse().unwrap();
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{tid}/messages"),
+        Some(json!({"prompt": "edit a.txt"})),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && !workspace.join("ok.txt").exists() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        workspace.join("ok.txt").exists(),
+        "auto-fix loop should have created ok.txt"
+    );
+    // Wait until the auto-fix run settles to Completed.
+    let mut detail = Value::Null;
+    for _ in 0..60 {
+        detail = json_req(&app, Method::GET, &format!("/api/threads/{tid}"), None).await;
+        if detail["runs"].as_array().unwrap().len() >= 2
+            && detail["thread"]["status"] == "completed"
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(detail["thread"]["status"], "completed");
+    assert_eq!(detail["runs"].as_array().unwrap().len(), 2);
+
+    // 2. Quota-exhausted automatic provider fallback: Claude hits weekly limit -> falls back to Mock!
+    let fb_thread = json_req(
+        &app,
+        Method::POST,
+        "/api/threads",
+        Some(json!({
+            "project_id": pid,
+            "title": "Fallback Thread",
+            "model_selection": {"provider": "claude", "model": "claude-sonnet-4-5"},
+            "runtime_mode": "full-access"
+        })),
+    )
+    .await;
+    let fb_tid: Uuid = fb_thread["id"].as_str().unwrap().parse().unwrap();
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{fb_tid}/messages"),
+        Some(json!({"prompt": "quota-trigger please answer"})),
+    )
+    .await;
+    wait_for_thread(&mut events, fb_tid, ThreadStatus::Completed).await;
+    let fb_detail = json_req(&app, Method::GET, &format!("/api/threads/{fb_tid}"), None).await;
+    let fb_runs = fb_detail["runs"].as_array().unwrap();
+    assert_eq!(fb_runs.len(), 2);
+    assert_eq!(fb_runs[0]["status"], "rate-limited");
+    assert_eq!(fb_runs[1]["provider"], "mock");
+    assert_eq!(fb_runs[1]["status"], "completed");
 }

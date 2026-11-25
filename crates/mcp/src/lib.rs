@@ -46,6 +46,16 @@ pub struct ForkOptions {
     pub handoff_summary: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskMergeResult {
+    pub merged: bool,
+    pub child_thread_id: Uuid,
+    pub branch: String,
+    pub summary: String,
+    pub conflict_files: Vec<String>,
+    pub cleaned_up: bool,
+}
+
 #[async_trait]
 pub trait OrchestratorBackend: Send + Sync {
     async fn get_thread(&self, id: Uuid) -> CoreResult<Thread>;
@@ -62,6 +72,22 @@ pub trait OrchestratorBackend: Send + Sync {
     -> CoreResult<DelegatedTask>;
     async fn task_status(&self, task_id: Uuid) -> CoreResult<DelegatedTask>;
     async fn task_cancel(&self, task_id: Uuid) -> CoreResult<DelegatedTask>;
+    async fn task_diff(&self, _caller_id: Uuid, _child_thread_id: Uuid) -> CoreResult<DiffSummary> {
+        Err(CoreError::InvalidArgument(
+            "task_diff is unsupported by this backend".into(),
+        ))
+    }
+    async fn task_merge(
+        &self,
+        _caller_id: Uuid,
+        _child_thread_id: Uuid,
+        _commit_message: Option<String>,
+        _cleanup: bool,
+    ) -> CoreResult<TaskMergeResult> {
+        Err(CoreError::InvalidArgument(
+            "task_merge is unsupported by this backend".into(),
+        ))
+    }
     async fn thread_list(
         &self,
         project_id: Option<Uuid>,
@@ -317,6 +343,38 @@ impl<B: OrchestratorBackend> McpServer<B> {
                     encode(backend.task_cancel(id).await?)
                 }
             }
+            "task_diff" => {
+                let args: TaskDiffArgs = decode(args)?;
+                let caller_id = resolve_caller_thread(args.parent_thread_id, context)?;
+                self.scoped_thread(args.child_thread_id, caller).await?;
+                encode(backend.task_diff(caller_id, args.child_thread_id).await?)
+            }
+            "task_merge" => {
+                let args: TaskMergeArgs = decode(args)?;
+                let caller_id = resolve_caller_thread(args.parent_thread_id, context)?;
+                let is_plan = if let Some(caller) = caller {
+                    caller.interaction_mode == InteractionMode::Plan
+                } else {
+                    backend.get_thread(caller_id).await?.interaction_mode == InteractionMode::Plan
+                };
+                if is_plan {
+                    return Err(CoreError::InvalidArgument(
+                        "a plan thread cannot merge a task worktree".into(),
+                    ));
+                }
+                self.check_target_permissions(args.child_thread_id, caller)
+                    .await?;
+                encode(
+                    backend
+                        .task_merge(
+                            caller_id,
+                            args.child_thread_id,
+                            args.commit_message,
+                            args.cleanup,
+                        )
+                        .await?,
+                )
+            }
             "thread_list" => {
                 let args: ListArgs = decode(args)?;
                 let project_id = if let Some(caller) = caller {
@@ -441,6 +499,14 @@ fn swarm_thread(arg: Option<Uuid>, context: CallContext<'_>) -> CoreResult<Uuid>
     Ok(id)
 }
 
+fn resolve_caller_thread(arg: Option<Uuid>, context: CallContext<'_>) -> CoreResult<Uuid> {
+    let id = resolve_thread(arg, context.thread_id)?;
+    if context.caller.is_some_and(|caller| caller.id != id) {
+        return Err(CoreError::InvalidArgument("caller thread mismatch".into()));
+    }
+    Ok(id)
+}
+
 fn decode<T: DeserializeOwned>(args: Value) -> CoreResult<T> {
     serde_json::from_value(args).map_err(|error| CoreError::InvalidArgument(error.to_string()))
 }
@@ -516,6 +582,23 @@ struct DelegateArgs {
 #[derive(Deserialize)]
 struct TaskArgs {
     task_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct TaskDiffArgs {
+    #[serde(alias = "task_id")]
+    child_thread_id: Uuid,
+    parent_thread_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct TaskMergeArgs {
+    #[serde(alias = "task_id")]
+    child_thread_id: Uuid,
+    parent_thread_id: Option<Uuid>,
+    commit_message: Option<String>,
+    #[serde(default)]
+    cleanup: bool,
 }
 
 #[derive(Deserialize)]
@@ -646,6 +729,23 @@ fn tools() -> Vec<Value> {
             &["task_id"],
         ),
         make(
+            "task_diff",
+            "Inspect the Git diff of a delegated child worktree branch relative to its parent.",
+            json!({"child_thread_id": uuid, "parent_thread_id": uuid}),
+            &["child_thread_id"],
+        ),
+        make(
+            "task_merge",
+            "Merge a delegated child worktree branch into its parent workspace, optionally cleaning up the worktree and t3rs/* branch.",
+            json!({
+                "child_thread_id": uuid,
+                "parent_thread_id": uuid,
+                "commit_message": string,
+                "cleanup": {"type": "boolean"}
+            }),
+            &["child_thread_id"],
+        ),
+        make(
             "thread_list",
             "List recent threads.",
             json!({"project_id": uuid, "include_archived": {"type": "boolean"}, "limit": limit}),
@@ -734,4 +834,427 @@ fn tools() -> Vec<Value> {
             ],
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecordedMerge {
+        caller_id: Uuid,
+        child_thread_id: Uuid,
+        commit_message: Option<String>,
+        cleanup: bool,
+    }
+
+    struct StubBackend {
+        threads: Vec<Thread>,
+        support_merge: bool,
+        last_merge: Arc<Mutex<Option<RecordedMerge>>>,
+    }
+
+    impl StubBackend {
+        fn new(threads: Vec<Thread>, support_merge: bool) -> Self {
+            Self {
+                threads,
+                support_merge,
+                last_merge: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl OrchestratorBackend for StubBackend {
+        async fn get_thread(&self, id: Uuid) -> CoreResult<Thread> {
+            self.threads
+                .iter()
+                .find(|t| t.id == id)
+                .cloned()
+                .ok_or_else(|| CoreError::NotFound("thread".into()))
+        }
+
+        async fn capabilities(&self) -> CoreResult<Capabilities> {
+            Ok(Capabilities {
+                providers: vec![],
+                model_tiers: vec![],
+            })
+        }
+
+        async fn delegate(
+            &self,
+            _spec: DelegationSpec,
+            _mode: DelegateMode,
+        ) -> CoreResult<DelegatedTask> {
+            Err(CoreError::InvalidArgument("unused".into()))
+        }
+
+        async fn task_status(&self, _task_id: Uuid) -> CoreResult<DelegatedTask> {
+            Err(CoreError::InvalidArgument("unused".into()))
+        }
+
+        async fn task_cancel(&self, _task_id: Uuid) -> CoreResult<DelegatedTask> {
+            Err(CoreError::InvalidArgument("unused".into()))
+        }
+
+        async fn task_diff(
+            &self,
+            caller_id: Uuid,
+            child_thread_id: Uuid,
+        ) -> CoreResult<DiffSummary> {
+            if !self.support_merge {
+                return Err(CoreError::InvalidArgument(
+                    "task_diff is unsupported by this backend".into(),
+                ));
+            }
+            Ok(DiffSummary {
+                workspace_path: PathBuf::from(format!("/tmp/{caller_id}")),
+                branch: Some(format!("t3rs/{child_thread_id}")),
+                clean: false,
+                total_additions: 3,
+                total_deletions: 1,
+                files: vec![DiffFile {
+                    path: "src/lib.rs".into(),
+                    status: "M".into(),
+                    additions: 3,
+                    deletions: 1,
+                    patch: "+fn hi() {}\n".into(),
+                }],
+            })
+        }
+
+        async fn task_merge(
+            &self,
+            caller_id: Uuid,
+            child_thread_id: Uuid,
+            commit_message: Option<String>,
+            cleanup: bool,
+        ) -> CoreResult<TaskMergeResult> {
+            if !self.support_merge {
+                return Err(CoreError::InvalidArgument(
+                    "task_merge is unsupported by this backend".into(),
+                ));
+            }
+            *self.last_merge.lock().unwrap() = Some(RecordedMerge {
+                caller_id,
+                child_thread_id,
+                commit_message,
+                cleanup,
+            });
+            Ok(TaskMergeResult {
+                merged: true,
+                child_thread_id,
+                branch: "t3rs/child".into(),
+                summary: "merged".into(),
+                conflict_files: vec![],
+                cleaned_up: cleanup,
+            })
+        }
+
+        async fn thread_list(
+            &self,
+            _project_id: Option<Uuid>,
+            _include_archived: bool,
+            _limit: usize,
+        ) -> CoreResult<Vec<Thread>> {
+            Ok(vec![])
+        }
+
+        async fn thread_read(&self, _thread_id: Uuid, _limit: usize) -> CoreResult<ThreadRead> {
+            Err(CoreError::NotFound("thread".into()))
+        }
+
+        async fn thread_send(
+            &self,
+            _thread_id: Uuid,
+            _prompt: String,
+            _behavior: Option<FollowUpBehavior>,
+        ) -> CoreResult<Uuid> {
+            Ok(Uuid::nil())
+        }
+
+        async fn thread_fork(&self, _thread_id: Uuid, _options: ForkOptions) -> CoreResult<Thread> {
+            Err(CoreError::NotFound("thread".into()))
+        }
+
+        async fn orch_stats(&self) -> CoreResult<Vec<OrchModelStat>> {
+            Ok(vec![])
+        }
+    }
+
+    struct DefaultUnsupportedBackend(Thread);
+
+    #[async_trait]
+    impl OrchestratorBackend for DefaultUnsupportedBackend {
+        async fn get_thread(&self, id: Uuid) -> CoreResult<Thread> {
+            (self.0.id == id)
+                .then(|| self.0.clone())
+                .ok_or_else(|| CoreError::NotFound("thread".into()))
+        }
+        async fn capabilities(&self) -> CoreResult<Capabilities> {
+            Ok(Capabilities {
+                providers: vec![],
+                model_tiers: vec![],
+            })
+        }
+        async fn delegate(
+            &self,
+            _spec: DelegationSpec,
+            _mode: DelegateMode,
+        ) -> CoreResult<DelegatedTask> {
+            Err(CoreError::InvalidArgument("unused".into()))
+        }
+        async fn task_status(&self, _task_id: Uuid) -> CoreResult<DelegatedTask> {
+            Err(CoreError::InvalidArgument("unused".into()))
+        }
+        async fn task_cancel(&self, _task_id: Uuid) -> CoreResult<DelegatedTask> {
+            Err(CoreError::InvalidArgument("unused".into()))
+        }
+        async fn thread_list(
+            &self,
+            _project_id: Option<Uuid>,
+            _include_archived: bool,
+            _limit: usize,
+        ) -> CoreResult<Vec<Thread>> {
+            Ok(vec![])
+        }
+        async fn thread_read(&self, _thread_id: Uuid, _limit: usize) -> CoreResult<ThreadRead> {
+            Err(CoreError::NotFound("thread".into()))
+        }
+        async fn thread_send(
+            &self,
+            _thread_id: Uuid,
+            _prompt: String,
+            _behavior: Option<FollowUpBehavior>,
+        ) -> CoreResult<Uuid> {
+            Ok(Uuid::nil())
+        }
+        async fn thread_fork(&self, _thread_id: Uuid, _options: ForkOptions) -> CoreResult<Thread> {
+            Err(CoreError::NotFound("thread".into()))
+        }
+        async fn orch_stats(&self) -> CoreResult<Vec<OrchModelStat>> {
+            Ok(vec![])
+        }
+    }
+
+    fn make_thread(
+        project_id: Uuid,
+        runtime_mode: RuntimeMode,
+        interaction_mode: InteractionMode,
+    ) -> Thread {
+        let now = "2026-11-25T00:00:00Z".parse().unwrap();
+        Thread {
+            id: Uuid::new_v4(),
+            project_id,
+            parent_thread_id: None,
+            relationship: None,
+            title: "test".into(),
+            model_selection: ModelSelection::default(),
+            runtime_mode,
+            interaction_mode,
+            status: ThreadStatus::Idle,
+            worktree_path: None,
+            branch: None,
+            provider_session_id: None,
+            archived: false,
+            pinned: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn rpc_call(name: &str, arguments: Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        })
+    }
+
+    #[tokio::test]
+    async fn tools_list_registers_task_diff_and_task_merge() {
+        let parent = make_thread(
+            Uuid::new_v4(),
+            RuntimeMode::FullAccess,
+            InteractionMode::Default,
+        );
+        let server = McpServer::new(DefaultUnsupportedBackend(parent));
+        let list = server
+            .handle(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+                None,
+            )
+            .await
+            .unwrap();
+        let tools = list["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "task_diff"));
+        assert!(tools.iter().any(|t| t["name"] == "task_merge"));
+    }
+
+    #[tokio::test]
+    async fn default_trait_methods_return_unsupported() {
+        let parent = make_thread(
+            Uuid::new_v4(),
+            RuntimeMode::FullAccess,
+            InteractionMode::Default,
+        );
+        let parent_id = parent.id;
+        let server = McpServer::new(DefaultUnsupportedBackend(parent));
+        let diff_res = server
+            .handle(
+                rpc_call("task_diff", json!({"child_thread_id": Uuid::new_v4()})),
+                Some(parent_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(diff_res["result"]["isError"], true);
+        assert!(
+            diff_res["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported")
+        );
+        let merge_res = server
+            .handle(
+                rpc_call("task_merge", json!({"child_thread_id": Uuid::new_v4()})),
+                Some(parent_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(merge_res["result"]["isError"], true);
+        assert!(
+            merge_res["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported")
+        );
+    }
+
+    #[tokio::test]
+    async fn task_diff_and_task_merge_enforce_permissions_and_dispatch() {
+        let project = Uuid::new_v4();
+        let other_project = Uuid::new_v4();
+        let parent = make_thread(
+            project,
+            RuntimeMode::AutoAcceptEdits,
+            InteractionMode::Default,
+        );
+        let mut child = make_thread(
+            project,
+            RuntimeMode::AutoAcceptEdits,
+            InteractionMode::Default,
+        );
+        child.parent_thread_id = Some(parent.id);
+        let privileged_child =
+            make_thread(project, RuntimeMode::FullAccess, InteractionMode::Default);
+        let foreign_child = make_thread(
+            other_project,
+            RuntimeMode::ApprovalRequired,
+            InteractionMode::Default,
+        );
+        let plan_parent = make_thread(project, RuntimeMode::FullAccess, InteractionMode::Plan);
+
+        let backend = StubBackend::new(
+            vec![
+                parent.clone(),
+                child.clone(),
+                privileged_child.clone(),
+                foreign_child.clone(),
+                plan_parent.clone(),
+            ],
+            true,
+        );
+        let recorded = backend.last_merge.clone();
+        let server = McpServer::new(backend);
+
+        // Happy path: scoped task_diff and task_merge.
+        let diff_req = rpc_call("task_diff", json!({"child_thread_id": child.id}));
+        let diff_res = server
+            .handle_scoped_bytes(diff_req.to_string().as_bytes(), &parent)
+            .await
+            .unwrap();
+        assert_ne!(diff_res["result"]["isError"], true);
+        let diff_payload: Value =
+            serde_json::from_str(diff_res["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(diff_payload["total_additions"], 3);
+
+        let merge_req = rpc_call(
+            "task_merge",
+            json!({"child_thread_id": child.id, "commit_message": "merge child", "cleanup": true}),
+        );
+        let merge_res = server
+            .handle_scoped_bytes(merge_req.to_string().as_bytes(), &parent)
+            .await
+            .unwrap();
+        assert_ne!(merge_res["result"]["isError"], true);
+        let merge_payload: TaskMergeResult =
+            serde_json::from_str(merge_res["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert!(merge_payload.merged);
+        assert!(merge_payload.cleaned_up);
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            Some(RecordedMerge {
+                caller_id: parent.id,
+                child_thread_id: child.id,
+                commit_message: Some("merge child".into()),
+                cleanup: true,
+            })
+        );
+
+        // Plan caller cannot call task_merge (both scoped and unscoped).
+        let plan_req = rpc_call("task_merge", json!({"child_thread_id": child.id}));
+        let plan_scoped = server
+            .handle_scoped_bytes(plan_req.to_string().as_bytes(), &plan_parent)
+            .await
+            .unwrap();
+        assert_eq!(plan_scoped["result"]["isError"], true);
+        assert!(
+            plan_scoped["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("plan")
+        );
+        let plan_unscoped = server.handle(plan_req, Some(plan_parent.id)).await.unwrap();
+        assert_eq!(plan_unscoped["result"]["isError"], true);
+
+        // Caller cannot merge a higher-privilege target thread.
+        let esc_req = rpc_call(
+            "task_merge",
+            json!({"child_thread_id": privileged_child.id}),
+        );
+        let esc_res = server
+            .handle_scoped_bytes(esc_req.to_string().as_bytes(), &parent)
+            .await
+            .unwrap();
+        assert_eq!(esc_res["result"]["isError"], true);
+        assert!(
+            esc_res["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("permissions")
+        );
+
+        // Caller cannot inspect or merge a thread in another project.
+        let foreign_req = rpc_call("task_diff", json!({"child_thread_id": foreign_child.id}));
+        let foreign_res = server
+            .handle_scoped_bytes(foreign_req.to_string().as_bytes(), &parent)
+            .await
+            .unwrap();
+        assert_eq!(foreign_res["result"]["isError"], true);
+
+        // Scoped caller cannot spoof another parent_thread_id.
+        let spoof_req = rpc_call(
+            "task_merge",
+            json!({"child_thread_id": child.id, "parent_thread_id": plan_parent.id}),
+        );
+        let spoof_res = server
+            .handle_scoped_bytes(spoof_req.to_string().as_bytes(), &parent)
+            .await
+            .unwrap();
+        assert_eq!(spoof_res["result"]["isError"], true);
+    }
 }

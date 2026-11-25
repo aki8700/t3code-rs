@@ -9,6 +9,11 @@ import {
 } from './js/util.js';
 import { md, mdEl } from './js/markdown.js';
 import {
+  U_PERIODS, U_METRICS, U_KINDS, uId, uSum, normalizeUsage, uText, normalizeLimits,
+  LIMIT_CRITICAL, limitIsReset, limitIsOut, fmtLeft, fmtDurationJa, fmtResetIn, fmtResetAt,
+  limitSource, limitState, bucketTick, bucketTitle, rangeText, niceScale, monotonePath, axisMarks,
+} from './js/usage-data.js';
+import {
   fileEntries, changedFiles, patchLines, latestTurnChangedPaths, filterDiffFilesByPaths,
 } from './js/patch.js';
 import { wireRailResizer } from './js/rail.js';
@@ -58,6 +63,7 @@ const S = {
   diffStat: null,         // { threadId, add, del, files }
   diffData: null,         // { threadId, data }
   diffError: null,        // { threadId, message }
+  parentDiff: null,       // { parentId, childId, branch, data } while showing a parent↔child diff
   diffScope: ls.get('t3.diffScope', 'all') === 'latest' ? 'latest' : 'all',
   ignoreWs: ls.get('t3.ws', '1') !== '0',
   dbStats: null,
@@ -74,6 +80,8 @@ const S = {
 const threadById = (id) => S.threads.find((t) => t.id === id) || (S.detail?.thread?.id === id ? S.detail.thread : null)
   || S.detail?.children?.find((t) => t.id === id) || null;
 const curThread = () => S.detail?.thread || null;
+/** 'rate-limited' はサイドバー・タイムライン・モニターすべてで「制限中」と表示する。 */
+const statusLabel = (st) => (st === 'rate-limited' ? '制限中' : (STATUS_LABEL[st] || st));
 const projectById = (id) => S.projects.find((p) => p.id === id) || null;
 const projectTitle = (id) => projectById(id)?.title || '';
 
@@ -475,7 +483,7 @@ function threadRow(t, { shelf = false, kids = [] } = {}) {
   const hasKids = !shelf && kids.length > 0;
   const collapsed = !(S.kidsOpen.get(t.id) ?? (S.showKids || kids.some((k) => treeHas(k, S.threadId))));
   const rel = t.parent_thread_id ? (REL_LABEL[t.relationship] || t.relationship || '子') : null;
-  const status = STATUS_LABEL[t.status] || t.status;
+  const status = statusLabel(t.status);
 
   const title = cleanTitle(t.title);
   const act = (name, ic, label, fn, on) => { const b = ibtn(ic, label, (e) => { e.stopPropagation(); fn(); }, `xs${on ? ' on' : ''}`); b.dataset.act = name; return b; };
@@ -712,7 +720,7 @@ async function openThread(id, { push = true } = {}) {
   if (id !== S.threadId) {
     stashDraft();
     S.threadId = id;
-    S.detail = null; S.diffStat = null; S.diffData = null; S.diffError = null;
+    S.detail = null; S.diffStat = null; S.diffData = null; S.diffError = null; S.parentDiff = null;
     diffOpenFiles.clear();
     clearBlobCache();
     restoreDraft();
@@ -868,17 +876,109 @@ function renderHeader() {
     h('button', { type: 'button', id: 'thread-title', class: 'title-btn', title: 'クリックして名前を変更', text: cleanTitle(t.title), onclick: renameInline }),
     badge,
     t.branch ? h('span', { class: 'branch-pill', title: t.worktree_path ? `worktree: ${t.worktree_path}` : 'ブランチ' }, iconEl('fork'), h('span', { text: t.branch }), t.worktree_path ? h('em', { text: 'worktree' }) : null) : null,
-    ['idle', 'completed'].includes(t.status) ? null : h('span', { class: `status-pill s-${t.status}`, text: STATUS_LABEL[t.status] || t.status }),
+    ['idle', 'completed'].includes(t.status) ? null : h('span', { class: `status-pill s-${t.status}`, text: statusLabel(t.status) }),
   ].filter(Boolean));
 }
 
 function childrenMenu(anchor) {
   const kids = S.detail?.children || [];
   if (!kids.length) return;
-  openPopover(anchor, h('div', { class: 'menu kids-list', role: 'menu', 'aria-label': '子スレッド' }, [...kids].sort(threadCmp).map((k) => h('button', {
-    type: 'button', role: 'menuitem', class: 'menu-item kid-item', title: cleanTitle(k.title), dataset: { child: k.id },
-    onclick: () => openThread(k.id),
-  }, provDot(k.model_selection?.provider, `${k.status === 'running' ? 'live' : ''} s-${k.status}`), h('span', { class: 't', text: cleanTitle(k.title) }), h('small', { text: STATUS_LABEL[k.status] || k.status })))), { cls: 'kids-pop', below: true });
+  const parent = curThread();
+  const rows = [...kids].sort(threadCmp).map((k) => {
+    const openBtn = h('button', {
+      type: 'button', role: 'menuitem', class: 'menu-item kid-item', title: cleanTitle(k.title), dataset: { child: k.id },
+      onclick: () => openThread(k.id),
+    }, provDot(k.model_selection?.provider, `${k.status === 'running' ? 'live' : ''} s-${k.status}`), h('span', { class: 't', text: cleanTitle(k.title) }), h('small', { text: statusLabel(k.status) }));
+    const acts = isWorktreeChild(k, parent) ? h('span', { class: 'kid-acts' },
+      h('button', {
+        type: 'button', class: 'btn xs', text: '親との差分', title: '親スレッドとの差分を表示',
+        onclick: (e) => { e.stopPropagation(); showParentDiff(parent.id, k.id); },
+      }),
+      mergeConfirmControl(parent.id, k, 'btn xs')) : null;
+    return h('div', { class: 'kid-row' }, openBtn, acts);
+  });
+  openPopover(anchor, h('div', { class: 'menu kids-list', role: 'menu', 'aria-label': '子スレッド' }, rows), { cls: 'kids-pop', below: true });
+}
+
+/** 専用 worktree 子スレッドか: 親と worktree/ブランチが異なる子。親が未読込でも worktree_path があれば対象とする。 */
+function isWorktreeChild(child, parent) {
+  if (!child?.parent_thread_id || !child.worktree_path) return false;
+  if (parent && child.worktree_path === parent.worktree_path) return false;
+  if (parent && child.branch && parent.branch && child.branch === parent.branch) return false;
+  return true;
+}
+
+/** 親スレッドとの差分を取得し、#diff-panel にバナー付きで表示する。 */
+async function showParentDiff(parentId, childId) {
+  const child = threadById(childId) || (S.detail?.children || []).find((k) => k.id === childId) || null;
+  closePopover();
+  diffSeq++; // 進行中の通常差分取得を無効化する
+  S.parentDiff = { parentId, childId, branch: child?.branch || '', data: null };
+  setRail('diff'); // loadDiff は parentDiff 表示中は何もしない
+  const body = $('#diff-body');
+  body?.replaceChildren(h('div', { class: 'dp-empty', text: '親との差分を読み込み中…' }));
+  try {
+    const d = await api(`/api/threads/${parentId}/children/${childId}/diff?ignore_whitespace=${S.ignoreWs}`);
+    if (!S.parentDiff || S.parentDiff.childId !== childId) return; // 別スレッドへ移動済み
+    diffSeq++; // setRail 経由の通常差分取得が残っていれば無効化する
+    S.parentDiff.data = d;
+    if (!S.parentDiff.branch) S.parentDiff.branch = d.branch || '';
+    diffShownFor = childId;
+    renderDiffView(d);
+  } catch (e) {
+    S.parentDiff = null;
+    toast(`親との差分を取得できません: ${e.message}`, 'err');
+    loadDiff();
+  }
+}
+
+/** インライン 2 段階確認の「親へマージ」コントロール（window.confirm は使わない）。 */
+function mergeConfirmControl(parentId, child, btnClass = 'btn xs') {
+  const wrap = h('span', { class: 'merge-ctl' });
+  const showIdle = () => {
+    wrap.replaceChildren(h('button', {
+      type: 'button', class: btnClass, text: '親へマージ', title: 'この子スレッドを親スレッドへマージする',
+      onclick: (e) => { e.stopPropagation(); showArmed(); },
+    }));
+  };
+  const showArmed = () => {
+    const go = h('button', {
+      type: 'button', class: `${btnClass} primary`, text: 'マージ実行',
+      onclick: (e) => { e.stopPropagation(); doMerge(parentId, child, go, cancel); },
+    });
+    const cancel = h('button', {
+      type: 'button', class: btnClass, text: 'キャンセル',
+      onclick: (e) => { e.stopPropagation(); showIdle(); },
+    });
+    wrap.replaceChildren(h('span', { class: 'merge-q', text: '本当にマージ？' }), go, cancel);
+    setTimeout(() => { if (wrap.isConnected && wrap.contains(go) && !go.disabled) showIdle(); }, 10000);
+  };
+  showIdle();
+  return wrap;
+}
+
+async function doMerge(parentId, child, goBtn, cancelBtn) {
+  goBtn.disabled = true;
+  if (cancelBtn) cancelBtn.disabled = true;
+  try {
+    const r = await api(`/api/threads/${parentId}/children/${child.id}/merge`, { method: 'POST', json: {} });
+    if (r.merged) {
+      toast('親へマージしました', 'ok');
+      closePopover();
+      await loadThreads();
+      loadDetailSoon();
+      refreshDiffSoon();
+    } else {
+      const files = r.conflict_files || [];
+      toast(files.length ? `マージ競合: ${files.slice(0, 3).join(', ')}${files.length > 3 ? ` 他 ${files.length - 3} 件` : ''}` : 'マージできませんでした（競合）', 'err', 6000);
+      goBtn.disabled = false;
+      if (cancelBtn) cancelBtn.disabled = false;
+    }
+  } catch (e) {
+    toast(`マージに失敗: ${e.message}`, 'err');
+    goBtn.disabled = false;
+    if (cancelBtn) cancelBtn.disabled = false;
+  }
 }
 
 function renameInline() {
@@ -1152,7 +1252,7 @@ function buildStep(item) {
       const progress = pstr(p, 'progress');
       const row = stepRow({
         item, icon: 'bot', verb: 'サブエージェント', target: title, cls: 'sub',
-        badges: [sel ? h('span', { class: 'sbadge prov' }, provDot(sel.provider), provLabel(sel.provider)) : null, h('span', { class: `sbadge sub-status s-${st}`, text: STATUS_LABEL[st] || st })].filter(Boolean),
+        badges: [sel ? h('span', { class: 'sbadge prov' }, provDot(sel.provider), provLabel(sel.provider)) : null, h('span', { class: `sbadge sub-status s-${st}`, text: statusLabel(st) })].filter(Boolean),
         trailing: cid ? h('button', { class: 'btn xs open-child', type: 'button', text: 'スレッドを開く →', onclick: (e) => { e.preventDefault(); openThread(cid); } }) : null,
         sections: [
           ...(prompt ? [() => h('details', { class: 'sub-prompt' }, h('summary', {}, iconEl('chevron', 's-chev'), h('span', { text: '指示内容（プロンプト）' }), h('small', { text: `${fmtNum(prompt.length)}文字` })), pre(prompt))] : []),
@@ -1385,7 +1485,7 @@ function runFooter(run) {
       run.duration_ms != null ? h('span', { text: fmtDur(run.duration_ms) }) : null,
       run.input_tokens || run.output_tokens ? h('span', { title: '入力 / 出力トークン', text: `↑${fmtTok(run.input_tokens)} ↓${fmtTok(run.output_tokens)}` }) : null,
       runCost > 0 ? h('span', { title: 'このターンの推定コスト', text: fmtUsd(runCost) }) : null,
-      ok ? null : h('span', { class: 'rf-status', text: STATUS_LABEL[run.status] || run.status }),
+      ok ? null : h('span', { class: 'rf-status', text: statusLabel(run.status) }),
       canRollback ? h('button', {
         class: 'btn xs rf-rollback', type: 'button', text: '元に戻す', title: 'このターン開始前の作業ツリー状態に戻す',
         onclick: async (e) => {
@@ -1405,10 +1505,92 @@ function runFooter(run) {
 
 const runGroup = (runId) => h('div', { class: 'run-group', dataset: { run: runId || '' } });
 
+// Incremental re-render bookkeeping: the item ids of the last renderTimeline
+// pass, so a plain refresh can append only the new tail instead of rebuilding
+// the DOM (keeps .run-group nodes, open folds, text selection and scroll).
+let timelineSig = null; // { threadId, firstId, ids, lastRunId, allFolded, count, totalItems, hasMore, handoffs }
+
+function timelineSignature(d) {
+  const items = d.items;
+  const runs = new Map((d.runs || []).map((r) => [r.id, r]));
+  let allFolded = true;
+  for (let i = 0; i < items.length;) {
+    const runId = items[i].run_id;
+    let j = i + 1;
+    while (j < items.length && items[j].run_id === runId) j++;
+    if (!isRunDone(runs.get(runId), j < items.length || !isBusy(d.thread.status))) allFolded = false;
+    i = j;
+  }
+  return {
+    threadId: d.thread.id,
+    firstId: items[0]?.id || null,
+    ids: items.map((it) => it.id),
+    lastRunId: items.at(-1)?.run_id || null,
+    allFolded,
+    count: items.length,
+    totalItems: d.total_items,
+    hasMore: d.has_more,
+    handoffs: (d.handoffs || []).length,
+  };
+}
+
+/** Appends only the new tail when the refresh is a plain append; false means "do the full render". */
+function tryIncrementalTimeline(root, d) {
+  const sig = timelineSig;
+  const items = d.items;
+  if (!sig || sig.threadId !== d.thread.id || root.dataset.thread !== d.thread.id) return false;
+  if (!sig.count) return false; // the previous render was the blank state (or a footer-only thread): rebuild it fully
+  if (items.length < sig.count || !sig.allFolded) return false;
+  if (sig.count && items[0]?.id !== sig.firstId) return false;
+  for (let i = 0; i < sig.count; i++) if (items[i].id !== sig.ids[i]) return false; // previously rendered items must be an exact prefix
+  if (d.has_more !== sig.hasMore || d.total_items !== sig.totalItems) return false;
+  if ((d.handoffs || []).length !== sig.handoffs) return false;
+  if (S.optimistic.some((o) => o.threadId === d.thread.id)) return false; // optimistic rows sit between groups and #live
+  const live = $('#live', root);
+  if (!live) return false;
+  const groups = $$('.run-group', root);
+  if (sig.count && (!groups.length || groups.at(-1).dataset.run !== sig.lastRunId)) return false;
+  const fresh = items.slice(sig.count);
+  if (fresh.length && sig.count && fresh[0].run_id === sig.lastRunId) return false; // new items continue the last run: needs a full re-render
+  const strayFoot = root.querySelector(':scope > .run-foot');
+  if (strayFoot && fresh.some((it) => it.run_id === strayFoot.dataset.run)) return false; // a run that already has a standalone footer gained items
+  const runs = new Map((d.runs || []).map((r) => [r.id, r]));
+  const anchor = strayFoot || live;
+  for (let i = 0; i < fresh.length;) {
+    const runId = fresh[i].run_id;
+    let j = i + 1;
+    while (j < fresh.length && fresh[j].run_id === runId) j++;
+    const seg = fresh.slice(i, j);
+    const run = runs.get(runId);
+    const group = runGroup(runId);
+    if (isRunDone(run, sig.count + j < items.length || !isBusy(d.thread.status))) appendFinished(seg, group, run?.duration_ms);
+    else seg.forEach((it) => appendItem(it, group));
+    const foot = runFooter(run);
+    if (foot) group.append(foot);
+    if (group.childElementCount) anchor.before(group);
+    i = j;
+  }
+  // a run with no items yet only gets its footer once it is terminal
+  const lr = latestRun();
+  if (lr && !items.some((it) => it.run_id === lr.id)) {
+    const foot = runFooter(lr);
+    const old = root.querySelector(':scope > .run-foot[data-run="' + CSS.escape(lr.id) + '"]');
+    if (foot && !old) live.before(foot);
+    else if (foot && old && old.className !== foot.className) old.replaceWith(foot);
+  }
+  root.dataset.thread = d.thread.id;
+  root.dataset.threadId = d.thread.id;
+  timelineSig = timelineSignature(d);
+  renderLive();
+  scrollBottom();
+  return true;
+}
+
 function renderTimeline() {
   const root = tl();
   const d = S.detail;
-  if (!d) { if (!S.threadId) root.replaceChildren(); callRows.clear(); foldIndex.clear(); return; }
+  if (!d) { if (!S.threadId) root.replaceChildren(); callRows.clear(); foldIndex.clear(); timelineSig = null; return; }
+  if (tryIncrementalTimeline(root, d)) return;
   // keep what the reader had expanded (and their scroll position) across refreshes
   const same = root.dataset.thread === d.thread.id;
   keepOpen = new Set(same ? $$('details[open][data-item]', root).map((e) => e.dataset.item) : []);
@@ -1416,6 +1598,7 @@ function renderTimeline() {
   const expanded = new Set(same ? $$('.steps.expanded', root).map((e) => e.dataset.run) : []);
   const top = scroller().scrollTop;
   root.dataset.thread = d.thread.id;
+  root.dataset.threadId = d.thread.id;
   callRows.clear(); foldIndex.clear();
   const frag = document.createDocumentFragment();
   if (d.has_more) {
@@ -1457,6 +1640,7 @@ function renderTimeline() {
   $$('.steps', frag).forEach((g) => { if (!g.closest('.work-fold') && expanded.has(g.dataset.run)) { g.classList.add('expanded'); labelSteps(g); } });
   $$('details[data-item]', frag).forEach((e) => { if (keepOpen.has(e.dataset.item)) e.open = true; });
   root.replaceChildren(frag);
+  timelineSig = timelineSignature(d);
   if (same && !S.stick) scroller().scrollTop = top;
   renderLive();
   scrollBottom();
@@ -1480,6 +1664,10 @@ function renderKeepingAnchor() {
 
 function optimisticEl(o) { return h('div', { class: 'msg user pending', dataset: { opt: o.key } }, userBubble(o.text, `opt:${o.key}`)); }
 
+// Live Markdown repaint throttle: last md() render time + pending trailing timer.
+let liveMdLast = 0;
+let liveMdTimer = 0;
+
 const renderLive = rafThrottle(() => {
   const host = $('#live');
   const t = curThread();
@@ -1496,11 +1684,22 @@ const renderLive = rafThrottle(() => {
   } else reas?.remove();
   if (live?.assistant) {
     if (!asst) { asst = h('div', { class: 'msg assistant live' }, h('div', { class: 'md' })); host.insertBefore(asst, work); }
-    asst.firstChild.innerHTML = md(live.assistant);
+    const text = live.assistant;
+    if (asst.dataset.len !== String(text.length)) {
+      // Long replies re-parse Markdown on every frame; throttle those repaints.
+      const now = performance.now();
+      if (text.length > 4000 && now - liveMdLast < 120) {
+        if (!liveMdTimer) liveMdTimer = setTimeout(() => { liveMdTimer = 0; renderLive(); }, 120 - (now - liveMdLast));
+      } else {
+        liveMdLast = now;
+        asst.firstChild.innerHTML = md(text);
+        asst.dataset.len = String(text.length);
+      }
+    }
   } else asst?.remove();
   if (isBusy(t.status)) {
     if (!work) { work = h('div', { class: 'working' }, h('span', { class: 'dots' }, h('i'), h('i'), h('i')), h('span', { class: 'w-label' }), h('span', { class: 'w-time' })); host.append(work); }
-    $('.w-label', work).textContent = t.status === 'rate-limited' ? 'レート制限 — 自動再開を待っています' : t.status === 'waiting-for-children' ? '子スレッドの完了を待っています' : '作業中';
+    $('.w-label', work).textContent = t.status === 'rate-limited' ? '制限中 — 自動再開を待っています' : t.status === 'waiting-for-children' ? '子スレッドの完了を待っています' : '作業中';
     tickTimer();
   } else work?.remove();
   if (stick) scrollBottom();
@@ -1803,10 +2002,28 @@ async function runShellCommand(command) {
   input.value = '';
   hideCommandPalette();
   autosize();
-  sending = true;
   syncSendEnabled();
+  // コンポーザはロックしない: 実行中も別メッセージ送信や ! 連続実行ができる。
   const label = oneLine(cmd, 56);
-  toast(`$ ${label} を実行中…`, 'info', 2500);
+  const streamPath = t ? `/api/threads/${t.id}/exec/stream` : `/api/projects/${project.id}/exec/stream`;
+  let res;
+  try {
+    res = await api(streamPath, { method: 'POST', json: { command: cmd } });
+  } catch (e) {
+    if (e.status === 404 || e.status === 405) { await runShellCommandSync(t, project, cmd, label); return; }
+    input.value = `!${cmd}`;
+    autosize();
+    toast(`コマンド実行に失敗: ${e.message}`, 'err', 6000);
+    return;
+  }
+  const execId = res?.exec_id;
+  if (!execId) { await runShellCommandSync(t, project, cmd, label); return; }
+  shellStartCard({ execId, threadId: t?.id || null, command: res.command || cmd, cwd: res.cwd || '' });
+  if (!isCoarse() && !$('dialog[open]')) ta().focus();
+}
+
+/** 旧サーバー向けの同期 /exec フォールバック（/exec/stream が 404/405 の場合のみ）。 */
+async function runShellCommandSync(t, project, cmd, label) {
   try {
     if (t) {
       const res = await api(`/api/threads/${t.id}/exec`, { method: 'POST', json: { command: cmd } });
@@ -1820,14 +2037,81 @@ async function runShellCommand(command) {
       shellResultDialog(res);
     }
   } catch (e) {
+    const input = ta();
     input.value = `!${cmd}`;
     autosize();
     toast(`コマンド実行に失敗: ${e.message}`, 'err', 6000);
-  } finally {
-    sending = false;
-    renderComposer();
-    if (!isCoarse() && !$('dialog[open]')) ta().focus();
   }
+}
+
+// ── ライブシェル出力カード（Tier 4 Item 3） ──
+const liveShells = new Map(); // exec_id -> { execId, threadId, command, el, out, status, stopBtn, chars }
+const SHELL_LIVE_MAX_CHARS = 200000;
+
+function shellStartCard({ execId, threadId, command, cwd }) {
+  const out = h('pre', { class: 'shell-live-out', 'aria-live': 'polite' });
+  const status = h('span', { class: 'shell-live-status' }, h('span', { class: 'pulse', 'aria-hidden': 'true' }), h('span', { text: '実行中' }));
+  const stopBtn = h('button', {
+    type: 'button', class: 'btn xs danger-ghost', text: '停止', title: 'このシェル実行を停止する',
+    onclick: async () => {
+      stopBtn.disabled = true;
+      try { await api(`/api/exec/${encodeURIComponent(execId)}/cancel`, { method: 'POST' }); }
+      catch (e) { toast(`停止に失敗: ${e.message}`, 'err'); stopBtn.disabled = false; }
+    },
+  });
+  const card = h('div', { class: 'shell-live', dataset: { exec: execId } },
+    h('div', { class: 'shell-live-head' }, iconEl('terminal'), h('code', { class: 'shell-live-cmd', text: `$ ${command}` }), h('span', { class: 'grow' }), status, stopBtn),
+    cwd ? h('div', { class: 'muted mono shell-live-cwd', text: cwd }) : null,
+    out);
+  const live = $('#live');
+  if (threadId && live?.isConnected) live.before(card);
+  else $('#approval')?.after(card);
+  liveShells.set(execId, { execId, threadId, command, el: card, out, status, stopBtn, chars: 0 });
+  scrollBottom();
+}
+
+function shellAppendChunk(execId, stream, chunk) {
+  const s = liveShells.get(execId);
+  if (!s || !s.el.isConnected) return;
+  const text = String(chunk ?? '');
+  if (!text) return;
+  s.out.append(h('span', { class: stream === 'stderr' ? 'sh-err' : 'sh-out', text }));
+  s.chars += text.length;
+  while (s.chars > SHELL_LIVE_MAX_CHARS && s.out.firstChild) {
+    s.chars -= (s.out.firstChild.textContent || '').length;
+    s.out.firstChild.remove();
+  }
+  if (S.stick) scrollBottom();
+}
+
+function shellFinish(m) {
+  const s = liveShells.get(m.exec_id);
+  if (!s) return;
+  liveShells.delete(m.exec_id);
+  const label = oneLine(s.command, 56);
+  // スレッド実行はサーバーが CommandExecution を永続化して turn_item_added を配信する:
+  // ライブカードを片付けて二重表示を防ぐ（item_id が無いエラー時のみカードに最終結果を残す）。
+  if (m.thread_id != null && m.item_id) {
+    s.el.remove();
+    if (m.thread_id === S.threadId) loadDetailSoon();
+    return;
+  }
+  const bad = m.timed_out || m.cancelled || (m.exit_code != null && m.exit_code !== 0);
+  if (m.thread_id != null && !m.item_id && bad) {
+    toast(m.timed_out ? `タイムアウトしました: $ ${label}` : m.cancelled ? `キャンセルしました: $ ${label}` : `exit ${m.exit_code}: $ ${label}`, 'warn', 5000);
+  }
+  s.el.classList.add('done');
+  s.status.replaceChildren(
+    m.timed_out ? badge('timeout', 'bad') : badge(`exit ${m.exit_code ?? '?'}`, bad ? 'bad' : 'good'),
+    badge(fmtDur(m.duration_ms)),
+    m.truncated ? badge('一部省略', 'warn') : null,
+    m.cancelled ? badge('キャンセル済み', 'warn') : null,
+  );
+  s.stopBtn.replaceWith(h('button', {
+    type: 'button', class: 'btn xs', text: '閉じる',
+    onclick: () => s.el.remove(),
+  }));
+  if (S.stick) scrollBottom();
 }
 
 function shellResultDialog(res) {
@@ -2083,6 +2367,10 @@ async function executeSlashCommand(parsed) {
       clearInput();
       usageDialog();
       return { handled: true };
+    case 'monitor':
+      clearInput();
+      monitorDialog();
+      return { handled: true };
     case 'limits':
       clearInput();
       usageDialog({ metric: 'limits' });
@@ -2220,6 +2508,127 @@ async function createThread(o) {
 async function interrupt() {
   const t = curThread(); if (!t) return;
   try { await api(`/api/threads/${t.id}/interrupt`, { method: 'POST' }); toast('停止を要求しました'); } catch (e) { toast(`停止に失敗: ${e.message}`, 'err'); }
+}
+
+// ───────────────────────── マルチスレッド稼働モニター（Tier 4 Item 6） ─────────────────────────
+let monitorOpen = false;
+let monitorSeq = 0;
+let monitorBody = null;
+let monitorClose = null;
+/** ダイアログが開いている間だけ WS イベントで ~300ms デバウンス再取得する。 */
+const refreshMonitorSoon = debounce(() => { if (monitorOpen) loadMonitor(); }, 300);
+
+function monitorDialog() {
+  openModal('稼働モニター', (body, close) => {
+    monitorOpen = true;
+    monitorBody = body;
+    monitorClose = close;
+    body.replaceChildren(h('div', { class: 'dp-empty', text: '読み込み中…' }));
+    loadMonitor();
+  }, {
+    cls: 'wide',
+    onclose: () => { monitorOpen = false; monitorSeq++; monitorBody = null; monitorClose = null; },
+  });
+}
+
+async function loadMonitor() {
+  const body = monitorBody;
+  if (!body || !monitorOpen) return;
+  const my = ++monitorSeq;
+  try {
+    const d = await api('/api/monitor');
+    if (my !== monitorSeq || !monitorOpen) return;
+    renderMonitor(body, d);
+  } catch (e) {
+    if (my !== monitorSeq || !monitorOpen) return;
+    body.replaceChildren(h('div', { class: 'dp-empty errtxt', text: `モニターを取得できません: ${e.message}` }),
+      h('button', { type: 'button', class: 'btn xs', text: '再試行', onclick: () => loadMonitor() }));
+  }
+}
+
+function renderMonitor(body, d) {
+  const pending = Array.isArray(d.pending_requests) ? d.pending_requests : [];
+  const runs = Array.isArray(d.active_runs) ? d.active_runs : [];
+  const queued = Array.isArray(d.queued_thread_ids) ? d.queued_thread_ids : [];
+  const shells = Number(d.active_shells) || 0;
+
+  const pendingRows = pending.map((r) => {
+    const t = threadById(r.thread_id);
+    const p = r.payload;
+    const summary = r.title || pstr(p, 'command', 'cmd', 'path', 'file_path', 'description') || r.kind || '承認リクエスト';
+    const btns = [];
+    const act = async (approved) => {
+      btns.forEach((b) => { b.disabled = true; });
+      try {
+        await api(`/api/threads/${r.thread_id}/respond`, { method: 'POST', json: { request_id: r.id, approved, payload: {} } });
+        dropPending(r.thread_id, r.id);
+        toast(approved ? '承認しました' : '拒否しました', approved ? 'ok' : '');
+        loadMonitor();
+      } catch (e) { btns.forEach((b) => { b.disabled = false; }); toast(`応答に失敗: ${e.message}`, 'err'); }
+    };
+    const ok = h('button', { type: 'button', class: 'btn xs primary', text: '許可', onclick: () => act(true) });
+    const no = h('button', { type: 'button', class: 'btn xs danger-ghost', text: '拒否', onclick: () => act(false) });
+    btns.push(ok, no);
+    return h('div', { class: 'mon-row' },
+      h('div', { class: 'mon-main' },
+        h('span', { class: 'mon-title', text: t ? cleanTitle(t.title) : (r.thread_id || '').slice(0, 8) }),
+        h('span', { class: 'mon-sub', text: summary }),
+        h('span', { class: 'sbadge warn', text: r.kind || '承認待ち' })),
+      h('div', { class: 'mon-acts' }, no, ok));
+  });
+
+  const runRows = runs.map((r) => {
+    const t = threadById(r.thread_id);
+    const ms = r.model_selection || {};
+    const model = `${provLabel(ms.provider)} / ${ms.model || ''}${ms.effort ? ` · ${ms.effort}` : ''}`;
+    const pend = Number(r.pending_count) || 0;
+    const stopBtn = h('button', {
+      type: 'button', class: 'btn xs danger-ghost', text: '停止',
+      onclick: async () => {
+        stopBtn.disabled = true;
+        try { await api(`/api/threads/${r.thread_id}/interrupt`, { method: 'POST' }); toast('停止を要求しました'); loadMonitor(); }
+        catch (e) { toast(`停止に失敗: ${e.message}`, 'err'); stopBtn.disabled = false; }
+      },
+    });
+    return h('div', { class: 'mon-row' },
+      h('div', { class: 'mon-main' },
+        h('span', { class: 'mon-title', text: t ? cleanTitle(t.title) : (r.title || (r.thread_id || '').slice(0, 8)) }),
+        h('span', { class: 'mon-sub', text: model }),
+        r.status === 'rate-limited' ? h('span', { class: 'flag warn', text: '制限中' })
+          : r.status ? h('span', { class: 'sbadge', text: statusLabel(r.status) }) : null,
+        pend ? h('span', { class: 'flag warn', text: `承認待ち ${pend} 件` }) : null),
+      h('div', { class: 'mon-acts' },
+        h('button', {
+          type: 'button', class: 'btn xs', text: '開く',
+          onclick: () => { monitorClose?.(); openThread(r.thread_id); },
+        }),
+        stopBtn));
+  });
+
+  const queuedRows = queued.map((id) => {
+    const t = threadById(id);
+    return h('div', { class: 'mon-row' },
+      h('div', { class: 'mon-main' }, h('span', { class: 'mon-title', text: t ? cleanTitle(t.title) : id.slice(0, 8) })),
+      h('div', { class: 'mon-acts' }, h('button', {
+        type: 'button', class: 'btn xs', text: '開く',
+        onclick: () => { monitorClose?.(); openThread(id); },
+      })));
+  });
+
+  const section = (title, countBadge, rows, emptyText) => ctxSection(title,
+    countBadge != null ? h('span', { class: 'sbadge', text: String(countBadge) }) : null,
+    rows.length
+      ? h('div', { class: 'ctx-card mon-card' }, rows)
+      : h('div', { class: 'ctx-card ctx-muted-card', text: emptyText }));
+  body.replaceChildren(
+    h('div', { class: 'mon-head' },
+      h('span', { class: 'sbadge', text: `実行中シェル ${shells} 件` }),
+      h('span', { class: 'grow' }),
+      h('button', { type: 'button', class: 'btn xs', text: '更新', onclick: () => loadMonitor() })),
+    section('承認待ちリクエスト', pending.length || null, pendingRows, '承認待ちのリクエストはありません'),
+    section('実行中スレッド', runs.length || null, runRows, '実行中のスレッドはありません'),
+    section('キュー待ちスレッド', queued.length || null, queuedRows, 'キュー待ちのスレッドはありません'),
+  );
 }
 
 // ───────────────────────── session stats pill ─────────────────────────
@@ -2526,71 +2935,7 @@ function searchDialog(initialQuery = '') {
 }
 
 // ───────────────────────── usage: data (T3 Code UsagePage) ─────────────────────────
-const U_PROVIDERS = {
-  claude: { label: 'Claude Code', color: 'var(--p-claude)' },
-  codex: { label: 'Codex', color: 'var(--text)' }, // high-contrast foreground; follows the surface it sits on
-  antigravity: { label: 'Antigravity', color: 'var(--p-antigravity)' },
-  opencode: { label: 'OpenCode', color: 'var(--p-opencode)' },
-};
-const U_PERIODS = [['1', '過去24時間'], ['7', '7日間'], ['30', '30日間'], ['90', '90日間']];
-const U_METRICS = [['cost', 'コスト'], ['tokens', 'トークン'], ['limits', '上限']];
-const U_KINDS = [
-  { key: 'input_tokens', label: '入力', color: 'var(--text)' },
-  { key: 'output_tokens', label: '出力', color: 'var(--accent)' },
-  { key: 'cache_read_tokens', label: 'キャッシュ読込', color: 'color-mix(in srgb, var(--text) 32%, transparent)' },
-  { key: 'cache_write_tokens', label: 'キャッシュ書込', color: 'color-mix(in srgb, var(--text) 58%, transparent)' },
-];
-const U_SUMS = ['cost_usd', 'total_tokens', ...U_KINDS.map((k) => k.key), 'sessions', 'requests'];
 
-const uNum = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
-function uId(p) {
-  const s = String(p || 'unknown').toLowerCase();
-  return s === 'open-code' ? 'opencode' : s === 'claude-code' || s === 'claudeagent' ? 'claude' : s;
-}
-function uStats(x) {
-  const o = Object.fromEntries(U_SUMS.map((k) => [k, uNum(x?.[k])]));
-  o.reasoning_tokens = uNum(x?.reasoning_tokens);
-  if (!o.total_tokens) o.total_tokens = U_KINDS.reduce((a, k) => a + o[k.key], 0);
-  return o;
-}
-const uSum = (rows) => Object.fromEntries(U_SUMS.map((k) => [k, rows.reduce((a, r) => a + r[k], 0)]));
-function uProvider(id, serverLabel, serverColor) {
-  const known = Object.hasOwn(U_PROVIDERS, id) ? U_PROVIDERS[id] : null;
-  // colours end up in style properties, so only known values or plain hex are accepted
-  return known ? { id, ...known } : { id, label: String(serverLabel || id), color: /^#[0-9a-f]{3,8}$/i.test(serverColor || '') ? serverColor : '#8b8b8b' };
-}
-
-/** Makes the /api/usage payload safe to render: arrays always exist, numbers are finite, provider ids are canonical. */
-function normalizeUsage(raw) {
-  if (!raw || typeof raw !== 'object' || !(raw.totals || raw.providers || raw.buckets)) throw new Error('応答の形式が不正です');
-  const rows = (a) => (Array.isArray(a) ? a.filter((x) => x && typeof x === 'object') : []);
-  const shares = (x) => ({ cost_share: uNum(x.cost_share), token_share: uNum(x.token_share) });
-  const providers = rows(raw.providers).map((p) => ({ ...uStats(p), ...shares(p), ...uProvider(uId(p.provider), p.label, p.color) }));
-  const models = rows(raw.models).map((m) => ({ ...uStats(m), ...shares(m), ...uProvider(uId(m.provider)), model: String(m.model || '(不明なモデル)') }))
-    .filter((m) => !(m.model === '<synthetic>' && !m.total_tokens)); // placeholder rows of locally generated replies
-  const buckets = rows(raw.buckets).map((b) => {
-    const by = new Map();
-    for (const [k, v] of Object.entries(b.by_provider || {})) {
-      const id = uId(k); const prev = by.get(id) || { cost_usd: 0, total_tokens: 0 };
-      by.set(id, { cost_usd: prev.cost_usd + uNum(v?.cost_usd), total_tokens: prev.total_tokens + uNum(v?.total_tokens) });
-    }
-    return { key: String(b.key ?? ''), label: String(b.label ?? b.key ?? ''), by };
-  }).sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-  // a provider that only shows up in buckets still needs a legend row and a colour
-  for (const b of buckets) {
-    for (const id of b.by.keys()) {
-      if (providers.some((p) => p.id === id)) continue;
-      const sum = (k) => buckets.reduce((a, x) => a + (x.by.get(id)?.[k] || 0), 0);
-      providers.push({ ...uStats({ cost_usd: sum('cost_usd'), total_tokens: sum('total_tokens') }), cost_share: 0, token_share: 0, ...uProvider(id) });
-    }
-  }
-  const w = raw.window || {};
-  const totals = raw.totals ? uStats(raw.totals) : { ...uSum(providers), reasoning_tokens: 0 };
-  return {
-    window: { since: String(w.since || ''), until: String(w.until || ''), hourly: w.resolution ? w.resolution === 'hour' : Number(w.days) === 1 },
-    totals, providers, models, buckets, scannedAt: Date.parse(raw.scanned_at) || 0,
-  };
-}
 
 function loadUsage(days, { refresh = false } = {}) {
   const u = S.usage;
@@ -2634,47 +2979,7 @@ function renderUsagePill() {
 }
 
 // ───────────────────────── usage: limits (T3 Code UsageLimits) ─────────────────────────
-const LIMIT_LOW = 15; // remaining %: amber in the Limits view
-const LIMIT_CRITICAL = 10; // remaining %: warned above the composer
 
-const uText = (v, max) => (typeof v === 'string' ? clip(v.trim(), max) : '');
-const uTime = (v) => (typeof v === 'string' && Date.parse(v)) || 0;
-const uPercent = (v) => {
-  const n = typeof v === 'number' || (typeof v === 'string' && v.trim()) ? Number(v) : NaN;
-  return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : null;
-};
-function uWindow(w) {
-  let used = uPercent(w.used_percent);
-  let remaining = uPercent(w.remaining_percent);
-  if (used == null && remaining == null) return null;
-  remaining ??= 100 - used;
-  used ??= 100 - remaining;
-  const kind = uText(w.kind, 24);
-  const mins = Number(w.window_duration_mins);
-  return {
-    id: uText(w.id, 60), kind, used, remaining,
-    label: uText(w.label, 60) || (kind === 'session' ? 'セッション' : kind === 'weekly' ? '週間' : '上限'),
-    durationMins: Number.isFinite(mins) && mins > 0 ? mins : 0,
-    resetsAt: uTime(w.resets_at),
-  };
-}
-/** Banked reset credits; null unless at least one can be spent. */
-function uCredits(c) {
-  const count = Math.floor(uNum(c?.available_count));
-  return count > 0 ? { count, nextExpiresAt: uTime(c.next_expires_at) } : null;
-}
-/** Makes the /api/usage/limits payload safe to render. */
-function normalizeLimits(raw) {
-  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.providers)) throw new Error('応答の形式が不正です');
-  const objects = (a) => (Array.isArray(a) ? a.filter((x) => x && typeof x === 'object') : []);
-  const providers = objects(raw.providers).map((p) => ({
-    ...uProvider(uId(p.provider), uText(p.label, 40)),
-    rawProvider: uText(p.provider, 40), credits: uCredits(p.reset_credits),
-    plan: uText(p.plan, 60), status: uText(p.status, 24), source: uText(p.source, 40), message: uText(p.message, 400),
-    windows: objects(p.windows).map(uWindow).filter(Boolean),
-  }));
-  return { providers, checkedAt: uTime(raw.checked_at) };
-}
 
 function loadUsageLimits({ refresh = false } = {}) {
   const l = S.limits;
@@ -2698,32 +3003,6 @@ const loadUsageLimitsSoon = debounce(() => loadUsageLimits(), 5000);
 /** Everything that shows limits; also run on a timer so countdowns and passed resets stay current. */
 function renderLimitSurfaces() { renderUsagePill(); syncLimitAlert(); S.limits.onchange?.(); if (shownRail() === 'context') renderContextPanel(); }
 
-/** A window whose reset time has passed no longer limits anything, whatever its last reading said. */
-const limitIsReset = (w, now) => w.resetsAt > 0 && w.resetsAt <= now;
-const limitIsOut = (w, now) => w.remaining <= 0 && !limitIsReset(w, now);
-const fmtLeft = (v) => (v > 0 && v < 1 ? '<1%' : `${Math.round(v)}%`);
-/** "6日2時間" / "2時間2分" / "45分"; `gap` spaces out the form without days ("1 時間 54 分"). */
-function fmtDurationJa(ms, gap = '') {
-  const mins = Math.floor(ms / 60000);
-  if (mins < 1) return '1分未満';
-  const d = Math.floor(mins / 1440); const hours = Math.floor((mins % 1440) / 60); const m = mins % 60;
-  if (d) return `${d}日${hours ? `${hours}時間` : ''}`;
-  return [...(hours ? [hours, '時間'] : []), ...(m ? [m, '分'] : [])].join(gap);
-}
-function fmtResetIn(resetsAt, now) {
-  if (!resetsAt) return '';
-  const ms = resetsAt - now;
-  if (ms <= 0) return 'リセット済';
-  return ms < 60000 ? 'まもなくリセット' : `あと ${fmtDurationJa(ms)}`;
-}
-/** "今日 17:04" / "明日 23:22" / "12/01 17:28" on the viewer's calendar. */
-function fmtResetAt(ts, now) {
-  const t = new Date(ts);
-  const day = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-  const ahead = Math.round((day(t) - day(new Date(now))) / 86400000);
-  const date = ahead === 0 ? '今日' : ahead === 1 ? '明日' : `${String(t.getMonth() + 1).padStart(2, '0')}/${String(t.getDate()).padStart(2, '0')}`;
-  return `${date} ${hhmm(t)}`;
-}
 
 /** The sidebar tooltip line (tightest live window per provider) and whether anything is used up. */
 function limitsSummary(now) {
@@ -2773,31 +3052,6 @@ function syncLimitAlert() {
   if (focused) $('button', box)?.focus();
 }
 
-const LIMIT_SOURCES = {
-  'claude-cli': 'CLI', 'codex-app-server': 'CLI', 'codex-session-log': 'ローカルログ', 'antigravity-api': 'Antigravity API', runtime: '実行時検知',
-};
-const limitSource = (s) => (Object.hasOwn(LIMIT_SOURCES, s) ? LIMIT_SOURCES[s] : '');
-
-/** What one window says right now. Pace and refill only exist while its reset is still ahead. */
-function limitState(w, now) {
-  const expired = limitIsReset(w, now);
-  const upcoming = w.resetsAt > now;
-  const length = w.durationMins * 60000;
-  const elapsed = upcoming && length ? Math.min(1, Math.max(0, (length - (w.resetsAt - now)) / length)) : null;
-  let pace = null;
-  if (elapsed != null) {
-    const ahead = w.used - elapsed * 100;
-    pace = ahead > 5 ? { cls: 'ahead', icon: 'trendUp', title: 'ペース超過: 時間経過より速く消費中' }
-      : ahead < -5 ? { cls: 'under', icon: 'trendDown', title: '余裕あり: 時間経過より緩やかに消費中' }
-        : { cls: 'even', icon: 'gauge', title: '適正ペース' };
-  }
-  return {
-    expired, upcoming, pace,
-    timeLeft: elapsed == null ? null : Math.round((1 - elapsed) * 100),
-    refill: upcoming && w.remaining < 100 ? 100 - w.remaining : 0,
-    level: expired ? '' : w.remaining <= 0 ? ' out' : w.remaining <= LIMIT_LOW ? ' low' : '',
-  };
-}
 
 /** The thick bar: remaining fill, hatched refill region, even-pace tick, and the countdown / reset-credit pill. */
 function limitBar(p, w, st, now) {
@@ -2987,48 +3241,7 @@ function uBar(fraction, color, cls = '') {
 }
 const uEmpty = (text = 'この期間の利用はありません') => h('div', { class: 'u-empty', text });
 
-const WEEKDAYS = '日月火水木金土';
-const hhmm = (t) => `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
-const hourLabel = (t) => `${String(t.getHours()).padStart(2, '0')}:00`;
-/** Bucket keys are "YYYY-MM-DD" or an hourly timestamp; zoned timestamps are shown in local time. */
-function bucketDate(key) {
-  const m = /^(\d{4})-(\d\d)-(\d\d)(?:[T ](\d\d)(?::(\d\d))?)?/.exec(key);
-  if (!m) return null;
-  const zoned = /[T ]\d\d.*(Z|[+-]\d\d:?\d\d)$/.test(key);
-  const t = zoned ? new Date(key) : new Date(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0));
-  return Number.isNaN(t.getTime()) ? null : { t, timed: m[4] != null };
-}
-// labels are built from the key so that hours follow the viewer's clock; the server label is the fallback
-function bucketTick(b, hourly) {
-  const p = bucketDate(b.key);
-  if (!p || (hourly && !p.timed)) return b.label;
-  return hourly ? hourLabel(p.t) : `${p.t.getMonth() + 1}/${p.t.getDate()}`;
-}
-function bucketTitle(b, hourly, short = false) {
-  const p = bucketDate(b.key);
-  if (!p) return b.label;
-  const { t } = p;
-  const day = short ? `${t.getMonth() + 1}/${t.getDate()}` : `${t.getMonth() + 1}月${t.getDate()}日`;
-  return hourly ? `${day} ${p.timed ? hourLabel(t) : b.label}` : `${day} (${WEEKDAYS[t.getDay()]})`;
-}
-function rangeText(w) {
-  const f = (s) => {
-    if (!w.hourly) return s.replace(/^(\d{4}-\d\d-\d\d)T.*$/, '$1'); // daily windows are whole days
-    const p = bucketDate(s);
-    return p?.timed ? `${p.t.getMonth() + 1}/${p.t.getDate()} ${hhmm(p.t)}` : s;
-  };
-  return w.since || w.until ? `${f(w.since)} – ${f(w.until)}` : '';
-}
 
-/** 1 / 2 / 5 steps, about four intervals, up to a round number at or above the peak. */
-function niceScale(peak) {
-  if (!(peak > 0)) return { max: 1, step: 0.25, ticks: [0, 0.25, 0.5, 0.75, 1], labeled: false };
-  const raw = peak / 4;
-  const mag = 10 ** Math.floor(Math.log10(raw));
-  const step = [1, 2, 5, 10].find((x) => x * mag >= raw * (1 - 1e-9)) * mag;
-  const count = Math.max(1, Math.ceil(peak / step - 1e-9));
-  return { max: step * count, step, ticks: Array.from({ length: count + 1 }, (_, i) => step * i), labeled: true };
-}
 function tickText(v, step) {
   if (S.usage.metric === 'tokens') return v === 0 ? '0' : fmtCompact(v);
   if (v === 0) return '$0';
@@ -3038,38 +3251,6 @@ function tickText(v, step) {
   return `$${v.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 }
 
-/** Cubic Bézier path with monotone (Fritsch–Carlson) tangents: smooth, and never overshoots below zero. */
-function monotonePath(pts) {
-  const n = pts.length;
-  const f = (v) => Math.round(v * 100) / 100;
-  if (n < 2) return n ? `M${f(pts[0][0])} ${f(pts[0][1])}` : '';
-  const m = pts.slice(1).map((p, i) => (p[1] - pts[i][1]) / (p[0] - pts[i][0]));
-  const t = pts.map((_, i) => (i === 0 ? m[0] : i === n - 1 ? m[n - 2] : m[i - 1] * m[i] <= 0 ? 0 : (m[i - 1] + m[i]) / 2));
-  m.forEach((s, i) => {
-    if (s === 0) { t[i] = 0; t[i + 1] = 0; return; }
-    const a = t[i] / s; const b = t[i + 1] / s; const q = a * a + b * b;
-    if (q > 9) { const k = 3 / Math.sqrt(q); t[i] = k * a * s; t[i + 1] = k * b * s; }
-  });
-  let d = `M${f(pts[0][0])} ${f(pts[0][1])}`;
-  for (let i = 0; i < n - 1; i++) {
-    const [x0, y0] = pts[i]; const [x1, y1] = pts[i + 1]; const dx = (x1 - x0) / 3;
-    d += `C${f(x0 + dx)} ${f(y0 + t[i] * dx)} ${f(x1 - dx)} ${f(y1 - t[i + 1] * dx)} ${f(x1)} ${f(y1)}`;
-  }
-  return d;
-}
-/** Indices that get an x-axis label: whole hours for the 24h view, otherwise evenly spaced days ending today. */
-function axisMarks(columns, hourly) {
-  const n = columns.length;
-  const narrow = matchMedia('(max-width: 640px)').matches;
-  const all = columns.map((_, i) => i);
-  if (hourly) {
-    const every = narrow ? 6 : 4;
-    const marks = all.filter((i) => bucketDate(columns[i].bucket.key)?.t.getHours() % every === 0);
-    if (marks.length) return marks;
-  }
-  const every = Math.max(1, Math.ceil(n / (narrow ? 4 : 7)));
-  return all.filter((i) => (n - 1 - i) % every === 0);
-}
 
 /** UsageProviderChart: overlapping monotone areas, one per provider, each from the zero baseline. */
 function usageChart(view) {
@@ -3503,7 +3684,7 @@ function threadContextInfo() {
     thread: t, sel, windowSize, used, pct, level, remaining, source,
     input, output, cacheRead, cacheWrite, cacheHit,
     totalInput, totalOutput, totalDuration, totalRawBytes, breakdown,
-    runsCount: runs.length,
+    runsCount: runs.length, compaction: ctx?.compaction || null,
   };
 }
 
@@ -3661,7 +3842,7 @@ function renderContextPanel() {
     return;
   }
 
-  const { thread: t, sel, windowSize, used, pct, level, remaining, source, input, output, cacheRead, cacheWrite, cacheHit, totalInput, totalOutput, totalDuration, totalRawBytes, breakdown, runsCount } = info;
+  const { thread: t, sel, windowSize, used, pct, level, remaining, source, input, output, cacheRead, cacheWrite, cacheHit, totalInput, totalOutput, totalDuration, totalRawBytes, breakdown, runsCount, compaction } = info;
   const estCost = Number(S.detail?.context?.estimated_cost_usd) || 0;
   const project = projectById(t.project_id);
   const parts = [];
@@ -3741,6 +3922,37 @@ function renderContextPanel() {
       h('button', { type: 'button', class: 'btn xs', onclick: forkDialog }, iconEl('fork'), h('span', { text: '文脈を分岐' })),
       h('button', { type: 'button', class: 'btn xs', onclick: () => usageDialog('model') }, iconEl('chart'), h('span', { text: '使用量詳細' })))));
 
+  // ── 1b. Compaction recommendation (Tier 4 Item 4)
+  {
+    const util = Number(compaction?.utilization_pct);
+    const worth = compaction?.worth_compacting === true;
+    if (compaction && (compaction.recommended === true || (util >= 80 && worth))) {
+      const be = Number(compaction.break_even_turns);
+      parts.push(ctxSection('コンパクション推奨', null,
+        h('div', { class: 'ctx-card ctx-compact-card' },
+          h('div', { class: 'ctx-alert warn' }, iconEl('alert'), h('span', { text: 'コンテキスト使用率が高くなっています。要約して新しいスレッドへ分岐すると、以降のターンが軽くなります。' })),
+          h('div', { class: 'ctx-compact-meta' },
+            h('span', { text: Number.isFinite(util) ? `使用率 ${Math.round(util)}%` : '使用率 —' }),
+            Number.isFinite(be) ? h('span', { text: `約 ${Math.round(be)} ターンで回収` }) : null),
+          h('div', { class: 'ctx-quick-acts' },
+            h('button', { type: 'button', class: 'btn xs', onclick: () => forkDialog() }, iconEl('fork'), h('span', { text: '要約して新スレッドへ分岐' }))))));
+    }
+  }
+
+  // ── 1c. Worktree child: parent diff & merge (Tier 4 Item 2)
+  {
+    const parent = t.parent_thread_id ? threadById(t.parent_thread_id) : null;
+    if (isWorktreeChild(t, parent)) {
+      parts.push(ctxSection('親スレッドとの差分・マージ', null,
+        h('div', { class: 'ctx-card' },
+          h('div', { class: 'ctx-wt-row' },
+            h('span', { class: 'muted', text: `親: ${parent ? cleanTitle(parent.title) : t.parent_thread_id.slice(0, 8)} · ⎇ ${t.branch || ''}` })),
+          h('div', { class: 'ctx-quick-acts' },
+            h('button', { type: 'button', class: 'btn xs', text: '親との差分', onclick: () => showParentDiff(t.parent_thread_id, t.id) }),
+            mergeConfirmControl(t.parent_thread_id, t, 'btn xs')))));
+    }
+  }
+
   // ── 2. Context Breakdown (items composition)
   if (breakdown.length && totalRawBytes > 0) {
     const byKind = new Map(breakdown.map((b) => [b.kind, b]));
@@ -3797,7 +4009,7 @@ function renderContextPanel() {
   }
   kv.push(['更新', h('span', { title: new Date(t.updated_at).toLocaleString('ja-JP'), text: fmtAgo(t.updated_at) })]);
   parts.push(ctxSection('スレッド詳細',
-    h('span', { class: `status-pill s-${t.status}`, text: STATUS_LABEL[t.status] || t.status }),
+    h('span', { class: `status-pill s-${t.status}`, text: statusLabel(t.status) }),
     h('div', { class: 'ctx-card ctx-kv-list' }, kv.map(([k, v]) => h('div', { class: 'ctx-kv' }, h('span', { text: k }), v)))));
 
   // ── 6. Related threads (parent / children / attachments)
@@ -3814,7 +4026,7 @@ function renderContextPanel() {
       rel.push(h('button', { type: 'button', class: 'ctx-rel-row', onclick: () => openThread(k.id) },
         provDot(k.model_selection?.provider, k.status === 'running' ? 'live' : ''),
         h('span', { class: 'ctx-rel-title', text: cleanTitle(k.title) }),
-        h('small', { text: STATUS_LABEL[k.status] || k.status })));
+        h('small', { text: statusLabel(k.status) })));
     }
     parts.push(ctxSection(`関連スレッド (${rel.length})`,
       h('button', { type: 'button', class: 'link ctx-more-link', text: '+ 委譲', onclick: delegateDialog }),
@@ -3925,9 +4137,14 @@ function renderDiffView(d) {
   const body = $('#diff-body'); const sum = $('#diff-sum'); const branch = $('#diff-branch');
   syncDiffScopeButtons();
   branch.textContent = d.branch ? `⎇ ${d.branch}` : '';
+  const pd = S.parentDiff && S.parentDiff.data === d ? S.parentDiff : null;
+  const banner = pd ? h('div', { class: 'dp-parent-banner' }, iconEl('fork'),
+    h('span', { class: 'dp-parent-label', text: `親スレッドとの差分（${pd.branch || d.branch || ''}）` }),
+    h('span', { class: 'grow' }),
+    h('button', { type: 'button', class: 'btn xs', text: '通常の差分に戻る', onclick: () => { S.parentDiff = null; loadDiff(); } })) : null;
   const latestOnly = S.diffScope === 'latest';
   let files = d.files || [];
-  if (latestOnly && t) {
+  if (latestOnly && t && !pd) {
     const turnPaths = latestTurnChangedPaths(S.detail, projectById(t.project_id)?.workspace_root || '');
     files = filterDiffFilesByPaths(files, turnPaths);
   }
@@ -3939,19 +4156,19 @@ function renderDiffView(d) {
     h('span', { class: 'muted', text: `${files.length} ファイル` }),
   );
   if (d.clean || !d.files.length) {
-    body.replaceChildren(h('div', { class: 'dp-empty' }, iconEl('check'), h('span', { text: '変更はありません（クリーン）' })));
+    body.replaceChildren(...[banner, h('div', { class: 'dp-empty' }, iconEl('check'), h('span', { text: '変更はありません（クリーン）' }))].filter(Boolean));
     return;
   }
   if (!files.length && latestOnly) {
-    body.replaceChildren(h('div', { class: 'dp-empty' },
+    body.replaceChildren(...[banner, h('div', { class: 'dp-empty' },
       iconEl('file'),
       h('span', { text: '最新ターンで変更されたファイルはありません' }),
-      h('button', { type: 'button', class: 'btn xs', text: `全 ${d.files.length} ファイルを表示`, onclick: () => { S.diffScope = 'all'; ls.set('t3.diffScope', 'all'); renderDiffView(d); } })));
+      h('button', { type: 'button', class: 'btn xs', text: `全 ${d.files.length} ファイルを表示`, onclick: () => { S.diffScope = 'all'; ls.set('t3.diffScope', 'all'); renderDiffView(d); } }))].filter(Boolean));
     return;
   }
   const top = body.scrollTop;
-  body.replaceChildren(...files.map(diffFile));
-  body.append(diffCommitForm(t));
+  body.replaceChildren(...[banner, ...files.map(diffFile)].filter(Boolean));
+  if (!pd) body.append(diffCommitForm(t));
   body.scrollTop = top;
 }
 
@@ -3961,6 +4178,7 @@ async function loadDiff() {
   const my = ++diffSeq;
   syncDiffScopeButtons();
   if (!t) { diffShownFor = null; body.replaceChildren(h('div', { class: 'dp-empty', text: 'スレッドを選択すると、作業ツリーの差分が表示されます' })); sum.replaceChildren(); branch.textContent = ''; return; }
+  if (S.parentDiff) return; // 親との差分表示中は通常差分で上書きしない
   if (diffShownFor !== t.id) { sum.replaceChildren(); branch.textContent = ''; body.replaceChildren(h('div', { class: 'dp-empty', text: '読み込み中…' })); }
   try {
     const d = await fetchDiff(t.id);
@@ -4380,12 +4598,13 @@ function handleWs(m) {
       const prev = threadById(m.thread_id)?.status;
       setThreadStatus(m.thread_id, m.status);
       syncSubscriptions(); renderSidebarSoon();
-      if (m.status === 'rate-limited') { loadUsageLimitsSoon(); notifyUser('レート制限', cleanTitle(threadById(m.thread_id)?.title) || m.thread_id, m.thread_id); }
+      if (m.status === 'rate-limited') { loadUsageLimitsSoon(); notifyUser('制限中', cleanTitle(threadById(m.thread_id)?.title) || m.thread_id, m.thread_id); }
       if (m.thread_id === cur) {
         renderHeader(); renderComposer(); renderLive();
         if (isBusy(prev) && !isBusy(m.status)) { loadDetailSoon(); refreshDiffSoon(); }
       }
       if (!isBusy(m.status) && S.pending.has(m.thread_id)) { S.pending.delete(m.thread_id); renderApprovals(); }
+      refreshMonitorSoon();
       break;
     }
     case 'run_started': {
@@ -4398,6 +4617,7 @@ function handleWs(m) {
         renderHeader(); renderComposer(); renderStatPill();
         renderLive(); scrollBottom();
       }
+      refreshMonitorSoon();
       break;
     }
     case 'run_status_changed': {
@@ -4411,6 +4631,7 @@ function handleWs(m) {
         if (m.thread_id === cur) { loadDetailSoon(); refreshDiffSoon(); loadSwarm(cur); }
         loadThreadsSoon(); loadDbStatsSoon(); loadUsageSoon(); loadUsageLimitsSoon();
       } else if (m.thread_id === cur) { renderHeader(); renderLive(); }
+      refreshMonitorSoon();
       break;
     }
     case 'delta': {
@@ -4475,8 +4696,16 @@ function handleWs(m) {
       if (r.thread_id === cur) { renderApprovals(); scrollBottom(); } else toast(`⚠ 承認待ち: ${r.title || r.kind}`, '', 5000);
       notifyUser('承認待ち', r.title || r.kind, r.thread_id);
       renderSidebarSoon();
+      refreshMonitorSoon();
       break;
     }
+    case 'shell_output':
+      shellAppendChunk(m.exec_id, m.stream, m.chunk);
+      break;
+    case 'shell_finished':
+      shellFinish(m);
+      refreshMonitorSoon();
+      break;
     case 'subagent_updated': {
       const known = threadById(m.child_thread_id);
       if (!known) loadThreadsSoon(); else setThreadStatus(m.child_thread_id, m.status);
@@ -4485,7 +4714,7 @@ function handleWs(m) {
         renderHeader();
         $$(`.step.sub[data-child="${CSS.escape(m.child_thread_id)}"] .sub-status`).forEach((el) => {
           el.className = `sbadge sub-status s-${m.status}`;
-          el.textContent = STATUS_LABEL[m.status] || m.status;
+          el.textContent = statusLabel(m.status);
         });
       }
       syncSubscriptions(); renderSidebarSoon();
@@ -4538,6 +4767,7 @@ function wire() {
   $('#btn-sb-search').onclick = searchDialog;
   $('#btn-usage').onclick = () => usageDialog();
   $('#btn-top-usage').onclick = () => usageDialog();
+  $('#btn-monitor').onclick = () => monitorDialog();
   $('#stat-pill').onclick = (e) => usageDialog(e.target.closest('[data-utab]')?.dataset.utab || 'model');
   $('#btn-kids').setAttribute('aria-pressed', String(S.showKids));
   $('#btn-kids').onclick = (e) => {

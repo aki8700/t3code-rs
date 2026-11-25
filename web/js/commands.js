@@ -30,6 +30,7 @@ export const LOCAL_COMMANDS = [
   { name: 'archive', aliases: [], args: '', desc: '現在のスレッドをアーカイブ／解除', icon: 'archive', group: 'session', requiresThread: true },
   { name: 'search', aliases: ['find'], args: '[語句]', desc: '全スレッドを全文検索', icon: 'search', group: 'ui' },
   { name: 'usage', aliases: ['cost'], args: '', desc: '使用量・コストを表示', icon: 'chart', group: 'ui' },
+  { name: 'monitor', aliases: ['mon'], args: '', desc: 'マルチスレッド稼働モニターを開く', icon: 'gauge', group: 'ui' },
   { name: 'limits', aliases: ['usage-limits'], args: '', desc: 'プロバイダの使用上限を表示', icon: 'gauge', group: 'ui' },
   { name: 'theme', aliases: [], args: '[テーマ名]', desc: '配色テーマを切り替え', icon: 'palette', group: 'ui' },
   { name: 'help', aliases: ['?', 'commands'], args: '', desc: 'コマンド一覧とショートカットを表示', icon: 'info', group: 'ui' },

@@ -45,6 +45,7 @@ pub struct ServerState {
     usage_home: Option<PathBuf>,
     usage_cache: Arc<Mutex<usage::UsageScanCache>>,
     limits_cache: Arc<limits::UsageLimitsCache>,
+    shells: shell::ActiveShells,
     mcp: Arc<McpServer<RunCoordinator>>,
     daemon_lock: Arc<DaemonLock>,
 }
@@ -81,6 +82,7 @@ impl ServerState {
             usage_home: std::env::home_dir(),
             usage_cache: Arc::new(Mutex::new(usage::UsageScanCache::default())),
             limits_cache,
+            shells: shell::ActiveShells::default(),
         })
     }
 }

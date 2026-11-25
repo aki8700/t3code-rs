@@ -76,7 +76,10 @@ impl Parser {
             "control_request" => claude_control_request(event, out),
             "assistant" | "user" => self.claude_message(event, out),
             "result" => {
-                let usage = event.get("usage").or(event.get("stats")).unwrap_or(&Value::Null);
+                let usage = event
+                    .get("usage")
+                    .or(event.get("stats"))
+                    .unwrap_or(&Value::Null);
                 if !self.claude_step_context && has_cache_tokens(usage) {
                     push_context_usage(ProviderId::Claude, usage, out);
                 }
@@ -905,7 +908,13 @@ mod tests {
         let events = fixture(ProviderId::Claude, lines);
         assert_eq!(
             event_types(&events),
-            ["session_started", "context_usage", "assistant_delta", "usage", "completed"]
+            [
+                "session_started",
+                "context_usage",
+                "assistant_delta",
+                "usage",
+                "completed"
+            ]
         );
         assert_eq!(
             events[1],
