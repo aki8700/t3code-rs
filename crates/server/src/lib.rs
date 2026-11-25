@@ -3,6 +3,7 @@
 mod assets;
 mod attachments;
 pub mod auth;
+mod compact;
 pub mod coordinator;
 mod database;
 mod export;

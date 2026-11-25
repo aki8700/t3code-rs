@@ -61,6 +61,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/threads/{id}/git/discard", post(git_discard))
         .route("/api/threads/{id}/git/commit", post(git_commit))
         .route("/api/threads/{id}/fork", post(fork_thread))
+        .route("/api/threads/{id}/compact", post(compact_thread))
         .route("/api/threads/{id}/respond", post(respond))
         .route("/api/threads/{id}/diff", get(diff))
         .route(
@@ -804,6 +805,14 @@ async fn fork_thread(
     Json(options): Json<ForkOptions>,
 ) -> ApiResult<Json<Thread>> {
     Ok(Json(state.coordinator.fork_thread(id, options).await?))
+}
+
+async fn compact_thread(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    state.coordinator.compact_thread(id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn respond(

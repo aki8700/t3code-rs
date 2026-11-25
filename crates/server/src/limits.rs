@@ -32,7 +32,7 @@ const CODEX_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(8);
 const CODEX_RESET_TIMEOUT: StdDuration = StdDuration::from_secs(20);
 const ANTIGRAVITY_HTTP_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const KEYCHAIN_TIMEOUT: StdDuration = StdDuration::from_secs(3);
-const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 const CODEX_LOG_SCAN_FILES: usize = 16;
 const SESSION_MINS: u32 = 5 * 60;
 const WEEK_MINS: u32 = 7 * 24 * 60;
@@ -451,7 +451,7 @@ async fn probe_all(
     }
 }
 
-fn prepare_probe_cmd(bin: &Path) -> Command {
+pub(crate) fn prepare_probe_cmd(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
     cmd.envs([
         ("DO_NOT_TRACK", "1"),
@@ -1360,7 +1360,7 @@ async fn codex_app_server_rpc(
     }
 }
 
-async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
+pub(crate) async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,
 ) -> Result<usize, CoreError> {

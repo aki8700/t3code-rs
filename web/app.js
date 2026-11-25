@@ -2222,10 +2222,19 @@ async function executeSlashCommand(parsed) {
       if (p === 'antigravity' || p === 'claude') {
         return { handled: false, overrideText: arg ? `/compact ${arg}` : '/compact' };
       }
-      // Other providers (Codex, OpenCode, Mock): compact by forking with an automatic handoff summary.
       clearInput();
       sending = true; syncSendEnabled();
       try {
+        if (p === 'codex') {
+          // `codex exec resume` would send "/compact" to the model as plain text, so the server
+          // compacts the session through the app-server instead. The thread stays the same.
+          // thread/compact/start takes no instruction, so a custom [方針] is not used.
+          await api(`/api/threads/${t.id}/compact`, { method: 'POST' });
+          toast('会話を圧縮しました', 'ok');
+          await loadDetail(t.id);
+          return { handled: true };
+        }
+        // OpenCode / Mock: compact by forking with an automatic handoff summary.
         const req = {
           title: `${cleanTitle(t.title)} (圧縮)`,
           target_model: S.compose.sel || t.model_selection,

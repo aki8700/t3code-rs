@@ -545,6 +545,28 @@ impl RunCoordinator {
         Ok(target)
     }
 
+    /// Compacts a Codex thread's own session instead of forking it. Other providers either
+    /// compact natively through `/compact` (Claude, Antigravity) or fall back to `fork_thread`.
+    pub async fn compact_thread(&self, id: Uuid) -> CoreResult<()> {
+        let thread = self.0.store.get_thread(id).await?;
+        if thread.model_selection.provider != ProviderId::Codex {
+            return Err(CoreError::InvalidArgument(
+                "in-place compaction is only available for Codex threads".into(),
+            ));
+        }
+        let session_id = thread.provider_session_id.clone().ok_or_else(|| {
+            CoreError::InvalidArgument("thread has no Codex session to compact yet".into())
+        })?;
+        if self.0.active.lock().await.contains_key(&id) {
+            return Err(CoreError::InvalidArgument(
+                "thread has a running turn; wait for it to finish".into(),
+            ));
+        }
+        let cwd = self.workspace(&thread).await?;
+        crate::compact::compact_codex_session(&self.0.cfg.providers.codex_bin, &session_id, &cwd)
+            .await
+    }
+
     pub(crate) async fn handoff_summary(&self, thread: &Thread) -> CoreResult<String> {
         let items = self.recent_items(thread.id, 100).await?;
         let runs = self.0.store.list_runs(thread.id).await?;

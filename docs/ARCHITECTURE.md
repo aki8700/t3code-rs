@@ -32,6 +32,7 @@ All `/api/*` and `/ws` endpoints pass through the configured `AuthLayer` (except
 - `POST /api/threads/:id/messages` (`{ prompt, behavior?: "steer"|"queue", attachment_ids?: [Uuid], model_selection?: ModelSelection }`)
 - `POST /api/threads/:id/interrupt`
 - `POST /api/threads/:id/fork` (`{ title?, target_model?: ModelSelection, handoff_summary?: String }`)
+- `POST /api/threads/:id/compact` -> `204` (Codex only: compacts the thread's own CLI session in place through `codex app-server` `thread/compact/start`; the thread id and session id do not change)
 - `POST /api/threads/:id/respond` (`PendingResponse`)
 - `GET /api/threads/:id/diff?ignore_whitespace=true` -> `DiffSummary`
 - `POST /api/threads/:id/delegate` (`DelegationSpec`) -> `{ thread, run_id }`
