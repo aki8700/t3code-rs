@@ -120,6 +120,10 @@ pub struct Project {
     pub title: String,
     pub workspace_root: PathBuf,
     pub default_model: Option<ModelSelection>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub verify_command: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -8,6 +8,7 @@ export const GROUP_LABEL = {
   agent: 'エージェント',
   ui: '表示・検索',
   provider: 'プロバイダ',
+  skill: 'スキル',
 };
 
 export const LOCAL_COMMANDS = [
@@ -159,9 +160,57 @@ const DIFF_OPTIONS = [
  * Computes inline palette suggestions for the current textarea value.
  * Returns null when the palette should stay closed.
  */
+/** Local workspace skills (GET workspace-meta) as palette items, deduplicated against built-in + provider commands. */
+function workspaceSkillItems(ctx, q) {
+  const known = new Set(allCommands(ctx.provider).flatMap((c) => [c.name, ...(c.aliases || [])]));
+  const query = String(q || '').toLowerCase();
+  return (Array.isArray(ctx.workspaceCommands) ? ctx.workspaceCommands : [])
+    .filter((s) => s && typeof s.name === 'string' && s.name && !known.has(s.name.toLowerCase()))
+    .map((s) => ({ s, score: scoreCommand({ name: s.name, aliases: [], desc: s.desc || '' }, query) }))
+    .filter((x) => x.score >= 0)
+    .sort((a, b) => a.score - b.score || a.s.name.localeCompare(b.s.name))
+    .map(({ s, score }) => ({
+      kind: 'command',
+      cmd: { name: s.name, desc: s.desc || '', group: 'skill', sendToProvider: true },
+      insert: `/${s.name} `,
+      execute: false,
+      label: `/${s.name}`,
+      args: '',
+      desc: s.desc || (s.source ? `ローカルスキル · ${s.source}` : 'ローカルスキル'),
+      icon: 'terminal',
+      group: 'スキル',
+      fuzzy: score >= 50,
+    }));
+}
+
 export function getPaletteSuggestions(text, ctx = {}) {
   const raw = String(text ?? '');
-  if (!raw || raw.includes('\n')) return null;
+  if (!raw) return null;
+
+  // `@file` path completion: trailing `@<query>` at the end of the input (single- or multi-line).
+  const fileMatch = /(?:^|\s)@([^\s@]{0,80})$/.exec(raw);
+  if (fileMatch && Array.isArray(ctx.workspaceFiles) && ctx.workspaceFiles.length) {
+    const q = fileMatch[1].toLowerCase();
+    const files = ctx.workspaceFiles
+      .filter((f) => typeof f === 'string' && (!q || f.toLowerCase().includes(q)))
+      .slice(0, 10);
+    if (files.length) {
+      return {
+        mode: 'file',
+        items: files.map((filePath) => ({
+          kind: 'file',
+          replaceFrom: `@${fileMatch[1]}`,
+          insert: `@${filePath} `,
+          execute: false,
+          label: filePath,
+          desc: 'ファイル参照',
+          icon: 'file',
+        })),
+      };
+    }
+  }
+
+  if (raw.includes('\n')) return null;
 
   // Direct shell history suggestions when user starts typing `!`
   const shell = parseShellInput(raw);
@@ -189,7 +238,7 @@ export function getPaletteSuggestions(text, ctx = {}) {
     const cmds = allCommands(ctx.provider).filter((c) => !c.requiresThread || ctx.hasThread);
     return {
       mode: 'command',
-      items: cmds.map((c) => commandItem(c, false)),
+      items: [...cmds.map((c) => commandItem(c, false)), ...workspaceSkillItems(ctx, '')],
     };
   }
 
@@ -250,11 +299,12 @@ export function getPaletteSuggestions(text, ctx = {}) {
     .filter((x) => x.score >= 0)
     .sort((a, b) => a.score - b.score || a.c.name.localeCompare(b.c.name))
     .slice(0, 10);
+  const items = [...cmds.map(({ c, score }) => commandItem(c, score >= 50)), ...workspaceSkillItems(ctx, q)];
 
-  if (!cmds.length) return null;
+  if (!items.length) return null;
   return {
     mode: 'command',
-    items: cmds.map(({ c, score }) => commandItem(c, score >= 50)),
+    items,
   };
 }
 

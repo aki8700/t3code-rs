@@ -18,9 +18,12 @@ A zero-telemetry, privacy-hardened Rust rewrite of [T3 Code](https://github.com/
   - Supports **Claude Code**, **Codex**, **Antigravity (Gemini)**, **OpenCode** (free cloud & local LLMs), plus a deterministic **Mock** provider for testing.
   - Built-in JSON-RPC 2.0 MCP server (`POST /mcp` + `t3d mcp` stdio bridge) for cross-provider `delegate_task` (`shared` / `git worktree` isolation), `thread_fork` (with automatic redacted handoff summaries), and `/swarm` shared message board coordination.
   - Per-run internal MCP tokens bound to caller project scope and enforcing child permission ceilings (`child <= parent`).
-- **Composer Command Palette (`/`) & Direct Shell Execution (`!`)**
-  - Type `/` in the composer for an interactive, typo-tolerant slash command palette with keyboard navigation (`↑`/`↓`, `Tab`, `Enter`, `Esc`) and argument completion (`/compact`, `/new`, `/model`, `/effort`, `/plan`, `/mode`, `/diff`, `/context`, `/swarm`, `/fork`, `/delegate`, `/title`, `/pin`, `/archive`, `/search`, `/usage`, `/limits`, `/theme`, `/sh`, `/help`, plus provider-native commands).
-  - Type `!<command>` (or `/sh <command>`) to run shell commands directly in the active project or git worktree with zero-telemetry env isolation, bounded output, process-group timeout cleanup, and persistent timeline recording.
+- **Composer Command Palette (`/`, `@file`) & Direct Shell Execution (`!`)**
+  - Type `/` in the composer for an interactive, typo-tolerant slash command palette with keyboard navigation (`↑`/`↓`, `Tab`, `Enter`, `Esc`), argument completion, and automatic discovery of local `.claude/commands/*.md` and `.agents/skills/*/SKILL.md` skills.
+  - Type `@` for workspace file path completion, or `!<command>` (or `/sh <command>`) to run shell commands directly in the active project or git worktree with zero-telemetry env isolation, bounded output, process-group timeout cleanup, and persistent timeline recording.
+- **Safe Harness Guardrails, Rollback & Desktop Ergonomics**
+  - Automatic pre-turn Git tree checkpoints with one-click per-turn **Rollback**, plus **Stage / Discard / Commit** actions inside the Diff panel and automatic post-turn `verify_command` hooks.
+  - Interactive Claude `stream-json` tool approval relay (`control_request` / `control_response`), mid-thread model-switch auto-handoff, repeated tool-loop & idle-turn watchdogs, native macOS notifications & Dock bounce, queued-run visibility/cancellation, mid-run reload hydration, and CLI thread control (`t3d threads / send / interrupt / limits`).
 - **Usage & Quota Limits Dashboard (`⌘U`)**
   - Interactive daily/hourly cost & token charts, cache hit rates, model rankings, DB compression stats, and pooled provider quota limits (Claude, Codex with reset-credit redemption, and Antigravity).
 - **Ultra-Low Memory & Storage Footprint**

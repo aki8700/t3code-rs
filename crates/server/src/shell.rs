@@ -151,7 +151,7 @@ pub(crate) async fn exec_in_thread(
     Ok(result)
 }
 
-async fn run_shell(workspace: &Path, req: ShellExecRequest) -> CoreResult<ShellExecOutput> {
+pub(crate) async fn run_shell(workspace: &Path, req: ShellExecRequest) -> CoreResult<ShellExecOutput> {
     let command = req.command.trim().to_owned();
     if command.is_empty() {
         return Err(CoreError::InvalidArgument("command is required".into()));

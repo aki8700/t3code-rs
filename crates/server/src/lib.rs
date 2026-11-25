@@ -12,6 +12,7 @@ mod shell;
 mod swarm;
 mod threads;
 mod usage;
+mod workspace_meta;
 mod ws;
 
 use std::{

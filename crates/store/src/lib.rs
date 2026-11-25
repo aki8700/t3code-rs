@@ -394,6 +394,20 @@ impl SqliteStore {
         transaction
             .execute_batch(include_str!("schema.sql"))
             .map_err(storage_error)?;
+        for migration in [
+            "ALTER TABLE projects ADD COLUMN instructions TEXT",
+            "ALTER TABLE projects ADD COLUMN verify_command TEXT",
+        ] {
+            if let Err(error) = transaction.execute_batch(migration)
+                && !matches!(
+                    &error,
+                    rusqlite::Error::SqliteFailure(_, Some(message))
+                        if message.to_ascii_lowercase().contains("duplicate column name")
+                )
+            {
+                return Err(storage_error(error));
+            }
+        }
         transaction.commit().map_err(storage_error)?;
         let mut readers = Vec::new();
         let checkpoint = if let Some(path) = db_path {
@@ -494,6 +508,58 @@ impl SqliteStore {
         .await
     }
 
+    pub async fn update_project(
+        &self,
+        id: Uuid,
+        title: Option<String>,
+        default_model: Option<Option<ModelSelection>>,
+        instructions: Option<Option<String>>,
+        verify_command: Option<Option<String>>,
+    ) -> CoreResult<Project> {
+        self.with_writer(move |connection| {
+            let current = query_required(
+                connection,
+                "SELECT id, title, workspace_root, default_model, instructions, verify_command,
+                        created_at, updated_at FROM projects WHERE id = ?1",
+                "project",
+                id,
+                project_row,
+            )?;
+            let title = title.unwrap_or(current.title);
+            let default_model = default_model.unwrap_or(current.default_model);
+            let instructions = instructions
+                .map(trimmed_optional)
+                .unwrap_or(current.instructions);
+            let verify_command = verify_command
+                .map(trimmed_optional)
+                .unwrap_or(current.verify_command);
+            let updated_at = Utc::now();
+            connection
+                .execute(
+                    "UPDATE projects SET title = ?2, default_model = ?3, instructions = ?4,
+                    verify_command = ?5, updated_at = ?6 WHERE id = ?1",
+                    params![
+                        id.to_string(),
+                        title,
+                        default_model.as_ref().map(encode).transpose()?,
+                        instructions,
+                        verify_command,
+                        timestamp(updated_at),
+                    ],
+                )
+                .map_err(storage_error)?;
+            Ok(Project {
+                title,
+                default_model,
+                instructions,
+                verify_command,
+                updated_at,
+                ..current
+            })
+        })
+        .await
+    }
+
     async fn update_thread(
         &self,
         id: Uuid,
@@ -521,13 +587,16 @@ impl Store for SqliteStore {
                 title,
                 workspace_root,
                 default_model: None,
+                instructions: None,
+                verify_command: None,
                 created_at: now,
                 updated_at: now,
             };
             connection
                 .execute(
-                    "INSERT INTO projects (id, title, workspace_root, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                    "INSERT INTO projects (id, title, workspace_root, default_model, instructions,
+                        verify_command, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, NULL, NULL, ?4, ?4)",
                     params![
                         project.id.to_string(),
                         project.title,
@@ -545,7 +614,8 @@ impl Store for SqliteStore {
         self.with_reader(|connection| {
             query_all(
                 connection,
-                "SELECT id, title, workspace_root, default_model, created_at, updated_at
+                "SELECT id, title, workspace_root, default_model, instructions, verify_command,
+                        created_at, updated_at
                  FROM projects ORDER BY updated_at DESC, id",
                 [],
                 project_row,
@@ -558,7 +628,8 @@ impl Store for SqliteStore {
         self.with_reader(move |connection| {
             query_required(
                 connection,
-                "SELECT id, title, workspace_root, default_model, created_at, updated_at
+                "SELECT id, title, workspace_root, default_model, instructions, verify_command,
+                        created_at, updated_at
                  FROM projects WHERE id = ?1",
                 "project",
                 id,
@@ -1375,8 +1446,10 @@ fn project_row(row: &Row<'_>) -> rusqlite::Result<Project> {
             .get::<_, Option<String>>(3)?
             .map(|text| serde_json::from_str(&text).map_err(|e| conversion_error(3, Type::Text, e)))
             .transpose()?,
-        created_at: parse(row, 4)?,
-        updated_at: parse(row, 5)?,
+        instructions: row.get(4)?,
+        verify_command: row.get(5)?,
+        created_at: parse(row, 6)?,
+        updated_at: parse(row, 7)?,
     })
 }
 
@@ -1579,6 +1652,13 @@ fn sql_limit(value: usize) -> i64 {
 fn path_text(path: &Path) -> CoreResult<&str> {
     path.to_str()
         .ok_or_else(|| CoreError::InvalidArgument("path is not valid UTF-8".into()))
+}
+
+fn trimmed_optional(value: Option<String>) -> Option<String> {
+    value.and_then(|text| {
+        let trimmed = text.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
 }
 
 #[cfg(test)]

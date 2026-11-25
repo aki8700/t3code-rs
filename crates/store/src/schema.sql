@@ -3,6 +3,8 @@ CREATE TABLE IF NOT EXISTS projects (
     title TEXT NOT NULL,
     workspace_root TEXT NOT NULL,
     default_model TEXT,
+    instructions TEXT,
+    verify_command TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

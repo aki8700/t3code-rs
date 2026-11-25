@@ -99,6 +99,7 @@ struct Outcome {
     input: Option<u64>,
     output: Option<u64>,
     has_context_usage: bool,
+    had_file_changes: bool,
     assistant: String,
     reasoning: String,
     terminal: Option<(RunStatus, Option<String>)>,
@@ -607,6 +608,7 @@ impl RunCoordinator {
             .as_ref()
             .filter(|run| run.provider == selection.provider && run.model == selection.model)
             .and_then(|run| run.provider_session_id.clone());
+        let project = store.get_project(thread.project_id).await?;
         let mut prompt = queued.prompt;
         if previous_run.is_some() && resume_session_id.is_none() {
             let handoff = self.handoff_summary(&thread).await?;
@@ -623,6 +625,15 @@ impl RunCoordinator {
                 "Context from the previous thread:\n{}\n\nCurrent request:\n{prompt}",
                 handoff.summary
             );
+        }
+        if previous_run.is_none()
+            && let Some(instructions) = project
+                .instructions
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            prompt = format!("Project instructions:\n{instructions}\n\n{prompt}");
         }
         let workspace_dir = self.workspace(&thread).await?;
         let attachments = self
@@ -666,7 +677,7 @@ impl RunCoordinator {
         let request = TurnRequest {
             thread_id: thread.id,
             run_id,
-            workspace_dir,
+            workspace_dir: workspace_dir.clone(),
             prompt,
             model_selection: selection.clone(),
             runtime_mode: thread.runtime_mode,
@@ -723,6 +734,8 @@ impl RunCoordinator {
             mcp_token,
             swarm,
             started_at: run_started_at,
+            workspace_dir,
+            verify_command: project.verify_command,
         };
         Ok((ticket, turn))
     }
@@ -820,6 +833,8 @@ impl RunCoordinator {
             mcp_token,
             swarm,
             started_at: run_started_at,
+            workspace_dir,
+            verify_command,
         } = turn;
         let started = Instant::now();
         let thread_id = thread.id;
@@ -831,6 +846,7 @@ impl RunCoordinator {
             input: None,
             output: None,
             has_context_usage: false,
+            had_file_changes: false,
             assistant: String::new(),
             reasoning: String::new(),
             terminal: None,
@@ -881,6 +897,71 @@ impl RunCoordinator {
             }
         };
         drop(mcp_token);
+
+        if !*cancellation.borrow()
+            && result.is_ok()
+            && matches!(outcome.terminal, Some((RunStatus::Completed, _)))
+            && thread.interaction_mode != InteractionMode::Plan
+            && outcome.had_file_changes
+            && let Some(cmd) = verify_command
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            match crate::shell::run_shell(
+                &workspace_dir,
+                crate::shell::ShellExecRequest {
+                    command: cmd.to_owned(),
+                    timeout_secs: Some(60),
+                },
+            )
+            .await
+            {
+                Ok(out) => {
+                    let mut combined = String::new();
+                    if !out.stdout.is_empty() {
+                        combined.push_str(&out.stdout);
+                    }
+                    if !out.stderr.is_empty() {
+                        if !combined.is_empty() && !combined.ends_with('\n') {
+                            combined.push('\n');
+                        }
+                        combined.push_str(&out.stderr);
+                    }
+                    if out.timed_out {
+                        if !combined.is_empty() && !combined.ends_with('\n') {
+                            combined.push('\n');
+                        }
+                        combined.push_str("[タイムアウトにより強制終了しました]");
+                    }
+                    let summary = out.command.chars().take(240).collect::<String>();
+                    let _ = self
+                        .append(NewTurnItem {
+                            thread_id,
+                            run_id,
+                            kind: TurnItemKind::CommandExecution,
+                            summary: Some(summary),
+                            payload: json!({
+                                "command": out.command,
+                                "cwd": out.cwd,
+                                "exit_code": out.exit_code,
+                                "stdout": out.stdout,
+                                "stderr": out.stderr,
+                                "output": combined,
+                                "duration_ms": out.duration_ms,
+                                "timed_out": out.timed_out,
+                                "truncated": out.truncated,
+                                "source": "verify_hook",
+                            }),
+                            searchable_text: Some(format!("{}\n{}", out.command, combined)),
+                        })
+                        .await;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, %run_id, "Post-turn verify_command failed to launch");
+                }
+            }
+        }
 
         let mut active = self.0.active.lock().await;
         let cancelled = *cancellation.borrow();
@@ -1082,6 +1163,9 @@ impl RunCoordinator {
                 summary,
                 payload,
             } => {
+                if kind == TurnItemKind::FileChange {
+                    out.had_file_changes = true;
+                }
                 if kind == TurnItemKind::Reasoning {
                     out.reasoning.clear();
                 } else {
@@ -1321,6 +1405,8 @@ struct RunningTurn {
     mcp_token: Option<RunMcpToken>,
     swarm: Option<SwarmTurn>,
     started_at: chrono::DateTime<Utc>,
+    workspace_dir: std::path::PathBuf,
+    verify_command: Option<String>,
 }
 
 fn push_capped(buffer: &mut String, text: &str, other_len: usize) {

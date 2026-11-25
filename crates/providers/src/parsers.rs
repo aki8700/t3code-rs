@@ -1,9 +1,11 @@
-use serde_json::Value;
+use chrono::Utc;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use t3_core::{
     protocol::StreamEvent,
-    types::{ProviderId, TurnItemKind},
+    types::{PendingRequest, ProviderId, TurnItemKind},
 };
+use uuid::Uuid;
 
 pub(crate) struct Parser {
     provider: ProviderId,
@@ -71,6 +73,7 @@ impl Parser {
     fn claude(&mut self, event: &Value, out: &mut Vec<StreamEvent>) {
         match kind(event) {
             "stream_event" => self.claude_partial(&event["event"], out),
+            "control_request" => claude_control_request(event, out),
             "assistant" | "user" => self.claude_message(event, out),
             "result" => {
                 let usage = event.get("usage").or(event.get("stats")).unwrap_or(&Value::Null);
@@ -319,6 +322,40 @@ impl Parser {
             _ => {}
         }
     }
+}
+
+/// Only `can_use_tool` asks the host for permission; other control subtypes are not surfaced.
+fn claude_control_request(event: &Value, out: &mut Vec<StreamEvent>) {
+    let request = &event["request"];
+    if string(request, "subtype") != Some("can_use_tool") {
+        return;
+    }
+    let Some(provider_request_id) = string(event, "request_id") else {
+        return;
+    };
+    let tool_name = string(request, "tool_name").unwrap_or("tool");
+    let input = request.get("input").cloned().unwrap_or(Value::Null);
+    let command = ["command", "file_path", "path", "url"]
+        .iter()
+        .find_map(|field| string(&input, field))
+        .map(str::to_owned);
+    out.push(StreamEvent::PendingApproval {
+        request: PendingRequest {
+            id: Uuid::new_v4(),
+            // The coordinator fills in the thread and run ids when it stores the request.
+            thread_id: Uuid::nil(),
+            run_id: Uuid::nil(),
+            kind: "tool_approval".into(),
+            title: tool_name.to_owned(),
+            payload: json!({
+                "_provider_request_id": provider_request_id,
+                "tool_name": tool_name,
+                "input": input,
+                "command": command,
+            }),
+            created_at: Utc::now(),
+        },
+    });
 }
 
 fn kind(value: &Value) -> &str {
@@ -881,5 +918,44 @@ mod tests {
                 "cache_write_tokens": 1500
             })
         );
+    }
+
+    #[test]
+    fn claude_can_use_tool_control_request_becomes_pending_approval() {
+        let events = fixture(
+            ProviderId::Claude,
+            r#"{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -rf build"}}}
+{"type":"control_request","request_id":"req-2","request":{"subtype":"can_use_tool","tool_name":"Edit","input":{"file_path":"/w/a.rs","old_string":"a","new_string":"b"}}}"#,
+        );
+        assert_eq!(
+            event_types(&events),
+            ["pending_approval", "pending_approval"]
+        );
+        let bash = &events[0]["request"];
+        assert_eq!(bash["kind"], "tool_approval");
+        assert_eq!(bash["title"], "Bash");
+        assert_eq!(bash["thread_id"], Uuid::nil().to_string());
+        assert_eq!(bash["run_id"], Uuid::nil().to_string());
+        assert!(bash["id"].as_str().unwrap().parse::<Uuid>().is_ok());
+        assert_eq!(bash["payload"]["_provider_request_id"], "req-1");
+        assert_eq!(bash["payload"]["tool_name"], "Bash");
+        assert_eq!(bash["payload"]["input"], json!({"command": "rm -rf build"}));
+        assert_eq!(bash["payload"]["command"], "rm -rf build");
+        let edit = &events[1]["request"];
+        assert_eq!(edit["title"], "Edit");
+        assert_eq!(edit["payload"]["_provider_request_id"], "req-2");
+        assert_eq!(edit["payload"]["command"], "/w/a.rs");
+        assert_ne!(bash["id"], edit["id"]);
+    }
+
+    #[test]
+    fn claude_control_requests_without_permission_subtype_are_not_surfaced() {
+        let events = fixture(
+            ProviderId::Claude,
+            r#"{"type":"control_request","request_id":"init-1","request":{"subtype":"initialize"}}
+{"type":"control_request","request_id":"usage-1","request":{"subtype":"get_usage"}}
+{"type":"control_request","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{}}}"#,
+        );
+        assert!(events.is_empty(), "{events:?}");
     }
 }

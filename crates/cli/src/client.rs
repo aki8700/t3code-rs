@@ -20,7 +20,10 @@ const MAX_IN_FLIGHT: usize = 16;
 const MAX_STDIN_LINE: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BODY: usize = 16 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+const API_TIMEOUT: Duration = Duration::from_secs(30);
+const LIMITS_TIMEOUT: Duration = Duration::from_secs(60);
 const TIMEOUT_ENV: &str = "T3_MCP_TIMEOUT_SECS";
+const BEARER_TOKEN_ENV: &str = "T3_BEARER_TOKEN";
 
 pub async fn health(server_url: &str) -> CliResult<Value> {
     let client = http_client()?;
@@ -33,6 +36,132 @@ pub async fn health(server_url: &str) -> CliResult<Value> {
         .error_for_status()?
         .json()
         .await?)
+}
+
+/// Lists threads from `GET /api/threads`.
+pub async fn list_threads(
+    server_url: &str,
+    token: Option<&str>,
+    include_archived: bool,
+    limit: usize,
+) -> CliResult<Value> {
+    let url = threads_url(server_url, include_archived, limit)?;
+    let req = with_bearer_auth(http_client()?.get(url).timeout(API_TIMEOUT), token);
+    send_json(req).await
+}
+
+/// Sends a message to a thread via `POST /api/threads/{id}/messages`.
+pub async fn send_message(
+    server_url: &str,
+    token: Option<&str>,
+    thread_id: Uuid,
+    prompt: &str,
+    behavior: Option<&str>,
+) -> CliResult<Value> {
+    let url = send_message_url(server_url, thread_id)?;
+    let body = send_message_body(prompt, behavior);
+    let req = with_bearer_auth(http_client()?.post(url).timeout(API_TIMEOUT), token).json(&body);
+    send_json(req).await
+}
+
+/// Interrupts the active run on a thread via `POST /api/threads/{id}/interrupt`.
+pub async fn interrupt_thread(
+    server_url: &str,
+    token: Option<&str>,
+    thread_id: Uuid,
+) -> CliResult<()> {
+    let url = interrupt_url(server_url, thread_id)?;
+    let req = with_bearer_auth(http_client()?.post(url).timeout(API_TIMEOUT), token);
+    send_empty(req).await
+}
+
+/// Queries provider usage limits from `GET /api/usage/limits`.
+pub async fn usage_limits(
+    server_url: &str,
+    token: Option<&str>,
+    refresh: bool,
+) -> CliResult<Value> {
+    let url = usage_limits_url(server_url, refresh)?;
+    let req = with_bearer_auth(http_client()?.get(url).timeout(LIMITS_TIMEOUT), token);
+    send_json(req).await
+}
+
+fn with_bearer_auth(
+    req: reqwest::RequestBuilder,
+    token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match resolve_token(token, env::var(BEARER_TOKEN_ENV).ok().as_deref()) {
+        Some(token) => req.bearer_auth(token),
+        None => req,
+    }
+}
+
+fn resolve_token(explicit: Option<&str>, env_value: Option<&str>) -> Option<String> {
+    explicit
+        .filter(|value| !value.is_empty())
+        .or_else(|| env_value.filter(|value| !value.is_empty()))
+        .map(ToOwned::to_owned)
+}
+
+fn send_message_body(prompt: &str, behavior: Option<&str>) -> Value {
+    match behavior {
+        Some(behavior) => json!({ "prompt": prompt, "behavior": behavior }),
+        None => json!({ "prompt": prompt }),
+    }
+}
+
+async fn send_json(req: reqwest::RequestBuilder) -> CliResult<Value> {
+    let response = ensure_success(req.send().await?).await?;
+    Ok(response.json().await?)
+}
+
+async fn send_empty(req: reqwest::RequestBuilder) -> CliResult<()> {
+    ensure_success(req.send().await?).await?;
+    Ok(())
+}
+
+async fn ensure_success(response: reqwest::Response) -> CliResult<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().await.unwrap_or_default();
+    let detail = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|value| value.get("error").and_then(Value::as_str).map(String::from))
+        .unwrap_or_else(|| body.trim().to_owned());
+    if detail.is_empty() {
+        Err(format!("HTTP {status}").into())
+    } else {
+        Err(format!("HTTP {status}: {detail}").into())
+    }
+}
+
+fn threads_url(server_url: &str, include_archived: bool, limit: usize) -> CliResult<Url> {
+    let mut url = endpoint(server_url, "api/threads")?;
+    url.query_pairs_mut()
+        .append_pair(
+            "include_archived",
+            if include_archived { "true" } else { "false" },
+        )
+        .append_pair("limit", &limit.to_string());
+    Ok(url)
+}
+
+fn send_message_url(server_url: &str, thread_id: Uuid) -> CliResult<Url> {
+    endpoint(server_url, &format!("api/threads/{thread_id}/messages"))
+}
+
+fn interrupt_url(server_url: &str, thread_id: Uuid) -> CliResult<Url> {
+    endpoint(server_url, &format!("api/threads/{thread_id}/interrupt"))
+}
+
+fn usage_limits_url(server_url: &str, refresh: bool) -> CliResult<Url> {
+    let mut url = endpoint(server_url, "api/usage/limits")?;
+    if refresh {
+        url.query_pairs_mut().append_pair("refresh", "true");
+    }
+    Ok(url)
 }
 
 pub async fn run_stdio_bridge(
@@ -259,10 +388,108 @@ fn endpoint(base: &str, path: &str) -> CliResult<Url> {
         );
     }
     let prefix = url.path().trim_end_matches('/');
+    let path = path.trim_start_matches('/');
     url.set_path(&format!("{prefix}/{path}"));
     Ok(url)
 }
 
 fn internal(error: impl std::fmt::Display) -> CoreError {
     CoreError::Internal(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_normalizes_slashes_and_preserves_prefix() {
+        assert_eq!(
+            endpoint("http://127.0.0.1:3774", "api/threads")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3774/api/threads"
+        );
+        assert_eq!(
+            endpoint("https://example.com/t3/", "/api/usage/limits")
+                .unwrap()
+                .as_str(),
+            "https://example.com/t3/api/usage/limits"
+        );
+    }
+
+    #[test]
+    fn endpoint_rejects_invalid_urls() {
+        assert!(endpoint("ftp://127.0.0.1:3774", "healthz").is_err());
+        assert!(endpoint("http://user:pass@127.0.0.1:3774", "healthz").is_err());
+        assert!(endpoint("http://127.0.0.1:3774?a=1", "healthz").is_err());
+        assert!(endpoint("http://127.0.0.1:3774#frag", "healthz").is_err());
+    }
+
+    #[test]
+    fn thread_and_limit_urls_format_paths_and_queries() {
+        let id = Uuid::nil();
+        assert_eq!(
+            threads_url("http://127.0.0.1:3774", false, 30)
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3774/api/threads?include_archived=false&limit=30"
+        );
+        assert_eq!(
+            threads_url("http://127.0.0.1:3774/sub/", true, 10)
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3774/sub/api/threads?include_archived=true&limit=10"
+        );
+        assert_eq!(
+            send_message_url("http://127.0.0.1:3774", id)
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3774/api/threads/00000000-0000-0000-0000-000000000000/messages"
+        );
+        assert_eq!(
+            interrupt_url("http://127.0.0.1:3774", id)
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3774/api/threads/00000000-0000-0000-0000-000000000000/interrupt"
+        );
+        assert_eq!(
+            usage_limits_url("http://127.0.0.1:3774", false)
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3774/api/usage/limits"
+        );
+        assert_eq!(
+            usage_limits_url("http://127.0.0.1:3774", true)
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:3774/api/usage/limits?refresh=true"
+        );
+    }
+
+    #[test]
+    fn resolve_token_prefers_explicit_and_skips_empty() {
+        assert_eq!(
+            resolve_token(Some("cli-tok"), Some("env-tok")).as_deref(),
+            Some("cli-tok")
+        );
+        assert_eq!(
+            resolve_token(None, Some("env-tok")).as_deref(),
+            Some("env-tok")
+        );
+        assert_eq!(
+            resolve_token(Some(""), Some("env-tok")).as_deref(),
+            Some("env-tok")
+        );
+        assert_eq!(resolve_token(None, Some("")), None);
+        assert_eq!(resolve_token(None, None), None);
+    }
+
+    #[test]
+    fn send_message_body_omits_absent_behavior() {
+        assert_eq!(send_message_body("hi", None), json!({ "prompt": "hi" }));
+        assert_eq!(
+            send_message_body("hi", Some("queue")),
+            json!({ "prompt": "hi", "behavior": "queue" })
+        );
+    }
 }

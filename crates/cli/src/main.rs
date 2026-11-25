@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::{
     collections::HashSet,
     error::Error,
+    fmt::Write as _,
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -43,6 +44,51 @@ enum Command {
     Status {
         #[arg(long, default_value = DEFAULT_URL)]
         url: String,
+    },
+    /// List threads from a running server.
+    Threads {
+        #[arg(long, default_value = "http://127.0.0.1:3774")]
+        url: String,
+        #[arg(long, env = "T3_BEARER_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        #[arg(long)]
+        archived: bool,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send a prompt message to a thread.
+    Send {
+        thread_id: Uuid,
+        prompt: String,
+        #[arg(long, default_value = "http://127.0.0.1:3774")]
+        url: String,
+        #[arg(long, env = "T3_BEARER_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        #[arg(long)]
+        behavior: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Interrupt an active run on a thread.
+    Interrupt {
+        thread_id: Uuid,
+        #[arg(long, default_value = "http://127.0.0.1:3774")]
+        url: String,
+        #[arg(long, env = "T3_BEARER_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+    },
+    /// Query provider usage limits from a running server.
+    Limits {
+        #[arg(long, default_value = "http://127.0.0.1:3774")]
+        url: String,
+        #[arg(long, env = "T3_BEARER_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Print local orchestration and storage statistics.
     Stats {
@@ -165,6 +211,64 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
             println!("{}", serde_json::to_string_pretty(&health)?);
             if health["ok"] != Value::Bool(true) {
                 return Ok(ExitCode::FAILURE);
+            }
+        }
+        Command::Threads {
+            url,
+            token,
+            archived,
+            limit,
+            json,
+        } => {
+            let threads = client::list_threads(&url, token.as_deref(), archived, limit).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&threads)?);
+            } else {
+                print!("{}", format_threads_table(&threads));
+            }
+        }
+        Command::Send {
+            thread_id,
+            prompt,
+            url,
+            token,
+            behavior,
+            json,
+        } => {
+            let result = client::send_message(
+                &url,
+                token.as_deref(),
+                thread_id,
+                &prompt,
+                behavior.as_deref(),
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                let run_id = result["run_id"].as_str().unwrap_or("-");
+                println!("Run {run_id} queued on thread {thread_id}");
+            }
+        }
+        Command::Interrupt {
+            thread_id,
+            url,
+            token,
+        } => {
+            client::interrupt_thread(&url, token.as_deref(), thread_id).await?;
+            println!("Interrupted thread {thread_id}");
+        }
+        Command::Limits {
+            url,
+            token,
+            refresh,
+            json,
+        } => {
+            let limits = client::usage_limits(&url, token.as_deref(), refresh).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&limits)?);
+            } else {
+                print!("{}", format_limits_table(&limits));
             }
         }
         Command::Stats { data_dir } => {
@@ -524,4 +628,358 @@ fn print_plist(port: u16, config: Option<PathBuf>) -> CliResult<()> {
         "  </array>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n  <true/>\n</dict>\n</plist>"
     );
     Ok(())
+}
+
+fn format_threads_table(value: &Value) -> String {
+    let Some(rows) = value.as_array() else {
+        return format!("{value}\n");
+    };
+    if rows.is_empty() {
+        return "No threads.\n".into();
+    }
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<36}  {:<12}  {:<24}  {:<19}  Title",
+        "ID", "Status", "Model", "Updated"
+    );
+    for row in rows {
+        let id = row["id"].as_str().unwrap_or("-");
+        let status = row["status"].as_str().unwrap_or("-");
+        let model = format_model_label(&row["model_selection"]);
+        let updated = format_timestamp(row["updated_at"].as_str().unwrap_or("-"));
+        let raw_title = row["title"].as_str().unwrap_or("");
+        let title = if row["archived"].as_bool() == Some(true) {
+            format!("{} (archived)", truncate_single_line(raw_title, 40))
+        } else {
+            truncate_single_line(raw_title, 50)
+        };
+        let _ = writeln!(
+            out,
+            "{:<36}  {:<12}  {:<24}  {:<19}  {}",
+            truncate_single_line(id, 36),
+            truncate_single_line(status, 12),
+            truncate_single_line(&model, 24),
+            updated,
+            title
+        );
+    }
+    out
+}
+
+fn format_model_label(selection: &Value) -> String {
+    let provider = selection["provider"].as_str().unwrap_or("");
+    let model = selection["model"].as_str().unwrap_or("");
+    match (provider.is_empty(), model.is_empty()) {
+        (true, true) => "-".into(),
+        (true, false) => model.into(),
+        (false, true) => provider.into(),
+        (false, false) => format!("{provider}/{model}"),
+    }
+}
+
+fn format_limits_table(value: &Value) -> String {
+    let Some(providers) = value["providers"].as_array() else {
+        return format!("{value}\n");
+    };
+    if providers.is_empty() {
+        return "No provider limits.\n".into();
+    }
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<14}  {:<12}  {:<12}  {:<20}  {:>7}  {:>7}  Resets / Note",
+        "Provider", "Plan", "Status", "Window", "Used", "Left"
+    );
+    for provider in providers {
+        let label = provider["label"]
+            .as_str()
+            .or_else(|| provider["provider"].as_str())
+            .unwrap_or("-");
+        let plan = provider["plan"].as_str().unwrap_or("-");
+        let status = provider["status"].as_str().unwrap_or("-");
+        let message = provider["message"].as_str().unwrap_or("");
+        let windows = provider["windows"].as_array();
+        match windows {
+            Some(windows) if !windows.is_empty() => {
+                for (index, window) in windows.iter().enumerate() {
+                    let window_label = window["label"].as_str().unwrap_or("-");
+                    let used = format_percent(window["used_percent"].as_f64());
+                    let left = format_percent(window["remaining_percent"].as_f64());
+                    let resets = window["resets_at"]
+                        .as_str()
+                        .map(format_timestamp)
+                        .unwrap_or_else(|| "-".into());
+                    let note = if index == 0 && !message.is_empty() && resets == "-" {
+                        truncate_single_line(message, 40)
+                    } else {
+                        resets
+                    };
+                    let _ = writeln!(
+                        out,
+                        "{:<14}  {:<12}  {:<12}  {:<20}  {:>7}  {:>7}  {}",
+                        truncate_single_line(if index == 0 { label } else { "" }, 14),
+                        truncate_single_line(if index == 0 { plan } else { "" }, 12),
+                        truncate_single_line(if index == 0 { status } else { "" }, 12),
+                        truncate_single_line(window_label, 20),
+                        used,
+                        left,
+                        note
+                    );
+                }
+            }
+            _ => {
+                let note = if message.is_empty() {
+                    "-".into()
+                } else {
+                    truncate_single_line(message, 40)
+                };
+                let _ = writeln!(
+                    out,
+                    "{:<14}  {:<12}  {:<12}  {:<20}  {:>7}  {:>7}  {}",
+                    truncate_single_line(label, 14),
+                    truncate_single_line(plan, 12),
+                    truncate_single_line(status, 12),
+                    "-",
+                    "-",
+                    "-",
+                    note
+                );
+            }
+        }
+    }
+    out
+}
+
+fn format_percent(value: Option<f64>) -> String {
+    match value {
+        Some(pct) => format!("{pct:.0}%"),
+        None => "-".into(),
+    }
+}
+
+fn format_timestamp(ts: &str) -> String {
+    let trimmed = ts.trim();
+    if trimmed.len() >= 19 && trimmed.is_ascii() {
+        trimmed[..19].replace('T', " ")
+    } else {
+        truncate_single_line(trimmed, 19)
+    }
+}
+
+fn truncate_single_line(input: &str, max_chars: usize) -> String {
+    let collapsed = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = collapsed.chars().count();
+    if count <= max_chars {
+        return collapsed;
+    }
+    if max_chars <= 3 {
+        return collapsed.chars().take(max_chars).collect();
+    }
+    let prefix: String = collapsed.chars().take(max_chars - 3).collect();
+    format!("{prefix}...")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_threads_defaults_and_flags() {
+        let cli = Cli::try_parse_from(["t3d", "threads"]).unwrap();
+        match cli.command {
+            Command::Threads {
+                url,
+                token,
+                archived,
+                limit,
+                json,
+            } => {
+                assert_eq!(url, "http://127.0.0.1:3774");
+                assert_eq!(token, None);
+                assert!(!archived);
+                assert_eq!(limit, 30);
+                assert!(!json);
+            }
+            _ => panic!("expected Threads command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "t3d",
+            "threads",
+            "--url",
+            "http://localhost:4000",
+            "--token",
+            "secret-tok",
+            "--archived",
+            "--limit",
+            "12",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Threads {
+                url,
+                token,
+                archived,
+                limit,
+                json,
+            } => {
+                assert_eq!(url, "http://localhost:4000");
+                assert_eq!(token.as_deref(), Some("secret-tok"));
+                assert!(archived);
+                assert_eq!(limit, 12);
+                assert!(json);
+            }
+            _ => panic!("expected Threads command"),
+        }
+    }
+
+    #[test]
+    fn parse_send_command() {
+        let id = Uuid::new_v4();
+        let id_str = id.to_string();
+        let cli = Cli::try_parse_from(["t3d", "send", &id_str, "hello world"]).unwrap();
+        match cli.command {
+            Command::Send {
+                thread_id,
+                prompt,
+                url,
+                token,
+                behavior,
+                json,
+            } => {
+                assert_eq!(thread_id, id);
+                assert_eq!(prompt, "hello world");
+                assert_eq!(url, "http://127.0.0.1:3774");
+                assert_eq!(token, None);
+                assert_eq!(behavior, None);
+                assert!(!json);
+            }
+            _ => panic!("expected Send command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "t3d",
+            "send",
+            &id_str,
+            "follow up",
+            "--behavior",
+            "queue",
+            "--token",
+            "tok",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Send {
+                behavior,
+                token,
+                json,
+                ..
+            } => {
+                assert_eq!(behavior.as_deref(), Some("queue"));
+                assert_eq!(token.as_deref(), Some("tok"));
+                assert!(json);
+            }
+            _ => panic!("expected Send command"),
+        }
+    }
+
+    #[test]
+    fn parse_interrupt_and_limits_commands() {
+        let id = Uuid::new_v4();
+        let id_str = id.to_string();
+        let cli = Cli::try_parse_from([
+            "t3d",
+            "interrupt",
+            &id_str,
+            "--url",
+            "http://127.0.0.1:3888",
+            "--token",
+            "tok",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Interrupt {
+                thread_id,
+                url,
+                token,
+            } => {
+                assert_eq!(thread_id, id);
+                assert_eq!(url, "http://127.0.0.1:3888");
+                assert_eq!(token.as_deref(), Some("tok"));
+            }
+            _ => panic!("expected Interrupt command"),
+        }
+
+        let cli = Cli::try_parse_from(["t3d", "limits", "--refresh", "--json"]).unwrap();
+        match cli.command {
+            Command::Limits {
+                url,
+                token,
+                refresh,
+                json,
+            } => {
+                assert_eq!(url, "http://127.0.0.1:3774");
+                assert_eq!(token, None);
+                assert!(refresh);
+                assert!(json);
+            }
+            _ => panic!("expected Limits command"),
+        }
+    }
+
+    #[test]
+    fn format_tables_handles_empty_and_populated_payloads() {
+        assert_eq!(format_threads_table(&json!([])), "No threads.\n");
+        let threads_out = format_threads_table(&json!([{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "status": "running",
+            "model_selection": { "provider": "codex", "model": "gpt-5" },
+            "updated_at": "2026-11-25T10:20:30Z",
+            "title": "Implement CLI\ncontrol",
+            "archived": false
+        }]));
+        assert!(threads_out.contains("00000000-0000-0000-0000-000000000001"));
+        assert!(threads_out.contains("codex/gpt-5"));
+        assert!(threads_out.contains("2026-11-25 10:20:30"));
+        assert!(threads_out.contains("Implement CLI control"));
+
+        assert_eq!(
+            format_limits_table(&json!({ "providers": [] })),
+            "No provider limits.\n"
+        );
+        let limits_out = format_limits_table(&json!({
+            "providers": [
+                {
+                    "provider": "claude",
+                    "label": "Claude",
+                    "plan": "Max",
+                    "status": "ok",
+                    "windows": [
+                        {
+                            "label": "Session (5h)",
+                            "used_percent": 25.0,
+                            "remaining_percent": 75.0,
+                            "resets_at": "2026-11-25T15:00:00Z"
+                        }
+                    ]
+                },
+                {
+                    "provider": "codex",
+                    "label": "Codex",
+                    "plan": null,
+                    "status": "unavailable",
+                    "message": "not signed in",
+                    "windows": []
+                }
+            ]
+        }));
+        assert!(limits_out.contains("Claude"));
+        assert!(limits_out.contains("25%"));
+        assert!(limits_out.contains("75%"));
+        assert!(limits_out.contains("not signed in"));
+    }
 }

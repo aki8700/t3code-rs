@@ -28,8 +28,15 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/meta", get(meta))
         .route("/api/providers", get(providers))
         .route("/api/projects", get(projects).post(create_project))
-        .route("/api/projects/{id}", axum::routing::delete(delete_project))
+        .route(
+            "/api/projects/{id}",
+            axum::routing::patch(patch_project).delete(delete_project),
+        )
         .route("/api/projects/{id}/exec", post(project_exec))
+        .route(
+            "/api/projects/{id}/workspace-meta",
+            get(project_workspace_meta),
+        )
         .route("/api/threads", get(threads).post(create_thread))
         .route("/api/threads/{id}", get(thread_detail).patch(patch_thread))
         .route("/api/threads/{id}/messages", post(send_message))
@@ -182,6 +189,57 @@ async fn create_project(
     }
     Ok(Json(
         state.store.create_project(input.title, workspace).await?,
+    ))
+}
+
+fn deserialize_double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+struct PatchProject {
+    title: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    default_model: Option<Option<ModelSelection>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    instructions: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    verify_command: Option<Option<String>>,
+}
+
+async fn patch_project(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<PatchProject>,
+) -> ApiResult<Json<Project>> {
+    if let Some(title) = &input.title {
+        validate_title(title)?;
+    }
+    Ok(Json(
+        state
+            .store
+            .update_project(
+                id,
+                input.title,
+                input.default_model,
+                input.instructions,
+                input.verify_command,
+            )
+            .await?,
+    ))
+}
+
+async fn project_workspace_meta(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<crate::workspace_meta::WorkspaceMeta>> {
+    let project = state.store.get_project(id).await?;
+    Ok(Json(
+        crate::workspace_meta::scan_workspace(&project.workspace_root).await,
     ))
 }
 

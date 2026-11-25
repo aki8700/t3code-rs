@@ -209,6 +209,58 @@ async fn gc_removes_only_unreferenced_blobs_and_regular_attachment_files() {
 }
 
 #[tokio::test]
+async fn project_metadata_migrates_and_updates() {
+    let dir = TempDir::new();
+    let db_path = dir.0.join("state.sqlite");
+    let id = Uuid::new_v4();
+    let now = timestamp(Utc::now());
+    let legacy = Connection::open(&db_path).unwrap();
+    legacy
+        .execute_batch(
+            "CREATE TABLE projects (
+            id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, workspace_root TEXT NOT NULL,
+            default_model TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );",
+        )
+        .unwrap();
+    legacy
+        .execute(
+            "INSERT INTO projects (id, title, workspace_root, created_at, updated_at)
+         VALUES (?1, 'Legacy', '/workspace', ?2, ?2)",
+            params![id.to_string(), now],
+        )
+        .unwrap();
+    drop(legacy);
+
+    let store = SqliteStore::open(&db_path, StorageConfig::default()).unwrap();
+    let migrated = store.get_project(id).await.unwrap();
+    assert_eq!(migrated.instructions, None);
+    assert_eq!(migrated.verify_command, None);
+
+    let updated = store
+        .update_project(
+            id,
+            Some("Updated title".into()),
+            Some(Some(ModelSelection::default())),
+            Some(Some("  cargo test  ".into())),
+            Some(Some("  ".into())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.title, "Updated title");
+    assert_eq!(updated.default_model, Some(ModelSelection::default()));
+    assert_eq!(updated.instructions.as_deref(), Some("cargo test"));
+    assert_eq!(updated.verify_command, None);
+    let listed = store.list_projects().await.unwrap();
+    assert_eq!(listed[0].instructions.as_deref(), Some("cargo test"));
+    drop(store);
+
+    let reopened = SqliteStore::open(&db_path, StorageConfig::default()).unwrap();
+    let persisted = reopened.get_project(id).await.unwrap();
+    assert_eq!(persisted.instructions.as_deref(), Some("cargo test"));
+}
+
+#[tokio::test]
 async fn entity_lifecycle_and_cascade() {
     let store = SqliteStore::open_in_memory(StorageConfig::default()).unwrap();
     let project = store

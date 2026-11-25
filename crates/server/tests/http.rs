@@ -1911,3 +1911,98 @@ async fn checkpoints_git_actions_and_queue_endpoints_work() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn project_patch_workspace_meta_and_instructions_injection() {
+    let tmp = TempDir::new();
+    let workspace = tmp.0.join("ws");
+    std::fs::create_dir_all(workspace.join(".claude/commands")).unwrap();
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(
+        workspace.join(".claude/commands/deploy.md"),
+        "# Deploy helper\nDeploys safely\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+
+    let proj = json_req(
+        &app,
+        Method::POST,
+        "/api/projects",
+        Some(json!({"title": "Meta Proj", "workspace_root": workspace})),
+    )
+    .await;
+    let pid = proj["id"].as_str().unwrap();
+
+    let updated = json_req(
+        &app,
+        Method::PATCH,
+        &format!("/api/projects/{pid}"),
+        Some(json!({
+            "title": "Meta Proj v2",
+            "instructions": "Always respond in Japanese.",
+            "verify_command": "echo ok"
+        })),
+    )
+    .await;
+    assert_eq!(updated["title"], "Meta Proj v2");
+    assert_eq!(updated["instructions"], "Always respond in Japanese.");
+    assert_eq!(updated["verify_command"], "echo ok");
+
+    let meta = json_req(
+        &app,
+        Method::GET,
+        &format!("/api/projects/{pid}/workspace-meta"),
+        None,
+    )
+    .await;
+    assert!(
+        meta["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "deploy")
+    );
+    assert!(
+        meta["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "src/main.rs")
+    );
+
+    // First turn in a new thread receives the project instructions prefix.
+    let thread = json_req(
+        &app,
+        Method::POST,
+        "/api/threads",
+        Some(json!({
+            "project_id": pid,
+            "title": "Instructions Check",
+            "model_selection": {"provider": "mock", "model": "mock"}
+        })),
+    )
+    .await;
+    let tid: Uuid = thread["id"].as_str().unwrap().parse().unwrap();
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{tid}/messages"),
+        Some(json!({"prompt": "say hi"})),
+    )
+    .await;
+    wait_for_thread(&mut events, tid, ThreadStatus::Completed).await;
+    let detail = json_req(&app, Method::GET, &format!("/api/threads/{tid}"), None).await;
+    let reply = detail["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|item| item["kind"] == "assistant_message")
+        .and_then(|item| item["payload"]["text"].as_str())
+        .unwrap();
+    assert!(reply.contains("Project instructions:\nAlways respond in Japanese."));
+}

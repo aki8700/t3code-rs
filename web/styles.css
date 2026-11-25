@@ -1277,6 +1277,14 @@ body.resizing-rail { cursor: col-resize !important; user-select: none; -webkit-u
 .step.user-shell > summary .s-ic { color: var(--success); }
 .step.user-shell.bad > summary .s-ic { color: var(--error); }
 
+/* Automatic post-edit verification hook (source === 'verify_hook'): a quiet accent so it reads as system-initiated, not user-run. */
+.step.verify-hook > summary { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+.step.verify-hook > summary .s-ic { color: var(--accent); }
+.step.verify-hook.bad > summary .s-ic { color: var(--error); }
+
+/* Model picker dimmed while "clear default model" is checked in the project settings dialog. */
+.mp-embed.dim { opacity: .45; }
+
 .shell-res { display: flex; flex-direction: column; gap: 10px; }
 .shell-res-meta { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
 .shell-res-cmd { font: 600 13px/1.4 var(--mono); padding: 4px 9px; border-radius: 7px; background: var(--code-bg); border: 1px solid var(--border); overflow-wrap: anywhere; }

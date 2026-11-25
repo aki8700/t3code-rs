@@ -2,7 +2,7 @@ use crate::{
     parsers::{Parser, provider_error},
     watchdog::{RepetitionWatchdog, ToolLoopWatchdog},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     io,
@@ -17,7 +17,7 @@ use std::{
 use t3_core::{
     protocol::StreamEvent,
     traits::{CoreError, CoreResult},
-    types::ProviderId,
+    types::{PendingResponse, ProviderId},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -37,18 +37,37 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_IDLE_STDOUT_TIMEOUT: Duration = Duration::from_secs(600);
 const IDLE_STDOUT_TIMEOUT_ENV: &str = "T3_IDLE_STDOUT_TIMEOUT_SECS";
 
+/// Messages written to a streaming provider's stdin while the turn is open.
+enum StdinMsg {
+    /// A mid-turn user message, wrapped as a stream-json `user` event.
+    Steer(String),
+    /// A complete JSON object written as-is (one line, newline added on write).
+    RawLine(String),
+}
+
+/// A provider permission request that is waiting for the user's answer.
+pub(crate) struct ControlRequest {
+    /// The CLI's own `request_id`, echoed back in `control_response`.
+    provider_request_id: String,
+    /// Original tool input, used as `updatedInput` when the user approves unchanged.
+    input: Value,
+}
+
 pub(crate) struct ActiveProcess {
     #[cfg(unix)]
     pid: u32,
     #[cfg(unix)]
     released: watch::Receiver<bool>,
-    stdin_tx: Option<mpsc::UnboundedSender<String>>,
+    stdin_tx: Option<mpsc::UnboundedSender<StdinMsg>>,
+    /// Keyed by the `PendingRequest::id` shown to the user.
+    control_requests: ControlRequests,
     interrupted: Arc<AtomicBool>,
     #[cfg(not(unix))]
     stop: oneshot::Sender<()>,
 }
 
 pub(crate) type ActiveRunMap = Arc<Mutex<HashMap<Uuid, ActiveProcess>>>;
+type ControlRequests = Arc<Mutex<HashMap<Uuid, ControlRequest>>>;
 
 pub(crate) enum Input {
     StreamJson(String),
@@ -299,12 +318,51 @@ pub(crate) async fn interrupt(active: &ActiveRunMap, run_id: Uuid) -> CoreResult
 }
 
 pub(crate) fn send_steer(active: &ActiveRunMap, run_id: Uuid, message: String) -> bool {
+    send_stdin(active, run_id, StdinMsg::Steer(message))
+}
+
+/// Answers a `can_use_tool` control request by writing a `control_response` line to stdin.
+pub(crate) fn send_control_response(
+    active: &ActiveRunMap,
+    run_id: Uuid,
+    resp: &PendingResponse,
+) -> bool {
+    let Some(request) = active
+        .lock()
+        .unwrap()
+        .get(&run_id)
+        .and_then(|run| run.control_requests.lock().unwrap().remove(&resp.request_id))
+    else {
+        return false;
+    };
+    let response = if resp.approved {
+        let updated_input = resp
+            .payload
+            .get("updatedInput")
+            .cloned()
+            .unwrap_or(request.input);
+        json!({"behavior": "allow", "updatedInput": updated_input})
+    } else {
+        json!({"behavior": "deny", "message": "User denied tool execution"})
+    };
+    let line = json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request.provider_request_id,
+            "response": response,
+        }
+    });
+    send_stdin(active, run_id, StdinMsg::RawLine(line.to_string()))
+}
+
+fn send_stdin(active: &ActiveRunMap, run_id: Uuid, msg: StdinMsg) -> bool {
     active
         .lock()
         .unwrap()
         .get(&run_id)
         .and_then(|run| run.stdin_tx.as_ref())
-        .is_some_and(|tx| tx.send(message).is_ok())
+        .is_some_and(|tx| tx.send(msg).is_ok())
 }
 
 fn configured_idle_stdout_timeout() -> Duration {
@@ -357,6 +415,7 @@ async fn run_turn_with_idle_timeout(
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+    let control_requests = ControlRequests::default();
     let interrupted = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     let (released, release_rx) = watch::channel(false);
@@ -383,6 +442,7 @@ async fn run_turn_with_idle_timeout(
                 #[cfg(unix)]
                 released: release_rx,
                 stdin_tx: matches!(input, Input::StreamJson(_)).then_some(steer_tx),
+                control_requests: Arc::clone(&control_requests),
                 interrupted: Arc::clone(&interrupted),
                 #[cfg(not(unix))]
                 stop,
@@ -452,6 +512,7 @@ async fn run_turn_with_idle_timeout(
                 provider,
                 secret,
                 &tx,
+                &control_requests,
                 close_tx,
                 reader_stop_tx,
                 idle_timeout,
@@ -552,11 +613,13 @@ enum ReadOutcome {
     Stopped(&'static str),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_events(
     stdout: impl AsyncRead + Unpin,
     provider: ProviderId,
     secret: Option<&str>,
     tx: &mpsc::UnboundedSender<StreamEvent>,
+    control_requests: &ControlRequests,
     close_stdin: oneshot::Sender<()>,
     stop_process: oneshot::Sender<()>,
     idle_timeout: Duration,
@@ -604,6 +667,18 @@ async fn read_events(
                 redact_value(&mut value, secret);
             }
             for event in parser.parse(&value) {
+                if let StreamEvent::PendingApproval { request } = &event
+                    && let Some(provider_request_id) =
+                        request.payload["_provider_request_id"].as_str()
+                {
+                    control_requests.lock().unwrap().insert(
+                        request.id,
+                        ControlRequest {
+                            provider_request_id: provider_request_id.to_owned(),
+                            input: request.payload["input"].clone(),
+                        },
+                    );
+                }
                 if !matches!(terminal, Some(StreamEvent::Completed { .. })) {
                     let stop_reason = match &event {
                         StreamEvent::AssistantDelta { text } if assistant.push(text) => Some(
@@ -673,7 +748,7 @@ fn user_line(text: &str) -> String {
 async fn write_input(
     stdin: Option<ChildStdin>,
     input: Input,
-    mut steer: mpsc::UnboundedReceiver<String>,
+    mut steer: mpsc::UnboundedReceiver<StdinMsg>,
     close: oneshot::Receiver<()>,
 ) -> io::Result<()> {
     let Some(mut stdin) = stdin else {
@@ -683,8 +758,15 @@ async fn write_input(
         match input {
             Input::StreamJson(prompt) => {
                 stdin.write_all(user_line(&prompt).as_bytes()).await?;
-                while let Some(message) = steer.recv().await {
-                    stdin.write_all(user_line(&message).as_bytes()).await?;
+                while let Some(msg) = steer.recv().await {
+                    let line = match msg {
+                        StdinMsg::Steer(text) => user_line(&text),
+                        StdinMsg::RawLine(mut line) => {
+                            line.push('\n');
+                            line
+                        }
+                    };
+                    stdin.write_all(line.as_bytes()).await?;
                 }
             }
             Input::Text(prompt) => stdin.write_all(prompt.as_bytes()).await?,
@@ -712,7 +794,10 @@ mod tests {
     use super::*;
     use crate::{AntigravityDriver, ClaudeDriver, CodexDriver, OpenCodeDriver, test_request};
     use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
-    use t3_core::{traits::ProviderDriver, types::McpInjectionSpec};
+    use t3_core::{
+        traits::ProviderDriver,
+        types::{McpInjectionSpec, PendingResponse},
+    };
 
     struct Fixture(PathBuf);
 
@@ -1150,6 +1235,7 @@ wait
             ProviderId::Claude,
             None,
             &tx,
+            &ControlRequests::default(),
             close,
             stop,
             DEFAULT_IDLE_STDOUT_TIMEOUT,
@@ -1229,6 +1315,7 @@ wait
                 pid,
                 released: release_rx,
                 stdin_tx: None,
+                control_requests: ControlRequests::default(),
                 interrupted: Arc::clone(&interrupted),
             },
         );
@@ -1406,5 +1493,102 @@ printf '{"type":"result","subtype":"success","result":"done"}\n'
             }
         }
         assert!(completed);
+    }
+
+    /// Runs a Claude turn whose CLI asks permission to run `ls -la`, answers it through
+    /// `respond_request`, and returns the single line the CLI read back from stdin.
+    async fn answer_control_request(approved: bool, payload: Value) -> Value {
+        let fixture = Fixture::new(
+            r#"
+IFS= read -r first
+printf '%s\n' '{"type":"control_request","request_id":"cli-req-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls -la"}}}'
+IFS= read -r answer
+printf '%s\n' "$answer" > "$(dirname "$0")/answer.json"
+printf '%s\n' '{"type":"result","result":"ok"}'
+if IFS= read -r unexpected; then
+    exit 17
+fi
+"#,
+        );
+        let driver = ClaudeDriver::new(fixture.binary());
+        let req = test_request(ProviderId::Claude);
+        let run_id = req.run_id;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let running = driver.clone();
+        let task = tokio::spawn(async move { running.run_turn(req, tx).await });
+
+        let Some(StreamEvent::PendingApproval { request }) = receive(&mut rx).await else {
+            panic!("expected a pending approval");
+        };
+        assert_eq!(request.title, "Bash");
+        assert_eq!(request.payload["command"], "ls -la");
+        let resp = PendingResponse {
+            request_id: request.id,
+            approved,
+            payload,
+        };
+        assert!(driver.respond_request(run_id, resp.clone()).await.unwrap());
+        // The request is consumed once answered, so a repeated answer is refused.
+        assert!(!driver.respond_request(run_id, resp).await.unwrap());
+        assert!(matches!(
+            receive(&mut rx).await,
+            Some(StreamEvent::Completed { .. })
+        ));
+        task.await.unwrap().unwrap();
+
+        let answer = fs::read_to_string(fixture.0.join("answer.json")).unwrap();
+        serde_json::from_str(&answer).unwrap()
+    }
+
+    #[tokio::test]
+    async fn approved_control_request_writes_allow_response_to_stdin() {
+        let answer = answer_control_request(true, json!({})).await;
+        assert_eq!(
+            answer,
+            json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "cli-req-1",
+                    "response": {"behavior": "allow", "updatedInput": {"command": "ls -la"}}
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_with_updated_input_allows_the_edited_call() {
+        let answer = answer_control_request(true, json!({"updatedInput": {"command": "ls"}})).await;
+        assert_eq!(
+            answer["response"]["response"],
+            json!({"behavior": "allow", "updatedInput": {"command": "ls"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_control_request_writes_deny_response_to_stdin() {
+        let answer = answer_control_request(false, json!({})).await;
+        assert_eq!(
+            answer,
+            json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "cli-req-1",
+                    "response": {"behavior": "deny", "message": "User denied tool execution"}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn control_response_for_unknown_run_is_refused() {
+        let active = ActiveRunMap::default();
+        let resp = PendingResponse {
+            request_id: Uuid::new_v4(),
+            approved: true,
+            payload: json!({}),
+        };
+        assert!(!send_control_response(&active, Uuid::new_v4(), &resp));
     }
 }

@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use t3_core::{
     protocol::StreamEvent,
     traits::{CoreError, CoreResult, ProviderDriver, TurnRequest},
-    types::{InteractionMode, McpInjectionSpec, ProviderHealth, ProviderId, RuntimeMode},
+    types::{
+        InteractionMode, McpInjectionSpec, PendingResponse, ProviderHealth, ProviderId, RuntimeMode,
+    },
 };
 use tokio::{process::Command, sync::mpsc};
 use uuid::Uuid;
@@ -109,6 +111,18 @@ macro_rules! cli_driver {
 
             async fn send_steer(&self, run_id: Uuid, message: String) -> CoreResult<bool> {
                 Ok(process::send_steer(&self.0.active, run_id, message))
+            }
+
+            async fn respond_request(
+                &self,
+                run_id: Uuid,
+                resp: PendingResponse,
+            ) -> CoreResult<bool> {
+                Ok(process::send_control_response(
+                    &self.0.active,
+                    run_id,
+                    &resp,
+                ))
             }
 
             async fn interrupt(&self, run_id: Uuid) -> CoreResult<()> {

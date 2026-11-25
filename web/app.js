@@ -68,6 +68,7 @@ const S = {
   token: ls.get('t3.token', ''),
   theme: ls.get('t3.theme', 'system'),
   shellHistory: loadShellHistory(ls),
+  workspaceMeta: new Map(), // projectId -> { commands, files } (GET workspace-meta, cached)
 };
 
 const threadById = (id) => S.threads.find((t) => t.id === id) || (S.detail?.thread?.id === id ? S.detail.thread : null)
@@ -638,7 +639,26 @@ async function loadProjects() {
   ls.set('t3.project', S.projectId);
   renderSidebar();
   if (!S.threadId) { renderHeader(); renderHero(); }
+  loadWorkspaceMeta(S.projectId);
 }
+
+/** Cached workspace metadata (local skills + file list) for `/` and `@file` completion. Failures stay silent and yield an empty set. */
+async function loadWorkspaceMeta(projectId) {
+  if (!projectId) return { commands: [], files: [] };
+  const hit = S.workspaceMeta.get(projectId);
+  if (hit) return hit;
+  try {
+    const meta = await api(`/api/projects/${projectId}/workspace-meta`);
+    const out = { commands: Array.isArray(meta?.commands) ? meta.commands : [], files: Array.isArray(meta?.files) ? meta.files : [] };
+    S.workspaceMeta.set(projectId, out);
+    return out;
+  } catch { /* silent: completion simply offers nothing extra */
+    const empty = { commands: [], files: [] };
+    S.workspaceMeta.set(projectId, empty);
+    return empty;
+  }
+}
+const workspaceMetaFor = (projectId) => S.workspaceMeta.get(projectId) || { commands: [], files: [] };
 
 async function patchThread(id, body) {
   try {
@@ -675,6 +695,7 @@ function goHome(projectId) {
   S.threadId = null; S.detail = null; S.diffStat = null; S.diffData = null; S.diffError = null;
   diffOpenFiles.clear();
   if (projectId && projectById(projectId)) { S.projectId = projectId; ls.set('t3.project', projectId); } else preferActiveProject();
+  loadWorkspaceMeta(S.projectId);
   S.compose = { sel: defaultSelection(S.projectId), mode: 'approval-required', plan: false, isolation: 'shared', baseRef: '' };
   setHash('');
   restoreDraft();
@@ -703,6 +724,7 @@ async function openThread(id, { push = true } = {}) {
   syncSubscriptions();
   loadSwarm(id);
   await loadDetail(id, { reset: true });
+  loadWorkspaceMeta(S.projectId);
   if (id === S.threadId) revealActiveRow();
 }
 
@@ -895,6 +917,7 @@ function renderHero() {
         type: 'button', role: 'radio', class: `proj-chip${p.id === S.projectId ? ' on' : ''}`, 'aria-checked': String(p.id === S.projectId), title: p.workspace_root, dataset: { project: p.id },
         onclick: () => {
           S.projectId = p.id; ls.set('t3.project', p.id);
+          loadWorkspaceMeta(p.id);
           S.compose.sel = defaultSelection(p.id);
           renderSidebar(); renderHeader(); renderHero(); renderComposer(); ta().focus();
         },
@@ -1084,6 +1107,7 @@ function buildStep(item) {
     case 'command_execution': {
       const cmd = pstr(p, 'command', 'cmd', 'title') || (Array.isArray(p?.command) ? p.command.join(' ') : '') || sum || pstr(p, 'step_type');
       const userShell = p?.source === 'user_shell';
+      const verifyHook = p?.source === 'verify_hook';
       const out = userShell
         ? pstr(p, 'output') || [textOf(p?.stdout), textOf(p?.stderr)].filter(Boolean).join('\n')
         : [textOf(p?.output ?? p?.stdout ?? p?.aggregated_output ?? p?.state?.output), textOf(p?.stderr)].filter(Boolean).join('\n');
@@ -1093,12 +1117,12 @@ function buildStep(item) {
       const dur = Number(p?.duration_ms);
       const badges = [
         timedOut ? badge('timeout', 'bad') : code == null ? null : badge(`exit ${code}`, bad ? 'bad' : 'good'),
-        userShell && Number.isFinite(dur) ? badge(fmtDur(dur)) : null,
+        (userShell || verifyHook) && Number.isFinite(dur) ? badge(fmtDur(dur)) : null,
       ].filter(Boolean);
       return stepRow({
-        item, icon: 'terminal', verb: userShell ? 'シェル実行' : 'コマンド実行', target: oneLine(cmd, 260),
-        cls: `cmd${userShell ? ' user-shell' : ''}${bad ? ' bad' : ''}`,
-        badges, open: userShell,
+        item, icon: 'terminal', verb: verifyHook ? '自動検証' : userShell ? 'シェル実行' : 'コマンド実行', target: oneLine(cmd, 260),
+        cls: `cmd${userShell ? ' user-shell' : ''}${verifyHook ? ' verify-hook' : ''}${bad ? ' bad' : ''}`,
+        badges, open: userShell || (verifyHook && bad),
         sections: [
           () => section(p?.cwd ? `コマンド (${compactPath(p.cwd)})` : 'コマンド', pre(cmd)),
           () => section('出力', out ? outputBlock(out) : h('div', { class: 'muted', text: '出力はありません' })),
@@ -1668,6 +1692,7 @@ function commandPaletteContext() {
     const providerLabel = provLabel(p.provider);
     for (const m of p.models || []) models.push({ provider: p.provider, providerLabel, id: m.id, label: m.label || m.id });
   }
+  const meta = workspaceMetaFor(curThread()?.project_id || S.projectId);
   return {
     provider: S.compose.sel?.provider || curThread()?.model_selection?.provider,
     hasThread: !!curThread(),
@@ -1676,6 +1701,8 @@ function commandPaletteContext() {
     models,
     themes: THEMES,
     shellHistory: S.shellHistory,
+    workspaceCommands: meta.commands,
+    workspaceFiles: meta.files,
   };
 }
 
@@ -1696,6 +1723,7 @@ function renderCommandPalette() {
   const box = $('#cmd-palette');
   if (!box || !cmdMenu || !cmdMenu.items.length) { hideCommandPalette(); return; }
   const headerText = cmdMenu.mode === 'shell' ? '最近のシェルコマンド（↑↓ 選択 · Tab 補完 · Enter 実行）'
+    : cmdMenu.mode === 'file' ? 'ファイル参照（↑↓ 選択 · Tab 補完 · Enter 補完）'
     : cmdMenu.mode === 'arg' ? `/${cmdMenu.command.name} の引数候補（↑↓ 選択 · Tab 補完 · Enter 実行）`
       : 'スラッシュコマンド（↑↓ 選択 · Tab 補完 · Enter 実行 · Esc 閉じる）';
   const list = h('div', { class: 'cmd-list' }, cmdMenu.items.map((item, i) => {
@@ -1737,6 +1765,18 @@ function moveCommandSelection(nextIdx) {
 function applyCommandChoice(item, { execute = false } = {}) {
   if (!item) return;
   const input = ta();
+  if (item.kind === 'file') {
+    // Replace only the trailing `@<query>` token; keep the rest of the input and keep typing (never sends).
+    const m = /@([^\s@]{0,80})$/.exec(input.value);
+    input.value = m ? input.value.slice(0, input.value.length - m[0].length) + item.insert : `${input.value}${item.insert}`;
+    cmdDismissed = false;
+    hideCommandPalette();
+    autosize();
+    syncSendEnabled();
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    return;
+  }
   if (execute) {
     input.value = item.insert.trim();
     hideCommandPalette();
@@ -2228,6 +2268,10 @@ function projectDialog() {
         monogram(p),
         h('div', { class: 'pl-main' }, h('b', { text: p.title }), h('small', { text: p.workspace_root })),
         h('button', {
+          class: 'btn xs', type: 'button', text: '編集',
+          onclick: () => projectEditDialog(p, renderList),
+        }),
+        h('button', {
           class: 'btn xs danger-ghost', type: 'button', text: '削除',
           onclick: async (e) => {
             const b = e.currentTarget;
@@ -2257,6 +2301,51 @@ function projectDialog() {
     h('div', { class: 'actions' }, h('button', { class: 'btn primary', type: 'submit', text: '追加' }))), list);
     setTimeout(() => title.focus(), 0);
   });
+}
+
+/** Edit a project's title, default model, resident instructions and post-edit verify command (PATCH /api/projects/:id). */
+function projectEditDialog(p, refreshList) {
+  openModal('プロジェクト設定', (body, close) => {
+    const title = h('input', { class: 'inp', value: p.title || '', 'aria-label': '名前' });
+    let modelChanged = false;
+    let clearModel = false;
+    const picker = modelPanel({ value: p.default_model || defaultSelection(p.id), onChange: () => { modelChanged = true; } });
+    const pickerWrap = h('div', { class: 'mp-embed' }, picker.el);
+    const clearChk = h('input', {
+      type: 'checkbox',
+      onchange: (e) => { clearModel = e.target.checked; pickerWrap.classList.toggle('dim', clearModel); },
+    });
+    const instructions = h('textarea', { class: 'inp', rows: 3, placeholder: '初回ターンに自動付与するプロジェクト固有のルールや前提…', value: p.instructions || '', 'aria-label': '常駐指示' });
+    const verify = h('input', { class: 'inp mono', placeholder: '例: cargo check / npm test（空欄で無効）', value: p.verify_command || '', autocapitalize: 'off', spellcheck: false, 'aria-label': '自動検証コマンド' });
+    const go = h('button', { class: 'btn primary', type: 'submit', text: '保存' });
+    body.append(h('form', {
+      class: 'form',
+      onsubmit: async (e) => {
+        e.preventDefault(); if (e.submitter !== go) return;
+        go.disabled = true;
+        // Empty instructions / verify_command are sent as '' so the server clears them to null.
+        const patch = { title: title.value.trim() || p.title, instructions: instructions.value.trim(), verify_command: verify.value.trim() };
+        if (clearModel) patch.default_model = null;
+        else if (modelChanged) patch.default_model = picker.get();
+        try {
+          await api(`/api/projects/${p.id}`, { method: 'PATCH', json: patch });
+          await loadProjects();
+          refreshList?.();
+          close();
+          toast('プロジェクト設定を保存しました', 'ok');
+          if (p.id === S.projectId) { renderHero(); renderComposer(); }
+        } catch (err) { go.disabled = false; toast(`保存に失敗: ${err.message}`, 'err'); }
+      },
+    },
+    field('名前', title),
+    field('既定モデル', h('div', { class: 'stack' },
+      pickerWrap,
+      h('label', { class: 'switch' }, clearChk, h('i'), h('span', { text: '既定モデルをクリア' })))),
+    field('常駐指示', instructions, '初回ターンに自動で付与されます。空欄で無効。'),
+    field('編集後の自動検証コマンド', verify, '編集ターン完了後に自動実行します。空欄で無効。'),
+    h('div', { class: 'actions' }, go)));
+    setTimeout(() => title.focus(), 0);
+  }, { cls: 'form-modal' });
 }
 
 function forkDialog() {
