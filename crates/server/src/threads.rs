@@ -327,7 +327,7 @@ impl RunCoordinator {
         Ok(target)
     }
 
-    async fn handoff_summary(&self, thread: &Thread) -> CoreResult<String> {
+    pub(crate) async fn handoff_summary(&self, thread: &Thread) -> CoreResult<String> {
         let items = self.recent_items(thread.id, 100).await?;
         let runs = self.0.store.list_runs(thread.id).await?;
         Ok(format_handoff(&thread.title, &items, &runs))
@@ -512,6 +512,52 @@ fn format_handoff(title: &str, items: &[TurnItem], runs: &[Run]) -> String {
         for entry in transcript.into_iter().rev() {
             summary.push('\n');
             summary.push_str(&entry);
+        }
+    }
+    let modified_files: Vec<_> = items
+        .iter()
+        .rev()
+        .filter(|item| item.kind == TurnItemKind::FileChange)
+        .filter_map(|item| {
+            let path = item.payload["path"].as_str().or_else(|| {
+                item.payload["changes"]
+                    .as_array()?
+                    .iter()
+                    .find_map(|change| change["path"].as_str())
+            });
+            path.or(item.summary.as_deref())
+                .map(|path| handoff_excerpt(path, 180))
+        })
+        .take(12)
+        .collect();
+    if !modified_files.is_empty() {
+        summary.push_str("\n\n## Modified Files");
+        for path in modified_files.into_iter().rev() {
+            summary.push_str("\n- ");
+            summary.push_str(&path);
+        }
+    }
+    let recent_commands: Vec<_> = items
+        .iter()
+        .rev()
+        .filter(|item| item.kind == TurnItemKind::CommandExecution)
+        .filter_map(|item| {
+            let command = item.payload["command"]
+                .as_str()
+                .or(item.summary.as_deref())?;
+            let exit_code = item.payload["exit_code"].as_i64()?;
+            Some(format!(
+                "{} (exit code {exit_code})",
+                handoff_excerpt(command, 180)
+            ))
+        })
+        .take(8)
+        .collect();
+    if !recent_commands.is_empty() {
+        summary.push_str("\n\n## Recent Commands");
+        for command in recent_commands.into_iter().rev() {
+            summary.push_str("\n- ");
+            summary.push_str(&command);
         }
     }
     summary
@@ -859,6 +905,42 @@ mod tests {
         let summary = format_handoff("Source", &[item], &[]);
         let (_, errors) = summary.split_once("## Unresolved / Recent Errors").unwrap();
         assert!(errors.contains("- Item 7 (unfinished): Apply the outstanding migration"));
+    }
+
+    #[test]
+    fn handoff_includes_modified_files_and_recent_commands() {
+        let item = |ordinal, kind, summary: Option<&str>, payload| TurnItem {
+            id: Uuid::new_v4(),
+            thread_id: Uuid::nil(),
+            run_id: Uuid::nil(),
+            ordinal,
+            kind,
+            summary: summary.map(str::to_owned),
+            payload,
+            raw_bytes: 0,
+            compressed_bytes: None,
+            created_at: Utc::now(),
+        };
+        let summary = format_handoff(
+            "Source",
+            &[
+                item(
+                    1,
+                    TurnItemKind::FileChange,
+                    None,
+                    json!({"changes":[{"path":"src/main.rs","kind":"update"}]}),
+                ),
+                item(
+                    2,
+                    TurnItemKind::CommandExecution,
+                    None,
+                    json!({"command":"cargo check", "exit_code":0}),
+                ),
+            ],
+            &[],
+        );
+        assert!(summary.contains("## Modified Files\n- src/main.rs"));
+        assert!(summary.contains("## Recent Commands\n- cargo check (exit code 0)"));
     }
 
     #[test]

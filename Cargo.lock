@@ -3155,6 +3155,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "muda",
+ "serde_json",
  "tao",
  "url",
  "wry",

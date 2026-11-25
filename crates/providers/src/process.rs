@@ -1,6 +1,6 @@
 use crate::{
     parsers::{Parser, provider_error},
-    watchdog::RepetitionWatchdog,
+    watchdog::{RepetitionWatchdog, ToolLoopWatchdog},
 };
 use serde_json::json;
 use std::{
@@ -34,6 +34,8 @@ use uuid::Uuid;
 const STDERR_LIMIT: usize = 16 * 1024;
 const STDOUT_LINE_LIMIT: usize = 4 * 1024 * 1024;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_IDLE_STDOUT_TIMEOUT: Duration = Duration::from_secs(600);
+const IDLE_STDOUT_TIMEOUT_ENV: &str = "T3_IDLE_STDOUT_TIMEOUT_SECS";
 
 pub(crate) struct ActiveProcess {
     #[cfg(unix)]
@@ -187,17 +189,36 @@ fn checked_pid(pid: u32) -> io::Result<libc::pid_t> {
 }
 
 #[cfg(unix)]
+fn classify_group_signal_error(
+    pid: libc::pid_t,
+    signal: i32,
+    error: io::Error,
+) -> io::Result<()> {
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        Some(libc::EPERM) if signal != 0 => {
+            // macOS XNU can return EPERM instead of ESRCH when signaling a process group
+            // whose leader or members are exiting/zombies during teardown.
+            tracing::debug!(
+                pid,
+                signal,
+                %error,
+                "ignoring EPERM during CLI process group teardown"
+            );
+            Ok(())
+        }
+        _ => Err(error),
+    }
+}
+
+#[cfg(unix)]
 fn signal_group(pid: u32, signal: i32) -> io::Result<()> {
     let pid = checked_pid(pid)?;
     // SAFETY: pre_exec puts the child in its own group and the leader is still unreaped.
     if unsafe { libc::kill(-pid, signal) } == 0 {
         return Ok(());
     }
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ESRCH) => Ok(()),
-        _ => Err(error),
-    }
+    classify_group_signal_error(pid, signal, io::Error::last_os_error())
 }
 
 #[cfg(unix)]
@@ -286,7 +307,39 @@ pub(crate) fn send_steer(active: &ActiveRunMap, run_id: Uuid, message: String) -
         .is_some_and(|tx| tx.send(message).is_ok())
 }
 
+fn configured_idle_stdout_timeout() -> Duration {
+    std::env::var(IDLE_STDOUT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_IDLE_STDOUT_TIMEOUT)
+}
+
 pub(crate) async fn run_turn(
+    active: &ActiveRunMap,
+    run_id: Uuid,
+    provider: ProviderId,
+    cmd: Command,
+    input: Input,
+    secret: Option<&str>,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+) -> CoreResult<()> {
+    run_turn_with_idle_timeout(
+        active,
+        run_id,
+        provider,
+        cmd,
+        input,
+        secret,
+        tx,
+        configured_idle_stdout_timeout(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_with_idle_timeout(
     active: &ActiveRunMap,
     run_id: Uuid,
     provider: ProviderId,
@@ -294,6 +347,7 @@ pub(crate) async fn run_turn(
     input: Input,
     secret: Option<&str>,
     tx: mpsc::UnboundedSender<StreamEvent>,
+    idle_timeout: Duration,
 ) -> CoreResult<()> {
     cmd.stdin(if matches!(input, Input::None) {
         Stdio::null()
@@ -368,16 +422,19 @@ pub(crate) async fn run_turn(
             #[cfg(unix)]
             {
                 let pid = child.id().expect("unreaped child");
+                let mut killed_group = false;
                 let result = tokio::select! {
                     result = wait_for_exit(pid) => result,
                     Ok(()) = reader_stop_rx => {
                         GroupCleanup(Some(pid)).kill();
+                        killed_group = true;
                         wait_for_exit(pid).await
                     }
                 };
                 if result.is_ok() || already_reaped(&result) {
-                    // Clean up descendants holding pipes before reaping the leader.
-                    guard.finish(result.is_ok());
+                    // Clean up descendants holding pipes before reaping the leader; skip
+                    // a second kill when reader_stop_rx already terminated the group.
+                    guard.finish(result.is_ok() && !killed_group);
                 }
                 result?;
                 child.wait().await
@@ -390,7 +447,15 @@ pub(crate) async fn run_turn(
         };
         tokio::try_join!(
             wait,
-            read_events(stdout, provider, secret, &tx, close_tx, reader_stop_tx),
+            read_events(
+                stdout,
+                provider,
+                secret,
+                &tx,
+                close_tx,
+                reader_stop_tx,
+                idle_timeout,
+            ),
             read_tail(stderr),
             write_input(stdin, input, steer_rx, close_rx),
         )
@@ -494,6 +559,7 @@ async fn read_events(
     tx: &mpsc::UnboundedSender<StreamEvent>,
     close_stdin: oneshot::Sender<()>,
     stop_process: oneshot::Sender<()>,
+    idle_timeout: Duration,
 ) -> io::Result<ReadOutcome> {
     let mut lines = BufReader::new(stdout);
     let mut line = Vec::new();
@@ -502,13 +568,31 @@ async fn read_events(
     let mut close_stdin = Some(close_stdin);
     let mut assistant = RepetitionWatchdog::default();
     let mut reasoning = RepetitionWatchdog::default();
+    let mut tool_loop = ToolLoopWatchdog::default();
     // Stop reading after one extra byte, even when the producer never sends a newline.
-    while (&mut lines)
-        .take((STDOUT_LINE_LIMIT + 1) as u64)
-        .read_until(b'\n', &mut line)
-        .await?
-        != 0
-    {
+    loop {
+        let bytes = match tokio::time::timeout(
+            idle_timeout,
+            (&mut lines)
+                .take((STDOUT_LINE_LIMIT + 1) as u64)
+                .read_until(b'\n', &mut line),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = stop_process.send(());
+                if terminal.is_some() {
+                    return Ok(ReadOutcome::Terminal(terminal));
+                }
+                return Ok(ReadOutcome::Stopped(
+                    "provider produced no stdout output before the idle timeout",
+                ));
+            }
+        };
+        if bytes == 0 {
+            break;
+        }
         if line.len() > STDOUT_LINE_LIMIT && line.last() != Some(&b'\n') {
             let _ = stop_process.send(());
             return Ok(ReadOutcome::Stopped(
@@ -520,17 +604,27 @@ async fn read_events(
                 redact_value(&mut value, secret);
             }
             for event in parser.parse(&value) {
-                let repeated = !matches!(terminal, Some(StreamEvent::Completed { .. }))
-                    && match &event {
-                        StreamEvent::AssistantDelta { text } => assistant.push(text),
-                        StreamEvent::ReasoningDelta { text } => reasoning.push(text),
-                        _ => false,
+                if !matches!(terminal, Some(StreamEvent::Completed { .. })) {
+                    let stop_reason = match &event {
+                        StreamEvent::AssistantDelta { text } if assistant.push(text) => Some(
+                            "repetition loop detected — terminated runaway provider process to save tokens/battery",
+                        ),
+                        StreamEvent::ReasoningDelta { text } if reasoning.push(text) => Some(
+                            "repetition loop detected — terminated runaway provider process to save tokens/battery",
+                        ),
+                        StreamEvent::Item {
+                            kind,
+                            summary,
+                            payload,
+                        } if tool_loop.push(*kind, summary.as_deref(), payload) => Some(
+                            "tool call repetition loop detected — terminated runaway provider process to save tokens/battery",
+                        ),
+                        _ => None,
                     };
-                if repeated {
-                    let _ = stop_process.send(());
-                    return Ok(ReadOutcome::Stopped(
-                        "repetition loop detected — terminated runaway provider process to save tokens/battery",
-                    ));
+                    if let Some(reason) = stop_reason {
+                        let _ = stop_process.send(());
+                        return Ok(ReadOutcome::Stopped(reason));
+                    }
                 }
                 match event {
                     StreamEvent::Completed { .. }
@@ -1051,9 +1145,17 @@ wait
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (close, _) = oneshot::channel();
         let (stop, _) = oneshot::channel();
-        let outcome = read_events(input.as_slice(), ProviderId::Claude, None, &tx, close, stop)
-            .await
-            .unwrap();
+        let outcome = read_events(
+            input.as_slice(),
+            ProviderId::Claude,
+            None,
+            &tx,
+            close,
+            stop,
+            DEFAULT_IDLE_STDOUT_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             outcome,
             ReadOutcome::Terminal(Some(StreamEvent::Completed { .. }))
@@ -1062,5 +1164,247 @@ wait
             receive(&mut rx).await,
             Some(StreamEvent::SessionStarted { provider_session_id }) if provider_session_id == "boundary"
         ));
+    }
+
+    #[test]
+    fn group_signal_treats_teardown_eperm_and_esrch_as_benign() {
+        assert!(
+            classify_group_signal_error(
+                12345,
+                libc::SIGKILL,
+                io::Error::from_raw_os_error(libc::EPERM),
+            )
+            .is_ok()
+        );
+        assert!(
+            classify_group_signal_error(
+                12345,
+                libc::SIGTERM,
+                io::Error::from_raw_os_error(libc::EPERM),
+            )
+            .is_ok()
+        );
+        assert!(
+            classify_group_signal_error(
+                12345,
+                libc::SIGKILL,
+                io::Error::from_raw_os_error(libc::ESRCH),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            classify_group_signal_error(12345, 0, io::Error::from_raw_os_error(libc::EPERM))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            classify_group_signal_error(
+                12345,
+                libc::SIGKILL,
+                io::Error::from_raw_os_error(libc::EINVAL),
+            )
+            .unwrap_err()
+            .raw_os_error(),
+            Some(libc::EINVAL)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_guard_finish_false_skips_second_group_kill() {
+        let mut cmd = command(Path::new("/bin/sleep"));
+        cmd.arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id().unwrap();
+        let active = ActiveRunMap::default();
+        let run_id = Uuid::new_v4();
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let (released, release_rx) = watch::channel(false);
+        active.lock().unwrap().insert(
+            run_id,
+            ActiveProcess {
+                pid,
+                released: release_rx,
+                stdin_tx: None,
+                interrupted: Arc::clone(&interrupted),
+            },
+        );
+        let guard = RunGuard {
+            active: &active,
+            run_id,
+            interrupted,
+            released,
+        };
+
+        // Calling finish(false) removes the active entry and marks released without killing.
+        guard.finish(false);
+        assert!(active.lock().unwrap().is_empty());
+        assert!(*guard.released.borrow());
+        // Child should still be alive because finish(false) did not call GroupCleanup::kill().
+        assert!(child.try_wait().unwrap().is_none());
+
+        // Dropping guard after finish(false) must also be a no-op; child stays alive until killed.
+        drop(guard);
+        assert!(child.try_wait().unwrap().is_none());
+
+        GroupCleanup(Some(pid)).kill();
+        wait_for_exit(pid).await.unwrap();
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_tool_calls_terminate_the_provider_group() {
+        let mut script = String::from(
+            "/bin/sleep 60 &\nprintf '{\"type\":\"system\",\"session_id\":\"%s:%s\"}\\n' \"$$\" \"$!\"\n",
+        );
+        for idx in 0..8 {
+            let call = json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "id": format!("tool-{idx}"),
+                        "name": "Bash",
+                        "input": {"command": "cargo test"}
+                    }]
+                }
+            });
+            let result = json!({
+                "type": "user",
+                "message": {
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": format!("tool-{idx}"),
+                        "content": "failed"
+                    }]
+                }
+            });
+            script.push_str(&format!("printf '%s\\n' '{call}'\n"));
+            script.push_str(&format!("printf '%s\\n' '{result}'\n"));
+        }
+        script.push_str("wait\n");
+
+        let fixture = Fixture::new(&script);
+        let driver = ClaudeDriver::new(fixture.binary());
+        let req = test_request(ProviderId::Claude);
+        let id = req.run_id;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(Duration::from_secs(2), driver.run_turn(req, tx))
+            .await
+            .expect("tool loop should stop the provider before it exits")
+            .unwrap();
+        let Some(StreamEvent::SessionStarted {
+            provider_session_id,
+        }) = receive(&mut rx).await
+        else {
+            panic!("fixture did not start");
+        };
+        let (pid, grandchild) = provider_session_id.split_once(':').unwrap();
+        assert_processes_exited(pid.parse().unwrap(), grandchild.parse().unwrap()).await;
+
+        let mut failed_message = None;
+        while let Some(event) = receive(&mut rx).await {
+            if let StreamEvent::Failed { message } = event {
+                failed_message = Some(message);
+            }
+        }
+        assert_eq!(
+            failed_message.as_deref(),
+            Some("tool call repetition loop detected — terminated runaway provider process to save tokens/battery")
+        );
+        assert!(!driver.send_steer(id, "late".into()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn idle_stdout_timeout_terminates_hung_cli_and_descendants() {
+        let fixture = Fixture::new(
+            r#"
+/bin/sleep 60 &
+printf '{"type":"system","session_id":"%s:%s"}\n' "$$" "$!"
+wait
+"#,
+        );
+        let active = ActiveRunMap::default();
+        let run_id = Uuid::new_v4();
+        let mut cmd = command(&fixture.binary());
+        cmd.arg("--print").arg("hello");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            run_turn_with_idle_timeout(
+                &active,
+                run_id,
+                ProviderId::Claude,
+                cmd,
+                Input::None,
+                None,
+                tx,
+                Duration::from_millis(350),
+            ),
+        )
+        .await
+        .expect("idle timeout must terminate hung CLI")
+        .unwrap();
+
+        let Some(StreamEvent::SessionStarted {
+            provider_session_id,
+        }) = receive(&mut rx).await
+        else {
+            panic!("fixture did not start");
+        };
+        let (pid, grandchild) = provider_session_id.split_once(':').unwrap();
+        assert_processes_exited(pid.parse().unwrap(), grandchild.parse().unwrap()).await;
+        assert!(matches!(
+            receive(&mut rx).await,
+            Some(StreamEvent::Failed { message }) if message.contains("idle timeout")
+        ));
+        assert!(receive(&mut rx).await.is_none());
+        assert!(active.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_stdout_timeout_resets_when_events_stream() {
+        let fixture = Fixture::new(
+            r#"
+printf '{"type":"system","session_id":"active-stream"}\n'
+for i in 1 2 3 4 5; do
+    /bin/sleep 0.1
+    printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"tick "}}}\n'
+done
+printf '{"type":"result","subtype":"success","result":"done"}\n'
+"#,
+        );
+        let active = ActiveRunMap::default();
+        let run_id = Uuid::new_v4();
+        let cmd = command(&fixture.binary());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_turn_with_idle_timeout(
+                &active,
+                run_id,
+                ProviderId::Claude,
+                cmd,
+                Input::None,
+                None,
+                tx,
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("active stream should complete")
+        .unwrap();
+
+        let mut completed = false;
+        while let Some(event) = receive(&mut rx).await {
+            if matches!(event, StreamEvent::Completed { final_text: Some(ref text) } if text == "done")
+            {
+                completed = true;
+            }
+        }
+        assert!(completed);
     }
 }

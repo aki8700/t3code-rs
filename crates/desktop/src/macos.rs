@@ -1,4 +1,8 @@
-use std::{env, error::Error};
+use std::{
+    env,
+    error::Error,
+    process::{Command, Stdio},
+};
 
 use muda::{
     AboutMetadata, Menu, MenuEvent, MenuItem, PredefinedMenuItem as SystemItem, Submenu,
@@ -9,7 +13,7 @@ use tao::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
     platform::macos::WindowBuilderExtMacOS,
-    window::WindowBuilder,
+    window::{UserAttentionType, WindowBuilder},
 };
 use wry::{NewWindowResponse, WebView, WebViewBuilder};
 
@@ -25,6 +29,13 @@ const NEW_THREAD: &str = "new-thread";
 const RELOAD: &str = "reload";
 const TOGGLE_SIDEBAR: &str = "toggle-sidebar";
 const SEARCH: &str = "search";
+const NOTIFY_PREFIX: &str = "notify:";
+const NOTIFICATION_TITLE_MAX: usize = 120;
+const NOTIFICATION_BODY_MAX: usize = 1000;
+// Arguments arrive as argv, so the script never interpolates renderer-supplied text.
+const NOTIFICATION_SCRIPT: &str = "on run argv
+  display notification (item 2 of argv) with title (item 1 of argv)
+end run";
 
 const INITIALIZATION: &str = r#"
 window.__T3_DESKTOP__ = true;
@@ -39,6 +50,64 @@ enum AppEvent {
     Drag,
     ToggleMaximize,
     Navigate(String),
+    Notify(Notification),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Notification {
+    title: String,
+    body: String,
+}
+
+/// Parses the JSON payload of a `notify:` message. Unknown fields such as `thread_id` are ignored.
+fn parse_notification(raw: &str) -> Option<Notification> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let field = |name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    let title = clean_text(field("title"), NOTIFICATION_TITLE_MAX);
+    let body = clean_text(field("body"), NOTIFICATION_BODY_MAX);
+    if title.is_empty() && body.is_empty() {
+        return None;
+    }
+    Some(Notification {
+        title: if title.is_empty() {
+            TITLE.into()
+        } else {
+            title
+        },
+        body,
+    })
+}
+
+/// Caps length in characters and turns control characters (newlines, tabs) into spaces.
+fn clean_text(raw: &str, max_chars: usize) -> String {
+    raw.chars()
+        .take(max_chars)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// Shows a notification via osascript. `--` ends osascript's options so title and body are argv only.
+fn show_notification(notification: Notification) {
+    std::thread::spawn(move || {
+        let result = Command::new("/usr/bin/osascript")
+            .args(["-e", NOTIFICATION_SCRIPT, "--"])
+            .arg(&notification.title)
+            .arg(&notification.body)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !matches!(result, Ok(status) if status.success()) {
+            eprintln!("T3 Code RS: could not show the desktop notification");
+        }
+    });
 }
 
 pub(super) fn run() -> Result<(), Box<dyn Error>> {
@@ -91,6 +160,11 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
                 message => {
                     if let Some(url) = message.strip_prefix("open-external:").and_then(http_url) {
                         open_external(url);
+                    } else if let Some(notification) = message
+                        .strip_prefix(NOTIFY_PREFIX)
+                        .and_then(parse_notification)
+                    {
+                        let _ = ipc_proxy.send_event(AppEvent::Notify(notification));
                     }
                     return;
                 }
@@ -150,6 +224,12 @@ pub(super) fn run() -> Result<(), Box<dyn Error>> {
                     AppEvent::ToggleMaximize => window.set_maximized(!window.is_maximized()),
                     AppEvent::Navigate(url) => {
                         let _ = webview.load_url(&url);
+                    }
+                    AppEvent::Notify(notification) => {
+                        if !window.is_focused() {
+                            show_notification(notification);
+                            window.request_user_attention(Some(UserAttentionType::Informational));
+                        }
                     }
                 }
             }
@@ -242,4 +322,65 @@ fn handle_menu(event: MenuEvent, webview: &WebView) {
         }})) && !document.querySelector('dialog[open]')) {{ {fallback}; }}"
     );
     let _ = webview.evaluate_script(&script);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_payload_is_parsed_and_unknown_fields_ignored() {
+        let parsed =
+            parse_notification(r#"{"title":"Done","body":"Run finished","thread_id":"t1"}"#);
+        assert_eq!(
+            parsed,
+            Some(Notification {
+                title: "Done".into(),
+                body: "Run finished".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_or_empty_notification_payloads_are_ignored() {
+        for raw in [
+            "",
+            "not json",
+            "[]",
+            r#"{"title":42}"#,
+            r#"{"title":"  ","body":""}"#,
+        ] {
+            assert_eq!(parse_notification(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn missing_title_falls_back_to_app_name() {
+        let parsed = parse_notification(r#"{"body":"Only a body"}"#).unwrap();
+        assert_eq!(parsed.title, TITLE);
+        assert_eq!(parsed.body, "Only a body");
+    }
+
+    #[test]
+    fn notification_text_is_capped_and_control_characters_replaced() {
+        let long_title = "あ".repeat(NOTIFICATION_TITLE_MAX + 5);
+        let long_body = "b".repeat(NOTIFICATION_BODY_MAX + 5);
+        let payload = serde_json::json!({
+            "title": long_title,
+            "body": format!("line1\nline2\t{long_body}"),
+        });
+        let parsed = parse_notification(&payload.to_string()).unwrap();
+        assert_eq!(parsed.title.chars().count(), NOTIFICATION_TITLE_MAX);
+        assert_eq!(parsed.body.chars().count(), NOTIFICATION_BODY_MAX);
+        assert!(parsed.body.starts_with("line1 line2 "));
+        assert!(!parsed.body.contains('\n') && !parsed.body.contains('\t'));
+    }
+
+    #[test]
+    fn shell_metacharacters_stay_plain_argv_text() {
+        let raw = r#"{"title":"$(rm -rf ~)","body":"\"; do shell; `id`"}"#;
+        let parsed = parse_notification(raw).unwrap();
+        assert_eq!(parsed.title, "$(rm -rf ~)");
+        assert_eq!(parsed.body, "\"; do shell; `id`");
+    }
 }

@@ -656,6 +656,45 @@ async fn fork_handoff_keeps_recent_failures_and_redacts_credentials() {
 }
 
 #[tokio::test]
+async fn run_without_provider_session_gets_previous_context_handoff() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let id = create_parent(&app, &tmp.0).await;
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({"prompt":"Remember the earlier migration constraints."})),
+    )
+    .await;
+    wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({
+            "prompt": "Continue the migration.",
+            "model_selection": {"provider": "mock", "model": "mock-2"}
+        })),
+    )
+    .await;
+    wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+    let detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
+    let reply = detail["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|item| item["kind"] == "assistant_message")
+        .and_then(|item| item["payload"]["text"].as_str())
+        .unwrap();
+    assert!(reply.contains("Context from the previous run:"));
+    assert!(reply.contains("Remember the earlier migration constraints."));
+    assert!(reply.contains("Current request:\nContinue the migration."));
+}
+
+#[tokio::test]
 async fn mock_rest_mcp_worktrees_handoff_search_compression_and_attachments() {
     let tmp = TempDir::new();
     let workspace = tmp.0.join("repo");

@@ -47,7 +47,7 @@ impl SwarmTurn {
             "Work on the assigned brief. When finished, call swarm_post_message with text starting with @coordinator [done] and include your result and any blocker. End your turn after posting. Reply to subsequent updates only when you have new information."
         };
         let marker =
-            (provider != ProviderId::Mock).then(|| format!("T3_SWARM_ACTION {}", Uuid::new_v4()));
+            (provider != ProviderId::Mock).then(|| format!("T3_SWARM_ACTION {}", board.board_id));
         let mut instructions = format!(
             "Swarm board {}. You are {}.\n{instructions}\n",
             board.board_id, member.name
@@ -72,7 +72,7 @@ impl SwarmTurn {
             instructions.truncate(instructions.len() - 2);
             instructions.push('\n');
         }
-        *prompt = format!("{instructions}\n{prompt}");
+        *prompt = format!("{prompt}\n\n{instructions}");
         Ok(Self { marker })
     }
 
@@ -547,4 +547,50 @@ fn mentions_in(text: &str) -> Vec<String> {
         }
     }
     mentions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_user_prompt_prefix_and_uses_stable_board_marker() {
+        let board_id = Uuid::new_v4();
+        let thread_id = Uuid::new_v4();
+        let board = SwarmBoardSnapshot {
+            board_id,
+            coordinator_thread_id: thread_id,
+            title: "test".into(),
+            members: vec![SwarmMember {
+                board_id,
+                name: "coordinator".into(),
+                thread_id,
+                provider: ProviderId::Codex,
+                model: "test".into(),
+                effort: None,
+                state: "working".into(),
+                role: "coordinator".into(),
+                last_read_seq: 0,
+                created_at: Utc::now(),
+            }],
+            messages: Vec::new(),
+            head_seq: 0,
+        };
+        let mut prompt = "cached user prompt".to_owned();
+        let turn = SwarmTurn::prepare(&board, thread_id, ProviderId::Codex, &mut prompt).unwrap();
+        let marker = format!("T3_SWARM_ACTION {board_id}");
+        assert!(prompt.starts_with("cached user prompt\n\nSwarm board"));
+        assert!(prompt.contains(&marker));
+        assert_eq!(
+            turn.actions(&format!(
+                "{marker} {{\"tool\":\"swarm_post_message\",\"text\":\"done\"}}"
+            ))
+            .len(),
+            1
+        );
+        let mut next_prompt = "another prompt".to_owned();
+        let next_turn =
+            SwarmTurn::prepare(&board, thread_id, ProviderId::Codex, &mut next_prompt).unwrap();
+        assert_eq!(turn.marker, next_turn.marker);
+    }
 }

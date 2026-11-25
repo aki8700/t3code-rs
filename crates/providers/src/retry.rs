@@ -5,6 +5,17 @@ use t3_core::{
 };
 use tokio::sync::mpsc;
 
+/// Longest rate-limit wait worth sleeping through; anything longer is treated as a hard stop.
+const MAX_RETRY_AFTER_SECS: u64 = 120;
+
+/// Account-level exhaustion (weekly or plan quota) cannot be cleared by waiting a few minutes.
+fn is_quota_exhausted(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    ["weekly", "usage limit", "hit your limit", "quota"]
+        .iter()
+        .any(|needle| message.contains(needle))
+}
+
 /// Stream each attempt and resume the latest provider session after rate limiting.
 pub async fn run_turn_with_retry(
     driver: Arc<dyn ProviderDriver>,
@@ -22,6 +33,7 @@ pub async fn run_turn_with_retry(
         tokio::pin!(turn);
 
         let mut retry_after: Option<u64> = None;
+        let mut hard_limit = false;
         let mut handle_event = |event| {
             match &event {
                 StreamEvent::SessionStarted {
@@ -30,8 +42,11 @@ pub async fn run_turn_with_retry(
                     req.resume_session_id = Some(provider_session_id.clone());
                 }
                 StreamEvent::RateLimited {
-                    retry_after_secs, ..
+                    retry_after_secs,
+                    message,
                 } => {
+                    hard_limit |=
+                        *retry_after_secs > MAX_RETRY_AFTER_SECS || is_quota_exhausted(message);
                     retry_after = Some(
                         retry_after.map_or(*retry_after_secs, |secs| secs.max(*retry_after_secs)),
                     );
@@ -54,7 +69,9 @@ pub async fn run_turn_with_retry(
             handle_event(event);
         }
         result?;
-        let Some(retry_after) = retry_after.filter(|_| auto_resume && retries < max_retries) else {
+        let Some(retry_after) =
+            retry_after.filter(|_| auto_resume && retries < max_retries && !hard_limit)
+        else {
             return Ok(());
         };
 
@@ -176,5 +193,82 @@ mod tests {
             .unwrap();
             assert_eq!(probe.attempts.lock().unwrap().len(), expected_attempts);
         }
+    }
+
+    /// Sends one rate-limit event per attempt and counts how many attempts were started.
+    struct LimitProbe {
+        retry_after_secs: u64,
+        message: &'static str,
+        attempts: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl ProviderDriver for LimitProbe {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::Mock
+        }
+        async fn health_check(&self) -> ProviderHealth {
+            unreachable!()
+        }
+        async fn interrupt(&self, _: Uuid) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn run_turn(
+            &self,
+            _: TurnRequest,
+            tx: mpsc::UnboundedSender<StreamEvent>,
+        ) -> CoreResult<()> {
+            *self.attempts.lock().unwrap() += 1;
+            tx.send(StreamEvent::RateLimited {
+                retry_after_secs: self.retry_after_secs,
+                message: self.message.into(),
+            })
+            .unwrap();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_bails_out_on_long_wait_or_quota_exhaustion() {
+        for (retry_after_secs, message) in [
+            (MAX_RETRY_AFTER_SECS + 1, "slow down"),
+            (0, "You've hit your limit · resets 9am"),
+            (0, "Weekly usage limit reached"),
+            (30, "quota exceeded for account"),
+        ] {
+            let probe = Arc::new(LimitProbe {
+                retry_after_secs,
+                message,
+                attempts: Mutex::new(0),
+            });
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            // Bounded so a regression that sleeps the long wait fails fast instead of hanging.
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                run_turn_with_retry(
+                    probe.clone(),
+                    test_request(ProviderId::Mock),
+                    tx,
+                    true,
+                    3,
+                    0,
+                ),
+            )
+            .await
+            .expect("must not sleep before bailing")
+            .unwrap();
+            assert_eq!(*probe.attempts.lock().unwrap(), 1, "{message}");
+            assert!(matches!(
+                rx.recv().await,
+                Some(StreamEvent::RateLimited { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn quota_detection_is_case_insensitive() {
+        assert!(is_quota_exhausted("WEEKLY cap"));
+        assert!(is_quota_exhausted("Usage Limit"));
+        assert!(!is_quota_exhausted("rate limited, retry shortly"));
     }
 }

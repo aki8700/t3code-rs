@@ -1340,12 +1340,14 @@ function renderMessage(item) {
 function runFooter(run) {
   if (!run || !TERMINAL_RUN.has(run.status)) return null;
   const ok = run.status === 'completed';
+  const runCost = Number(S.detail?.context?.run_costs?.[run.id]) || 0;
   return h('div', { class: `run-foot ${run.status}`, dataset: { run: run.id } },
     h('span', { class: 'rf-line' },
       provDot(run.provider),
       h('span', { text: `${run.model}${run.effort ? ` · ${run.effort}` : ''}` }),
       run.duration_ms != null ? h('span', { text: fmtDur(run.duration_ms) }) : null,
       run.input_tokens || run.output_tokens ? h('span', { title: '入力 / 出力トークン', text: `↑${fmtTok(run.input_tokens)} ↓${fmtTok(run.output_tokens)}` }) : null,
+      runCost > 0 ? h('span', { title: 'このターンの推定コスト', text: fmtUsd(runCost) }) : null,
       ok ? null : h('span', { class: 'rf-status', text: STATUS_LABEL[run.status] || run.status })),
     run.status === 'failed' && run.error_message ? h('div', { class: 'rf-error', text: run.error_message }) : null);
 }
@@ -2143,6 +2145,8 @@ function renderStatPill() {
     parts.push(h('span', { class: 'sp', title: 'このスレッドの Run 数', dataset: { utab: 'model' }, text: `${fmtNum(runs.length)} runs` }));
     const up = sum('input_tokens'); const down = sum('output_tokens');
     if (up || down) parts.push(h('span', { class: 'sp', title: 'このスレッドの入力 / 出力トークン', dataset: { utab: 'model' }, text: `↑${fmtTok(up)} ↓${fmtTok(down)}` }));
+    const estCost = Number(S.detail?.context?.estimated_cost_usd) || 0;
+    if (estCost > 0) parts.push(h('span', { class: 'sp', title: 'このスレッドの推定コスト', dataset: { utab: 'model' }, text: fmtUsd(estCost) }));
   } else if (S.dbStats) {
     parts.push(h('span', { class: 'sp', dataset: { utab: 'system' }, text: `${fmtNum(S.dbStats.threads_count)} スレッド` }), h('span', { class: 'sp', dataset: { utab: 'model' }, text: `${fmtNum(S.dbStats.runs_count)} runs` }));
   }
@@ -2611,13 +2615,18 @@ function syncLimitAlert() {
     const when = left.startsWith('あと') ? `${left}でリセット` : left;
     text = `${p.label} ${what}（残り ${fmtLeft(w.remaining)}${when ? ` · ${when}` : ''}）`;
   }
-  const key = text && `${out ? 'out' : 'low'}:${text}`;
+  const inThread = !!curThread();
+  const key = text && `${out ? 'out' : 'low'}:${inThread ? 'thread' : 'home'}:${text}`;
   if ((box.dataset.key || '') === key) return;
   box.dataset.key = key;
   const focused = box.contains(document.activeElement);
   box.replaceChildren(...(text ? [h('button', {
     type: 'button', class: `limit-pill${out ? ' out' : ''}`, title: '使用量の「上限」を開く', onclick: () => usageDialog({ metric: 'limits' }),
-  }, iconEl('alert'), h('span', { class: 'limit-pill-text', text }), h('span', { class: 'limit-pill-more', text: '— 詳細' }))] : []));
+  }, iconEl('alert'), h('span', { class: 'limit-pill-text', text }), h('span', { class: 'limit-pill-more', text: '— 詳細' })),
+  h('button', {
+    type: 'button', class: 'limit-switch', title: inThread ? '別モデルへ分岐する' : 'モデルを切り替える',
+    onclick: () => { if (inThread) forkDialog(); else openModelPopover($('#btn-model')); },
+  }, iconEl('split'), h('span', { text: inThread ? '別モデルへ分岐' : 'モデル切替' }))] : []));
   if (focused) $('button', box)?.focus();
 }
 
@@ -3510,6 +3519,7 @@ function renderContextPanel() {
   }
 
   const { thread: t, sel, windowSize, used, pct, level, remaining, source, input, output, cacheRead, cacheWrite, cacheHit, totalInput, totalOutput, totalDuration, totalRawBytes, breakdown, runsCount } = info;
+  const estCost = Number(S.detail?.context?.estimated_cost_usd) || 0;
   const project = projectById(t.project_id);
   const parts = [];
 
@@ -3556,7 +3566,12 @@ function renderContextPanel() {
         h('b', { text: totalInput || totalOutput ? `↑${fmtCompact(totalInput)} ↓${fmtCompact(totalOutput)}` : '–' })),
     h('div', { class: 'ctx-stat', title: `実行回数 ${runsCount} 回 / 総所要時間 ${fmtDur(totalDuration)}` },
       h('span', { text: 'ターン / 所要' }),
-      h('b', { text: `${fmtNum(runsCount)} · ${totalDuration ? fmtDur(totalDuration) : '–'}` })));
+      h('b', { text: `${fmtNum(runsCount)} · ${totalDuration ? fmtDur(totalDuration) : '–'}` })),
+    estCost > 0
+      ? h('div', { class: 'ctx-stat', title: `スレッド累計の推定コスト: ${fmtUsd(estCost)}` },
+        h('span', { text: '推定コスト' }),
+        h('b', { text: fmtUsd(estCost) }))
+      : null);
 
   const warnBanner = level === 'crit'
     ? h('div', { class: 'ctx-alert crit' }, iconEl('alert'), h('span', { text: 'コンテキスト上限間近です。分岐 (Fork) して引き継ぐと安定します。' }))
@@ -4148,6 +4163,16 @@ function setThreadStatus(id, status) {
   if (c) c.status = status;
 }
 
+// Fires only while the tab is hidden or unfocused: Desktop IPC, else Web Notification.
+function notifyUser(title, body, threadId) {
+  if (!document.hidden && document.hasFocus()) return;
+  if (isDesktop()) { ipc('notify:' + JSON.stringify({ title, body, thread_id: threadId || '' })); return; }
+  if (typeof Notification === 'function' && Notification.permission === 'granted') {
+    const n = new Notification(title, { body });
+    n.onclick = () => { window.focus(); if (threadId) openThread(threadId); };
+  }
+}
+
 function handleWs(m) {
   const cur = S.threadId;
   switch (m.type) {
@@ -4159,7 +4184,7 @@ function handleWs(m) {
       const prev = threadById(m.thread_id)?.status;
       setThreadStatus(m.thread_id, m.status);
       syncSubscriptions(); renderSidebarSoon();
-      if (m.status === 'rate-limited') loadUsageLimitsSoon();
+      if (m.status === 'rate-limited') { loadUsageLimitsSoon(); notifyUser('レート制限', cleanTitle(threadById(m.thread_id)?.title) || m.thread_id, m.thread_id); }
       if (m.thread_id === cur) {
         renderHeader(); renderComposer(); renderLive();
         if (isBusy(prev) && !isBusy(m.status)) { loadDetailSoon(); refreshDiffSoon(); }
@@ -4185,6 +4210,7 @@ function handleWs(m) {
       if (TERMINAL_RUN.has(m.status)) {
         S.live.delete(m.thread_id);
         S.liveUsage.delete(m.thread_id);
+        if (m.status === 'completed' || m.status === 'failed') notifyUser(m.status === 'completed' ? '実行完了' : '実行失敗', cleanTitle(threadById(m.thread_id)?.title) || m.thread_id, m.thread_id);
         if (m.status === 'failed' && m.error) toast(`実行失敗: ${m.error}`, 'err', 6000);
         if (m.thread_id === cur) { loadDetailSoon(); refreshDiffSoon(); loadSwarm(cur); }
         loadThreadsSoon(); loadDbStatsSoon(); loadUsageSoon(); loadUsageLimitsSoon();
@@ -4251,6 +4277,7 @@ function handleWs(m) {
       if (!a.some((x) => x.id === r.id)) a.push(r);
       S.pending.set(r.thread_id, a);
       if (r.thread_id === cur) { renderApprovals(); scrollBottom(); } else toast(`⚠ 承認待ち: ${r.title || r.kind}`, '', 5000);
+      notifyUser('承認待ち', r.title || r.kind, r.thread_id);
       renderSidebarSoon();
       break;
     }

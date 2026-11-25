@@ -760,6 +760,25 @@ impl Tokens {
     }
 }
 
+/// Estimated USD cost of one token snapshot, using the same price table as the usage dashboard.
+pub(crate) fn estimate_tokens_cost(
+    provider: ProviderId,
+    model: &str,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+) -> f64 {
+    Tokens {
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        reasoning_tokens: 0,
+    }
+    .estimated_cost(provider, model)
+}
+
 #[derive(Clone, Serialize)]
 pub(crate) struct UsageResponse {
     window: UsageWindow,

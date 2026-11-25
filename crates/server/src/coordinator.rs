@@ -530,7 +530,11 @@ impl RunCoordinator {
             .filter(|run| run.provider == selection.provider && run.model == selection.model)
             .and_then(|run| run.provider_session_id.clone());
         let mut prompt = queued.prompt;
-        if previous_run.is_none()
+        if previous_run.is_some() && resume_session_id.is_none() {
+            let handoff = self.handoff_summary(&thread).await?;
+            prompt =
+                format!("Context from the previous run:\n{handoff}\n\nCurrent request:\n{prompt}");
+        } else if previous_run.is_none()
             && let Some(handoff) = store
                 .list_handoffs(thread.id)
                 .await?

@@ -279,6 +279,23 @@ async fn build_thread_context(
     let total_output_tokens: u64 = runs.iter().filter_map(|r| r.output_tokens).sum();
     let total_duration_ms: u64 = runs.iter().filter_map(|r| r.duration_ms).sum();
     let total_raw_bytes: u64 = breakdown.iter().map(|b| b.raw_bytes).sum();
+    let run_costs: serde_json::Map<String, Value> = runs
+        .iter()
+        .map(|run| {
+            let cost = crate::usage::estimate_tokens_cost(
+                run.provider,
+                &run.model,
+                run.input_tokens.unwrap_or(0),
+                run.output_tokens.unwrap_or(0),
+                0,
+                0,
+            );
+            (run.id.to_string(), json!(cost))
+        })
+        .collect();
+    let runs_have_tokens = runs
+        .iter()
+        .any(|r| r.input_tokens.is_some() || r.output_tokens.is_some());
 
     let matches_thread = |snap: &crate::coordinator::LiveContextUsage| {
         snap.provider == thread.model_selection.provider
@@ -367,6 +384,22 @@ async fn build_thread_context(
             ("empty", 0, 0, 0, 0, 0)
         };
 
+    // Per-run tokens are the more precise source; the snapshot only prices a thread that reports none.
+    let estimated_cost_usd: f64 = if runs_have_tokens {
+        run_costs.values().filter_map(Value::as_f64).sum()
+    } else if matches!(source, "live" | "stored" | "session") {
+        crate::usage::estimate_tokens_cost(
+            thread.model_selection.provider,
+            &thread.model_selection.model,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        )
+    } else {
+        0.0
+    };
+
     json!({
         "context_window": context_window,
         "used_tokens": used_tokens,
@@ -380,6 +413,8 @@ async fn build_thread_context(
         "total_duration_ms": total_duration_ms,
         "total_raw_bytes": total_raw_bytes,
         "items_breakdown": breakdown,
+        "run_costs": run_costs,
+        "estimated_cost_usd": estimated_cost_usd,
     })
 }
 
