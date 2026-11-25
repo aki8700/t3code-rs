@@ -614,10 +614,7 @@ if IFS= read -r unexpected; then
 fi
 "#,
         );
-        for driver in [
-            Arc::new(ClaudeDriver::new(fixture.binary())) as Arc<dyn ProviderDriver>,
-            Arc::new(AntigravityDriver::new(fixture.binary())),
-        ] {
+        for driver in [Arc::new(ClaudeDriver::new(fixture.binary())) as Arc<dyn ProviderDriver>] {
             let health = driver.health_check().await;
             assert!(health.available, "{:?}", health.error);
             assert_eq!(health.version.as_deref(), Some("fixture 1.0"));
@@ -636,6 +633,49 @@ fi
             task.await.unwrap().unwrap();
             assert!(!driver.send_steer(id, "late".into()).await.unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn antigravity_passes_prompt_via_print_and_parses_event_stream() {
+        let fixture = Fixture::new(
+            r#"
+last=""
+prev=""
+for arg in "$@"; do
+    prev="$last"
+    last="$arg"
+done
+[ "$prev" = --print ]
+[ "$last" = hello ]
+printf '%s\n' \
+  '{"event":"init","conversation_id":"fake-agy"}' \
+  '{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"OK"}}' \
+  '{"event":"result","result":{"conversation_id":"fake-agy","status":"SUCCESS","response":"OK\n","usage":{"input_tokens":5,"output_tokens":2}}}'
+"#,
+        );
+        let driver = AntigravityDriver::new(fixture.binary());
+        let req = test_request(ProviderId::Antigravity);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(Duration::from_secs(5), driver.run_turn(req, tx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(receive(&mut rx).await, Some(StreamEvent::SessionStarted { provider_session_id }) if provider_session_id == "fake-agy")
+        );
+        assert!(
+            matches!(receive(&mut rx).await, Some(StreamEvent::AssistantDelta { text }) if text == "OK")
+        );
+        assert!(matches!(
+            receive(&mut rx).await,
+            Some(StreamEvent::Usage {
+                input_tokens: 5,
+                output_tokens: 2
+            })
+        ));
+        assert!(
+            matches!(receive(&mut rx).await, Some(StreamEvent::Completed { final_text: Some(t) }) if t == "OK\n")
+        );
     }
 
     #[tokio::test]

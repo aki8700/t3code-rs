@@ -192,6 +192,57 @@ impl Parser {
     }
 
     fn antigravity(&mut self, event: &Value, out: &mut Vec<StreamEvent>) {
+        if let Some(ev) = string(event, "event") {
+            match ev {
+                "init" => return,
+                "step_update" => {
+                    let step = &event["step_update"];
+                    push_delta(out, string(step, "text_delta"), false);
+                    push_delta(
+                        out,
+                        first_string(step, &["thinking_delta", "reasoning_delta"]),
+                        true,
+                    );
+                    if let Some(usage) = step.get("usage") {
+                        push_usage(out, usage);
+                    }
+                    if string(step, "state") == Some("DONE")
+                        && let Some(st) = string(step, "step_type")
+                    {
+                        if st.contains("command") {
+                            push_item(out, TurnItemKind::CommandExecution, step);
+                        } else if st.contains("file") {
+                            push_item(out, TurnItemKind::FileChange, step);
+                        } else if st.contains("tool") {
+                            push_item(out, TurnItemKind::ToolResult, step);
+                        }
+                    }
+                    return;
+                }
+                "result" => {
+                    let res = event.get("result").unwrap_or(event);
+                    push_usage(out, res.get("usage").unwrap_or(&Value::Null));
+                    let status = string(res, "status").unwrap_or("");
+                    let failed = status.eq_ignore_ascii_case("error")
+                        || status.eq_ignore_ascii_case("failed")
+                        || string(res, "error").is_some_and(|e| !e.is_empty());
+                    if failed {
+                        out.push(error_event(res));
+                    } else {
+                        out.push(StreamEvent::Completed {
+                            final_text: first_string(res, &["response", "result", "text"])
+                                .map(str::to_owned),
+                        });
+                    }
+                    return;
+                }
+                "error" | "failed" | "rate_limit" | "rate_limited" => {
+                    out.push(error_event(event));
+                    return;
+                }
+                _ => {}
+            }
+        }
         match kind(event) {
             "stream_event" => self.claude_partial(&event["event"], out),
             "assistant" | "user" if event["message"].is_object() => self.claude_message(event, out),
@@ -664,5 +715,31 @@ mod tests {
                 [json!({"type":"failed","message":"fixture failure"})]
             );
         }
+    }
+
+    #[test]
+    fn antigravity_event_envelope_parses_live_agy_stream_json() {
+        let lines = concat!(
+            r#"{"event":"init","conversation_id":"24110f9c-db50-4069-bfc0-db874b6832cb","init":{"model":"gemini-4-hydrogen"}}"#,
+            "\n",
+            r#"{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"OK"}}"#,
+            "\n",
+            r#"{"event":"result","result":{"conversation_id":"24110f9c-db50-4069-bfc0-db874b6832cb","status":"SUCCESS","response":"OK\n","usage":{"input_tokens":11126,"output_tokens":49}}}"#,
+        );
+        let events = fixture(ProviderId::Antigravity, lines);
+        assert_eq!(
+            event_types(&events),
+            ["session_started", "assistant_delta", "usage", "completed"]
+        );
+        assert_eq!(
+            events[0]["provider_session_id"],
+            "24110f9c-db50-4069-bfc0-db874b6832cb"
+        );
+        assert_eq!(events[1]["text"], "OK");
+        assert_eq!(
+            events[2],
+            json!({"type":"usage","input_tokens":11126,"output_tokens":49})
+        );
+        assert_eq!(events[3]["final_text"], "OK\n");
     }
 }

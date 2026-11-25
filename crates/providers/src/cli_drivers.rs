@@ -223,7 +223,7 @@ fn codex_args(cmd: &mut Command, req: &TurnRequest) -> Input {
 }
 
 fn antigravity_args(cmd: &mut Command, req: &TurnRequest) -> Input {
-    stream_json_args(cmd);
+    cmd.args(["--output-format", "stream-json"]);
     model_effort_args(cmd, req);
     match (req.interaction_mode, req.runtime_mode) {
         (InteractionMode::Plan, _) => cmd.args(["--mode", "plan"]),
@@ -236,7 +236,8 @@ fn antigravity_args(cmd: &mut Command, req: &TurnRequest) -> Input {
     if let Some(session) = &req.resume_session_id {
         cmd.args(["--conversation", session]);
     }
-    Input::StreamJson(prompt_with_paths(req, false))
+    cmd.arg("--print").arg(prompt_with_paths(req, false));
+    Input::None
 }
 
 fn opencode_args(cmd: &mut Command, req: &TurnRequest) -> Input {
@@ -536,18 +537,12 @@ mod tests {
         let mut cmd = AntigravityDriver::with_data_dir("/opt/homebrew/bin/agy", "/isolated state")
             .0
             .command();
-        assert!(matches!(
-            antigravity_args(&mut cmd, &req),
-            Input::StreamJson(_)
-        ));
+        assert!(matches!(antigravity_args(&mut cmd, &req), Input::None));
         assert_eq!(cmd.as_std().get_program(), "/opt/homebrew/bin/agy");
         assert_eq!(
             args(&cmd),
             [
-                "-p",
                 "--output-format",
-                "stream-json",
-                "--input-format",
                 "stream-json",
                 "--model",
                 "test-model",
@@ -556,7 +551,9 @@ mod tests {
                 "--mode",
                 "accept-edits",
                 "--conversation",
-                "existing session"
+                "existing session",
+                "--print",
+                "hello\n\nAttachments (file paths):\n- /attachments/picture.png\n- /attachments/notes.txt",
             ]
         );
         assert!(
