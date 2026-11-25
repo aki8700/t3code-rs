@@ -13,7 +13,6 @@ pub(crate) struct Parser {
     codex_text: HashMap<String, String>,
     codex_calls: HashSet<String>,
     opencode_step_finished: bool,
-    opencode_usage: (u64, u64),
 }
 
 impl Parser {
@@ -26,7 +25,6 @@ impl Parser {
             codex_text: HashMap::new(),
             codex_calls: HashSet::new(),
             opencode_step_finished: false,
-            opencode_usage: (0, 0),
         }
     }
 
@@ -203,9 +201,6 @@ impl Parser {
                         first_string(step, &["thinking_delta", "reasoning_delta"]),
                         true,
                     );
-                    if let Some(usage) = step.get("usage") {
-                        push_usage(out, usage);
-                    }
                     if string(step, "state") == Some("DONE")
                         && let Some(st) = string(step, "step_type")
                     {
@@ -263,7 +258,6 @@ impl Parser {
             "tool_result" | "tool_response" => push_item(out, TurnItemKind::ToolResult, event),
             "command_execution" => push_item(out, TurnItemKind::CommandExecution, event),
             "file_change" => push_item(out, TurnItemKind::FileChange, event),
-            "usage" => push_usage(out, event.get("usage").unwrap_or(event)),
             "result" | "completed" | "done" => stream_json_result(event, out),
             "error" | "failed" | "rate_limit" | "rate_limited" => out.push(error_event(event)),
             _ => {}
@@ -291,16 +285,10 @@ impl Parser {
             "file_change" => push_item(out, TurnItemKind::FileChange, part),
             "step_finish" => {
                 self.opencode_step_finished = true;
-                if let Some((input, output)) =
-                    token_counts(part.get("tokens").or(event.get("usage")).unwrap_or(part))
-                {
-                    self.opencode_usage.0 = self.opencode_usage.0.saturating_add(input);
-                    self.opencode_usage.1 = self.opencode_usage.1.saturating_add(output);
-                    out.push(StreamEvent::Usage {
-                        input_tokens: self.opencode_usage.0,
-                        output_tokens: self.opencode_usage.1,
-                    });
-                }
+                push_usage(
+                    out,
+                    part.get("tokens").or(event.get("usage")).unwrap_or(part),
+                );
             }
             "error" | "failed" | "rate_limit" | "rate_limited" => out.push(error_event(event)),
             _ => {}
@@ -643,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_ndjson_accumulates_usage_until_end_of_stdout() {
+    fn opencode_ndjson_emits_incremental_usage_until_end_of_stdout() {
         let events = fixture(
             ProviderId::OpenCode,
             r#"
@@ -677,8 +665,18 @@ mod tests {
         assert_eq!(events[5]["text"], "answer");
         assert_eq!(
             events[6],
-            json!({"type":"usage","input_tokens":32,"output_tokens":9})
+            json!({"type":"usage","input_tokens":20,"output_tokens":5})
         );
+        let total = events.iter().filter(|event| event["type"] == "usage").fold(
+            (0, 0),
+            |(input, output), event| {
+                (
+                    input + event["input_tokens"].as_u64().unwrap(),
+                    output + event["output_tokens"].as_u64().unwrap(),
+                )
+            },
+        );
+        assert_eq!(total, (32, 9));
     }
 
     #[test]
@@ -722,7 +720,7 @@ mod tests {
         let lines = concat!(
             r#"{"event":"init","conversation_id":"24110f9c-db50-4069-bfc0-db874b6832cb","init":{"model":"gemini-4-hydrogen"}}"#,
             "\n",
-            r#"{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"OK"}}"#,
+            r#"{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"OK","usage":{"input_tokens":11126,"output_tokens":49}}}"#,
             "\n",
             r#"{"event":"result","result":{"conversation_id":"24110f9c-db50-4069-bfc0-db874b6832cb","status":"SUCCESS","response":"OK\n","usage":{"input_tokens":11126,"output_tokens":49}}}"#,
         );

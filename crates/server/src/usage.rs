@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::{self, File, Metadata},
-    io::{BufRead, BufReader},
+    fs::{self, File},
+    io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
     time::{Duration as StdDuration, Instant, SystemTime},
 };
@@ -10,18 +10,20 @@ use axum::{
     Json,
     extract::{Query, State},
 };
-use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, Local, SecondsFormat, Timelike, Utc};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use t3_core::{CoreError, CoreResult, ProviderId};
 
 use crate::{ServerState, routes::ApiResult};
 
+const MAX_JSONL_LINE: usize = 4 * 1024 * 1024;
 const SNAPSHOT_TTL: StdDuration = StdDuration::from_secs(2);
 
 #[derive(Deserialize)]
 pub(crate) struct UsageQuery {
     days: Option<u32>,
+    tz_offset_mins: Option<i32>,
     #[serde(default, deserialize_with = "parse_refresh")]
     refresh: Option<bool>,
 }
@@ -42,6 +44,10 @@ pub(crate) async fn get(
     if !matches!(days, 1 | 7 | 30 | 90) {
         return Err(CoreError::InvalidArgument("days must be 1, 7, 30, or 90".into()).into());
     }
+    let offset = query
+        .tz_offset_mins
+        .unwrap_or_else(|| Local::now().offset().local_minus_utc() / 60)
+        .clamp(-720, 840);
     let response = tokio::task::spawn_blocking(move || {
         let mut cache = state
             .usage_cache
@@ -51,6 +57,7 @@ pub(crate) async fn get(
             state.usage_home.as_deref(),
             &state.config.db_path(),
             days,
+            offset,
             query.refresh.unwrap_or_default(),
         )
     })
@@ -76,7 +83,7 @@ struct UsageSnapshot {
     scanned_at: DateTime<Utc>,
     stamp: Instant,
     runs: Vec<LocalRun>,
-    reports: HashMap<u32, UsageResponse>,
+    reports: HashMap<(u32, i32), UsageResponse>,
 }
 
 impl UsageScanCache {
@@ -85,6 +92,7 @@ impl UsageScanCache {
         home: Option<&Path>,
         db: &Path,
         days: u32,
+        offset: i32,
         refresh: bool,
     ) -> CoreResult<UsageResponse> {
         if refresh
@@ -110,10 +118,11 @@ impl UsageScanCache {
         let snapshot = self.snapshot.as_mut().expect("usage snapshot initialized");
         Ok(snapshot
             .reports
-            .entry(days)
+            .entry((days, offset))
             .or_insert_with(|| {
                 aggregate(
                     days,
+                    offset,
                     snapshot.scanned_at,
                     self.files.values(),
                     &snapshot.runs,
@@ -156,39 +165,94 @@ impl UsageScanCache {
                     && path
                         .extension()
                         .is_some_and(|extension| extension == "jsonl")
-                    && let Ok(metadata) = fs::symlink_metadata(&path)
-                    && metadata.is_file()
+                    && self.scan_file(&path, provider).is_ok()
                 {
-                    seen.insert(path.clone());
-                    self.scan_file(path, provider, metadata);
+                    seen.insert(path);
                 }
             }
         }
     }
 
-    fn scan_file(&mut self, path: PathBuf, provider: ProviderId, metadata: Metadata) {
+    fn scan_file(&mut self, path: &Path, provider: ProviderId) -> io::Result<()> {
+        let mut options = File::options();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(transcript_open_flags()?);
+        }
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a regular transcript",
+            ));
+        }
         let modified = metadata.modified().ok();
         let len = metadata.len();
         if self
             .files
-            .get(&path)
+            .get(path)
             .is_some_and(|cached| cached.modified == modified && cached.len == len)
         {
-            return;
+            return Ok(());
         }
-        if let Ok(file) = File::open(&path)
-            && let Ok(samples) = parse_transcript(BufReader::new(file), provider)
-        {
-            self.files.insert(
-                path,
-                CachedFile {
-                    modified,
-                    len,
-                    provider,
-                    samples,
-                },
-            );
-        }
+        let samples = parse_transcript(BufReader::new(file), provider)?;
+        self.files.insert(
+            path.to_owned(),
+            CachedFile {
+                modified,
+                len,
+                provider,
+                samples,
+            },
+        );
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn transcript_open_flags() -> io::Result<i32> {
+    // The server has no libc dependency. Use the O_NOFOLLOW | O_NONBLOCK
+    // values from the supported platforms' fcntl.h to reject symlinks and FIFOs.
+    if cfg!(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )) {
+        Ok(0x100 | 0x4)
+    } else if cfg!(any(target_os = "linux", target_os = "android")) {
+        let nofollow = if cfg!(any(
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "powerpc",
+            target_arch = "powerpc64"
+        )) {
+            0x8000
+        } else {
+            0x20000
+        };
+        let nonblock = if cfg!(any(
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "mips32r6",
+            target_arch = "mips64r6"
+        )) {
+            0x80
+        } else if cfg!(any(target_arch = "sparc", target_arch = "sparc64")) {
+            0x4000
+        } else {
+            0x800
+        };
+        Ok(nofollow | nonblock)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure transcript open unavailable",
+        ))
     }
 }
 
@@ -371,7 +435,19 @@ impl Transcript {
 fn parse_transcript(mut input: impl BufRead, provider: ProviderId) -> std::io::Result<Vec<Sample>> {
     let mut transcript = Transcript::default();
     let mut line = Vec::new();
-    while input.read_until(b'\n', &mut line)? != 0 {
+    while input
+        .by_ref()
+        .take((MAX_JSONL_LINE + 1) as u64)
+        .read_until(b'\n', &mut line)?
+        != 0
+    {
+        if line.len() > MAX_JSONL_LINE {
+            if line.last() != Some(&b'\n') {
+                input.skip_until(b'\n')?;
+            }
+            line.clear();
+            continue;
+        }
         match provider {
             ProviderId::Claude => transcript.claude(&line),
             ProviderId::Codex => transcript.codex(&line),
@@ -642,19 +718,29 @@ impl<'a> UsageAggregation<'a> {
 
 fn aggregate<'a>(
     days: u32,
+    offset: i32,
     until: DateTime<Utc>,
     files: impl Iterator<Item = &'a CachedFile>,
     runs: &'a [LocalRun],
 ) -> UsageResponse {
     let hourly = days == 1;
+    let offset = Duration::minutes(i64::from(offset));
+    let local_now = (until + offset).naive_utc();
     let (since, step, count, resolution) = if hourly {
-        (until - Duration::hours(24), Duration::hours(1), 24, "hour")
+        let hour = local_now
+            .date()
+            .and_hms_opt(local_now.hour(), 0, 0)
+            .expect("hour is valid")
+            .and_utc()
+            - offset;
+        (hour - Duration::hours(23), Duration::hours(1), 24, "hour")
     } else {
-        let midnight = until
-            .date_naive()
+        let midnight = local_now
+            .date()
             .and_hms_opt(0, 0, 0)
             .expect("midnight is valid")
-            .and_utc();
+            .and_utc()
+            - offset;
         (
             midnight - Duration::days(i64::from(days - 1)),
             Duration::days(1),
@@ -666,9 +752,9 @@ fn aggregate<'a>(
         .map(|index| {
             let start = since + step * index as i32;
             let (key, label) = if hourly {
-                (rfc3339(start), start.format("%H:%M").to_string())
+                (rfc3339(start), (start + offset).format("%H:%M").to_string())
             } else {
-                let day = start.format("%Y-%m-%d").to_string();
+                let day = (start + offset).format("%Y-%m-%d").to_string();
                 (day.clone(), day)
             };
             UsageBucket {
@@ -745,16 +831,19 @@ fn aggregate<'a>(
     let mut models: Vec<_> = result
         .models
         .into_iter()
-        .map(|((id, model), usage)| {
+        .filter_map(|((id, model), usage)| {
             let totals = usage.totals();
+            if model == "<synthetic>" || (totals.total_tokens == 0 && totals.cost_usd == 0.0) {
+                return None;
+            }
             let (cost_share, token_share) = shares(&totals);
-            UsageModelRow {
+            Some(UsageModelRow {
                 provider: provider_info(id).0,
                 model: model.to_owned(),
                 totals,
                 cost_share,
                 token_share,
-            }
+            })
         })
         .collect();
     models.sort_by(|a, b| {
@@ -879,13 +968,15 @@ invalid json
             samples: parse_transcript(CLAUDE.as_bytes(), ProviderId::Claude).unwrap(),
         };
         let now = "2026-01-02T12:30:00Z".parse().unwrap();
-        let hourly = aggregate(1, now, std::iter::once(&file), &[]);
+        let hourly = aggregate(1, 0, now, std::iter::once(&file), &[]);
         assert_eq!(hourly.window.resolution, "hour");
-        assert_eq!(hourly.window.since, "2026-01-01T12:30:00Z");
+        assert_eq!(hourly.window.since, "2026-01-01T13:00:00Z");
         assert_eq!(hourly.buckets.len(), 24);
-        assert_eq!(hourly.buckets[23].by_provider["claude"].total_tokens, 155);
+        assert_eq!(hourly.buckets[22].by_provider["claude"].total_tokens, 155);
+        assert_eq!(hourly.buckets[23].label, "12:00");
+        assert_eq!(hourly.buckets[23].total_tokens, 0);
         assert_eq!(hourly.buckets[0].total_tokens, 0);
-        let daily = aggregate(7, now, std::iter::once(&file), &[]);
+        let daily = aggregate(7, 0, now, std::iter::once(&file), &[]);
         assert_eq!(daily.window.resolution, "day");
         assert_eq!(daily.buckets.len(), 7);
         assert_eq!(daily.buckets[0].key, "2025-12-27");

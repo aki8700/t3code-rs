@@ -137,6 +137,7 @@ async fn bearer_tailscale_and_local_peer_checks() {
     }
     assert_eq!(status(&app, "/healthz", REMOTE, &[]).await, StatusCode::OK);
 
+    drop(app);
     let app = router(dir.state(AuthConfig::Tailscale {
         allowed_logins: vec!["dev@example.test".into()],
     }));
@@ -183,6 +184,7 @@ async fn bearer_tailscale_and_local_peer_checks() {
         StatusCode::UNAUTHORIZED
     );
 
+    drop(app);
     let app = router(dir.state(AuthConfig::LocalOnly));
     assert_eq!(
         status(&app, "/api/meta", REMOTE, &[]).await,
@@ -835,6 +837,10 @@ async fn mock_rest_mcp_worktrees_handoff_search_compression_and_attachments() {
     .await;
     assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
     assert_eq!(
+        response.headers()[header::CONTENT_DISPOSITION],
+        "attachment; filename=\"hello.txt\"; filename*=UTF-8''hello.txt"
+    );
+    assert_eq!(
         to_bytes(response.into_body(), 65536)
             .await
             .unwrap()
@@ -954,6 +960,13 @@ async fn queue_and_delegated_cancellation() {
         Some(json!({"prompt":"queued","behavior":"queue"})),
     )
     .await;
+    let busy = json_req(&app, Method::GET, &path, None).await;
+    assert_eq!(busy["runs"][1]["status"], "queued");
+    assert!(
+        busy["items"].as_array().unwrap().iter().any(|item| {
+            item["run_id"] == queued["run_id"] && item["payload"]["text"] == "queued"
+        })
+    );
     wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
     wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
     let detail = json_req(&app, Method::GET, &path, None).await;
@@ -1006,4 +1019,374 @@ async fn usage_route_requires_authentication_and_valid_window() {
         .await,
         StatusCode::BAD_REQUEST
     );
+}
+
+#[tokio::test]
+async fn patch_thread_modes_and_walk_turn_item_pages() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let id = create_parent(&app, &tmp.0).await;
+    let path = format!("/api/threads/{id}");
+    let patched = json_req(
+        &app,
+        Method::PATCH,
+        &path,
+        Some(json!({
+            "runtime_mode":"auto-accept-edits","interaction_mode":"plan"
+        })),
+    )
+    .await;
+    assert_eq!(patched["runtime_mode"], "auto-accept-edits");
+    assert_eq!(patched["interaction_mode"], "plan");
+    json_req(
+        &app,
+        Method::POST,
+        &format!("{path}/messages"),
+        Some(json!({"prompt":"fixture"})),
+    )
+    .await;
+    wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+
+    let full = json_req(&app, Method::GET, &path, None).await;
+    let detail = json_req(&app, Method::GET, &format!("{path}?limit=2"), None).await;
+    let items = detail["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(detail["has_more"], true);
+    assert_eq!(
+        detail["total_items"],
+        full["items"].as_array().unwrap().len()
+    );
+    assert_eq!(detail["thread"]["interaction_mode"], "plan");
+    let cursor = &items[0]["ordinal"];
+    let older = json_req(
+        &app,
+        Method::GET,
+        &format!("{path}?limit=2&before_ordinal={cursor}"),
+        None,
+    )
+    .await;
+    assert_eq!(older["items"].as_array().unwrap().len(), 2);
+    assert!(older["items"][1]["ordinal"].as_i64() < cursor.as_i64());
+    let oldest = json_req(
+        &app,
+        Method::GET,
+        &format!(
+            "{path}?limit=2&before_ordinal={}",
+            older["items"][0]["ordinal"]
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(oldest["has_more"], false);
+    assert_eq!(oldest["items"][0]["kind"], "user_message");
+}
+
+#[tokio::test]
+async fn usage_route_buckets_both_sides_of_jst_midnight() {
+    use chrono::{Duration, FixedOffset, Utc};
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let store = state.store.clone();
+    let app = router(state);
+    let id = create_parent(&app, &tmp.0).await;
+    let offset = FixedOffset::east_opt(9 * 3600).unwrap();
+    let today_jst = Utc::now().with_timezone(&offset).date_naive();
+    let midnight = (today_jst - Duration::days(1))
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_local_timezone(offset)
+        .unwrap()
+        .to_utc();
+    for (ordinal, at, tokens, model) in [
+        (1, midnight - Duration::seconds(1), 11, "fixture"),
+        (2, midnight, 22, "fixture"),
+        (3, midnight, 0, "zero-token-model"),
+        (4, midnight, 1, "<synthetic>"),
+    ] {
+        store
+            .create_run(Run {
+                id: Uuid::new_v4(),
+                thread_id: id,
+                ordinal,
+                provider: ProviderId::Mock,
+                model: model.into(),
+                effort: None,
+                status: RunStatus::Completed,
+                prompt: String::new(),
+                provider_session_id: None,
+                input_tokens: Some(tokens),
+                output_tokens: Some(0),
+                duration_ms: Some(1),
+                error_message: None,
+                started_at: at,
+                completed_at: Some(at),
+            })
+            .await
+            .unwrap();
+    }
+    let report = json_req(
+        &app,
+        Method::GET,
+        "/api/usage?days=7&tz_offset_mins=540",
+        None,
+    )
+    .await;
+    let buckets = report["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 7);
+    assert_eq!(buckets[4]["by_provider"]["mock"]["total_tokens"], 11);
+    assert_eq!(buckets[5]["by_provider"]["mock"]["total_tokens"], 23);
+    assert_eq!(buckets[6]["key"], today_jst.to_string());
+    assert!(
+        report["window"]["since"]
+            .as_str()
+            .unwrap()
+            .ends_with("T15:00:00Z")
+    );
+    let models = report["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["provider"] == "mock")
+        .map(|row| row["model"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(models, vec!["fixture"]);
+}
+
+#[tokio::test]
+async fn attachment_download_sanitizes_and_encodes_stored_filename() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let bytes = b"legacy attachment";
+    let hash = blake3::hash(bytes).to_hex().to_string();
+    let path = state.config.attachments_dir().join(&hash);
+    std::fs::create_dir_all(state.config.attachments_dir()).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    let id = Uuid::new_v4();
+    state
+        .store
+        .save_attachment(t3_core::Attachment {
+            id,
+            thread_id: None,
+            filename: "報告\r\n\"/\\file.txt".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: bytes.len() as u64,
+            blake3_hash: hash,
+            storage_path: path,
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    let app = router(state);
+    let response = request(
+        &app,
+        Request::get(format!("/api/attachments/{id}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_DISPOSITION],
+        "attachment; filename=\"_______file.txt\"; filename*=UTF-8''%E5%A0%B1%E5%91%8A_____file.txt"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn internal_mcp_token_is_revoked_as_soon_as_run_finishes() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new();
+    let driver = tmp.0.join("fixture-codex");
+    std::fs::write(
+        &driver,
+        r#"#!/bin/sh
+umask 077
+cat > /dev/null
+printf '%s' "$T3_MCP_TOKEN" > mcp-token
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"active"}}'
+while [ ! -f release ]; do sleep 0.02; done
+printf '%s\n' '{"type":"turn.completed"}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut config = ServerConfig {
+        data_dir: tmp.0.join("server"),
+        enabled_providers: vec![ProviderId::Mock, ProviderId::Codex],
+        ..Default::default()
+    };
+    config.providers.codex_bin = driver;
+    let state = ServerState::new(config, "http://127.0.0.1:3774".into()).unwrap();
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let id = create_parent(&app, &tmp.0).await;
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({
+            "prompt":"fixture","model_selection":{"provider":"codex","model":"fixture"}
+        })),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), WsServerMessage::Delta { thread_id, .. } if thread_id == id) {
+                break;
+            }
+        }
+    }).await.unwrap();
+    let token = std::fs::read_to_string(tmp.0.join("mcp-token")).unwrap();
+    let call = |thread_id: Uuid| {
+        request(
+            &app,
+            Request::post("/mcp")
+                .extension(ConnectInfo(SocketAddr::new(LOCAL, 49152)))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header("x-t3-thread-id", thread_id.to_string())
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                ))
+                .unwrap(),
+        )
+    };
+    assert_eq!(call(id).await.status(), StatusCode::OK);
+    assert_eq!(
+        call(Uuid::new_v4()).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    std::fs::write(tmp.0.join("release"), []).unwrap();
+    wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+    assert_eq!(call(id).await.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn exclusive_daemon_lock_is_held_by_the_router() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let config = (*state.config).clone();
+    let app = router(state);
+    let attempt = || ServerState::new(config.clone(), "http://127.0.0.1:3774".into());
+    assert!(
+        attempt()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("another daemon")
+    );
+    drop(app);
+    assert!(attempt().is_ok());
+}
+
+#[tokio::test]
+async fn swarm_mock_workers_post_results_and_wake_the_coordinator() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let id = create_parent(&app, &tmp.0).await;
+    let thread = format!("/api/threads/{id}");
+    let swarm = format!("{thread}/swarm");
+    assert_eq!(json_req(&app, Method::GET, &swarm, None).await, Value::Null);
+    json_req(
+        &app,
+        Method::PATCH,
+        &thread,
+        Some(json!({"interaction_mode":"plan"})),
+    )
+    .await;
+    json_req(
+        &app,
+        Method::POST,
+        &format!("{thread}/messages"),
+        Some(json!({"prompt":"/swarm Review the fixture"})),
+    )
+    .await;
+    wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+    let before = mcp_tool(&app, "swarm_status", json!({"thread_id":id})).await;
+    assert_eq!(before["coordinator_thread_id"], json!(id));
+    let rejected = json_req(&app, Method::POST, "/mcp", Some(json!({
+        "jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"swarm_add_worker","arguments":{"thread_id":id,"name":"unsafe","brief":"check","isolation":"worktree"}
+        }
+    }))).await;
+    assert_eq!(rejected["result"]["isError"], true);
+    // MockDriver echoes the prompt. The test sends each participant's MCP calls
+    // over the same tool endpoint used by the external providers.
+    let worker = mcp_tool(&app, "swarm_add_worker", json!({
+        "thread_id":id,"name":"reviewer","brief":"Review the fixture","provider":"mock","model":"mock",
+    })).await;
+    let worker_id: Uuid = serde_json::from_value(worker["thread_id"].clone()).unwrap();
+    let worker_path = format!("/api/threads/{worker_id}");
+    wait_for_thread(&mut events, worker_id, ThreadStatus::Completed).await;
+    let worker_detail = json_req(&app, Method::GET, &worker_path, None).await;
+    assert_eq!(worker_detail["thread"]["parent_thread_id"], json!(id));
+    assert_eq!(worker_detail["thread"]["interaction_mode"], "plan");
+    assert!(
+        worker_detail["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item["kind"] == "assistant_message"
+                    && item["payload"]["text"].as_str().is_some_and(|text| {
+                        text.contains("swarm_post_message") && text.contains("Review the fixture")
+                    })
+            })
+    );
+    let note = json_req(
+        &app,
+        Method::POST,
+        &format!("{swarm}/messages"),
+        Some(json!({"text":"Fixture context from the user"})),
+    )
+    .await;
+    let done = mcp_tool(
+        &app,
+        "swarm_post_message",
+        json!({
+            "thread_id":worker_id,"text":"@coordinator [done] Fixture checked",
+        }),
+    )
+    .await;
+    wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+    let messages = mcp_tool(
+        &app,
+        "swarm_read_board",
+        json!({
+            "thread_id":worker_id, "since":note["head_seq"], "limit":1,
+        }),
+    )
+    .await;
+    assert_eq!(messages.as_array().unwrap().len(), 1);
+    assert_eq!(messages[0]["sender"], "reviewer");
+    assert_eq!(messages[0]["mentions"], json!(["coordinator"]));
+    let detail = json_req(&app, Method::GET, &thread, None).await;
+    assert_eq!(detail["runs"].as_array().unwrap().len(), 2);
+    let prompt = detail["runs"][1]["prompt"].as_str().unwrap();
+    assert!(prompt.contains("Fixture context from the user"));
+    assert!(prompt.contains("@coordinator [done] Fixture checked"));
+    let board = json_req(&app, Method::GET, &format!("{worker_path}/swarm"), None).await;
+    assert_eq!(board["board_id"], before["board_id"]);
+    assert_eq!(board["members"][0]["last_read_seq"], done["head_seq"]);
+    assert_eq!(board["members"][1]["state"], "waiting");
+    let killed = json_req(
+        &app,
+        Method::POST,
+        &format!("{swarm}/workers/reviewer/kill"),
+        None,
+    )
+    .await;
+    assert_eq!(killed["members"][1]["state"], "killed");
+    json_req(
+        &app,
+        Method::POST,
+        &format!("{swarm}/messages"),
+        Some(json!({"text":"@reviewer Please check again"})),
+    )
+    .await;
+    let detail = json_req(&app, Method::GET, &worker_path, None).await;
+    assert_eq!(detail["runs"].as_array().unwrap().len(), 1);
 }

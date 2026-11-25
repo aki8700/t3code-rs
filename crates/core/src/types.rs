@@ -10,6 +10,7 @@ pub enum ProviderId {
     Claude,
     Codex,
     Antigravity,
+    #[serde(alias = "opencode")]
     OpenCode,
     Mock,
 }
@@ -389,4 +390,50 @@ mod tests {
         );
         assert_eq!(ProviderId::OpenCode.as_str(), "opencode");
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmMember {
+    pub board_id: Uuid,
+    pub name: String,
+    pub thread_id: Uuid,
+    pub provider: ProviderId,
+    pub model: String,
+    pub effort: Option<String>,
+    pub state: String,
+    pub role: String,
+    pub last_read_seq: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmMessage {
+    pub seq: i64,
+    pub board_id: Uuid,
+    pub sender: String,
+    pub text: String,
+    pub mentions: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmBoardSnapshot {
+    pub board_id: Uuid,
+    pub coordinator_thread_id: Uuid,
+    pub title: String,
+    pub members: Vec<SwarmMember>,
+    /// Recent messages. Use the board reader to retrieve earlier messages.
+    pub messages: Vec<SwarmMessage>,
+    pub head_seq: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SwarmWorkerSpec {
+    pub name: String,
+    pub brief: String,
+    pub provider: Option<ProviderId>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub isolation: IsolationMode,
 }

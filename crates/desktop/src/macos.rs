@@ -15,7 +15,7 @@ use wry::{NewWindowResponse, WebView, WebViewBuilder};
 
 use crate::{
     daemon,
-    links::{Navigation, http_url, navigation, open_external},
+    links::{Navigation, app_url, http_url, navigation, open_external},
 };
 
 const TITLE: &str = "T3 Code RS";
@@ -43,16 +43,11 @@ enum AppEvent {
 
 pub(super) fn run() -> Result<(), Box<dyn Error>> {
     let raw_url = env::var("T3_APP_URL").unwrap_or_else(|_| DEFAULT_URL.into());
-    let url = http_url(&raw_url).ok_or("T3_APP_URL must be an absolute http:// or https:// URL")?;
+    let url = app_url(&raw_url)
+        .ok_or("T3_APP_URL must use https://, http://127.0.0.1, or http://localhost")?;
     let origin = url.origin();
-    let daemon = if origin == http_url(DEFAULT_URL).expect("valid default URL").origin() {
-        match daemon::ensure_running() {
-            Ok(daemon) => daemon,
-            Err(err) => {
-                eprintln!("{TITLE}: {err}");
-                None
-            }
-        }
+    let daemon = if url.scheme() == "http" && url.port() == Some(daemon::PORT) {
+        daemon::ensure_running(url.host_str() == Some("localhost"))?
     } else {
         None
     };

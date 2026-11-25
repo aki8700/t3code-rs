@@ -106,3 +106,41 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_entries USING fts5(
 CREATE TRIGGER IF NOT EXISTS threads_delete_fts AFTER DELETE ON threads BEGIN
     DELETE FROM fts_entries WHERE thread_id = old.id;
 END;
+
+CREATE TABLE IF NOT EXISTS queued_run_inputs (
+    run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    input_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS runs_status_thread_ordinal ON runs(status, thread_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS swarm_boards (
+    id TEXT PRIMARY KEY NOT NULL,
+    coordinator_thread_id TEXT UNIQUE NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS swarm_members (
+    board_id TEXT NOT NULL REFERENCES swarm_boards(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    thread_id TEXT UNIQUE NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    effort TEXT,
+    state TEXT NOT NULL,
+    role TEXT NOT NULL,
+    last_read_seq INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (board_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS swarm_messages (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    board_id TEXT NOT NULL REFERENCES swarm_boards(id) ON DELETE CASCADE,
+    sender TEXT NOT NULL,
+    text TEXT NOT NULL,
+    mentions_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS swarm_messages_board_seq ON swarm_messages(board_id, seq);

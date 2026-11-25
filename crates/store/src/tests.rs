@@ -155,12 +155,19 @@ async fn gc_removes_only_unreferenced_blobs_and_regular_attachment_files() {
         (link, target)
     };
 
+    let unrelated = ["notes.txt".to_owned(), "A".repeat(64), "f".repeat(63)];
+    for name in &unrelated {
+        fs::write(attachments.join(name), b"user data").unwrap();
+    }
+    let temporary = attachments.join(".tmp-fixture");
+    fs::write(&temporary, b"temporary").unwrap();
+
     let dry = store.gc_storage(&attachments, false).await.unwrap();
     assert!(!dry.applied);
     assert_eq!(dry.orphan_blobs_count, 1);
     assert!(dry.orphan_blobs_bytes > 0);
-    assert_eq!(dry.orphan_attachments_count, 1);
-    assert_eq!(dry.orphan_attachments_bytes, 6);
+    assert_eq!(dry.orphan_attachments_count, 2);
+    assert_eq!(dry.orphan_attachments_bytes, 15);
     assert_eq!(dry.db_bytes_before, dry.db_bytes_after);
     assert_eq!(store.db_stats().await.unwrap().dedup_blobs_count, 2);
     assert_eq!(fs::read(&orphan_file).unwrap(), b"orphan");
@@ -169,8 +176,8 @@ async fn gc_removes_only_unreferenced_blobs_and_regular_attachment_files() {
     assert!(applied.applied);
     assert_eq!(applied.orphan_blobs_count, 1);
     assert_eq!(applied.orphan_blobs_bytes, dry.orphan_blobs_bytes);
-    assert_eq!(applied.orphan_attachments_count, 1);
-    assert_eq!(applied.orphan_attachments_bytes, 6);
+    assert_eq!(applied.orphan_attachments_count, 2);
+    assert_eq!(applied.orphan_attachments_bytes, 15);
     assert_eq!(
         applied.db_bytes_after,
         fs::metadata(&db_path).unwrap().len()
@@ -186,6 +193,10 @@ async fn gc_removes_only_unreferenced_blobs_and_regular_attachment_files() {
     );
     assert_eq!(fs::read(keep_file).unwrap(), b"keep");
     assert!(!orphan_file.exists());
+    assert!(!temporary.exists());
+    for name in unrelated {
+        assert_eq!(fs::read(attachments.join(name)).unwrap(), b"user data");
+    }
     assert_eq!(fs::read(subdir.join("keep")).unwrap(), b"nested");
     #[cfg(unix)]
     {
@@ -939,6 +950,23 @@ async fn imports_legacy_history_with_lineage_runs_and_search() {
              '{\"messageId\": \"message-1\", \"text\": \"テスト依頼\"}');",
     )
     .unwrap();
+    db.execute_batch(
+        r#"UPDATE orchestration_v2_projection_runs
+           SET completed_at = 'invalid fallback',
+               payload_json = json_set(payload_json, '$.completedAt', '2026-01-01T00:01:00Z');
+           INSERT INTO orchestration_v2_projection_turn_items VALUES
+             ('bad-item', 'parent', 'legacy-run', 5, 'user_message',
+              '2026-01-01T00:00:00Z', 'invalid json'),
+             ('notice-link', 'parent', 'legacy-run', 6, 'notification',
+              '2026-01-01T00:00:00Z', '{"source":{"childThreadId":"child"}}'),
+             ('card', 'parent', 'legacy-run', 7, 'subagent',
+              '2026-01-01T00:00:00Z', '{"title":"Subagent", "childThreadId":"child"}'),
+             ('cross-thread', 'child', 'legacy-run', 1, 'assistant_message',
+              '2026-01-01T00:00:00Z', '{"text":"child result"}');
+           INSERT INTO orchestration_v2_projection_runs VALUES
+             ('bad-run', 'child', 1, 'codex', NULL, 'completed', 'bad timestamp', NULL, '{}');"#,
+    )
+    .unwrap();
     let output = format!("HEAD{}TAIL", "出力".repeat(20_000));
     for (id, ordinal) in [("command-1", 8), ("command-2", 9)] {
         db.execute(
@@ -963,7 +991,7 @@ async fn imports_legacy_history_with_lineage_runs_and_search() {
             report.runs_imported,
             report.items_imported
         ),
-        (1, 2, 2, 4)
+        (1, 2, 3, 7)
     );
     assert_eq!(
         report.db_bytes_after,
@@ -1004,13 +1032,23 @@ async fn imports_legacy_history_with_lineage_runs_and_search() {
     let items = store.list_turn_items(parent.id, 10, 0).await.unwrap();
     assert_eq!(
         items.iter().map(|i| i.ordinal).collect::<Vec<_>>(),
-        [3, 4, 8, 9]
+        [3, 4, 6, 7, 8, 9]
     );
     assert_eq!(items[0].run_id, runs[1].id);
-    assert_eq!(items[2].kind, TurnItemKind::CommandExecution);
-    assert_eq!(items[2].summary.as_deref(), Some("example"));
-    assert!(items[2].compressed_bytes.is_some());
-    let output = items[2].payload["output"].as_str().unwrap();
+    assert_eq!(runs[0].completed_at, "2026-01-01T00:01:00Z".parse().ok());
+    let child_runs = store.list_runs(child.id).await.unwrap();
+    let child_items = store.list_turn_items(child.id, 10, 0).await.unwrap();
+    assert_eq!(child_runs.len(), 1);
+    assert_eq!(child_items[0].run_id, child_runs[0].id);
+    assert_eq!(
+        items[2].payload["source"]["childThreadId"],
+        child.id.to_string()
+    );
+    assert_eq!(items[3].payload["childThreadId"], child.id.to_string());
+    assert_eq!(items[4].kind, TurnItemKind::CommandExecution);
+    assert_eq!(items[4].summary.as_deref(), Some("example"));
+    assert!(items[4].compressed_bytes.is_some());
+    let output = items[4].payload["output"].as_str().unwrap();
     assert!(output.starts_with("HEAD") && output.ends_with("TAIL"));
     assert_eq!(store.db_stats().await.unwrap().dedup_blobs_count, 1);
     assert_eq!(
@@ -1021,6 +1059,23 @@ async fn imports_legacy_history_with_lineage_runs_and_search() {
         store.search_fts("日本語タイトル", 10).await.unwrap()[0].thread_id,
         parent.id
     );
+    let child_id = child.id;
+    let card_id = items[3].id;
+    store
+        .with_writer(move |connection| {
+            connection
+                .execute(
+                    "UPDATE threads SET parent_thread_id = NULL WHERE id = ?1",
+                    [child_id.to_string()],
+                )
+                .map_err(storage_error)?;
+            connection.execute(
+            "UPDATE turn_items SET payload_text = json_set(payload_text, '$.childThreadId', 'child')
+             WHERE id = ?1", [card_id.to_string()]).map_err(storage_error)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     let repeated = store.import_history_from_t3_sqlite(&path).await.unwrap();
     assert_eq!(
         (
@@ -1031,6 +1086,12 @@ async fn imports_legacy_history_with_lineage_runs_and_search() {
         ),
         (0, 0, 0, 0)
     );
+    assert_eq!(
+        store.get_thread(child_id).await.unwrap().parent_thread_id,
+        Some(parent.id)
+    );
+    let page = store.list_turn_items(parent.id, 10, 0).await.unwrap();
+    assert_eq!(page[3].payload["childThreadId"], child_id.to_string());
     assert!(source == fs::read(&path).unwrap());
     assert!(!dir.0.join("legacy.sqlite-wal").exists());
     assert!(!dir.0.join("legacy.sqlite-shm").exists());
@@ -1050,4 +1111,112 @@ async fn imports_legacy_history_with_lineage_runs_and_search() {
     assert_eq!(incremental.runs_imported, 0);
     assert!(source == fs::read(&path).unwrap());
     assert!(wal_before == fs::read(&wal).unwrap());
+}
+
+#[tokio::test]
+async fn fts_body_is_capped_at_a_utf8_boundary() {
+    let store = SqliteStore::open_in_memory(StorageConfig::default()).unwrap();
+    let run = seed(&store, "FTS limit").await;
+    let mut item = item(&run, json!({"text": "payload"}));
+    item.searchable_text = Some(format!("indexprefix{}indexsuffix", "あ".repeat(24_000)));
+    store.append_turn_item(item).await.unwrap();
+    assert_eq!(store.search_fts("indexprefix", 10).await.unwrap().len(), 1);
+    assert!(
+        store
+            .search_fts("indexsuffix", 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn update_thread_modes_persists_both_modes() {
+    let store = SqliteStore::open_in_memory(StorageConfig::default()).unwrap();
+    let run = seed(&store, "Modes").await;
+    let before = store.get_thread(run.thread_id).await.unwrap();
+    store
+        .update_thread_modes(
+            run.thread_id,
+            RuntimeMode::FullAccess,
+            InteractionMode::Default,
+        )
+        .await
+        .unwrap();
+    let after = store.get_thread(run.thread_id).await.unwrap();
+    assert_eq!(after.runtime_mode, RuntimeMode::FullAccess);
+    assert_eq!(after.interaction_mode, InteractionMode::Default);
+    assert!(after.updated_at >= before.updated_at);
+    assert!(matches!(
+        store
+            .update_thread_modes(
+                Uuid::new_v4(),
+                RuntimeMode::FullAccess,
+                InteractionMode::Default
+            )
+            .await,
+        Err(CoreError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn list_turn_items_page_walks_backwards_with_an_exclusive_cursor() {
+    let store = SqliteStore::open_in_memory(StorageConfig::default()).unwrap();
+    let run = seed(&store, "Pagination").await;
+    let other = seed(&store, "Other thread").await;
+    store
+        .append_turn_item(item(&other, json!("other")))
+        .await
+        .unwrap();
+    let mut ordinals = Vec::new();
+    for i in 0..5 {
+        let stored = store.append_turn_item(item(&run, json!(i))).await.unwrap();
+        ordinals.push(stored.ordinal);
+    }
+
+    let mut cursor = None;
+    for (expected, expected_more) in [(3..5, true), (1..3, true), (0..1, false)] {
+        let (page, more, total) = store
+            .list_turn_items_page(run.thread_id, 2, cursor)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter().map(|item| item.ordinal).collect::<Vec<_>>(),
+            ordinals[expected]
+        );
+        assert_eq!((more, total), (expected_more, 5));
+        cursor = page.first().map(|item| item.ordinal);
+    }
+    let (page, more, total) = store
+        .list_turn_items_page(run.thread_id, 2, cursor)
+        .await
+        .unwrap();
+    assert!(page.is_empty());
+    assert_eq!((more, total), (false, 5));
+    let (page, more, total) = store
+        .list_turn_items_page(run.thread_id, 0, None)
+        .await
+        .unwrap();
+    assert!(page.is_empty());
+    assert_eq!((more, total), (true, 5));
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_lock_is_exclusive_until_the_holder_is_dropped() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new();
+    let first = acquire_daemon_lock(&dir.0).unwrap();
+    assert!(acquire_daemon_lock(&dir.0).is_err());
+    let mode = fs::metadata(dir.0.join("t3d.lock"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    // A child process holds a duplicate descriptor between fork and exec.
+    let inherited = first.0.try_clone().unwrap();
+    drop(first);
+    assert!(acquire_daemon_lock(&dir.0).is_ok());
+    drop(inherited);
 }

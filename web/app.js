@@ -66,6 +66,8 @@ const ICONS = {
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.500v.01"/>',
   shield: '<path d="M12 3l8 3v6c0 4.500-3.300 8-8 9-4.700-1-8-4.500-8-9V6z"/><path d="M8.500 12l2.500 2.500 4.500-5"/>',
   alert: '<path d="M12 4l9.500 16h-19zM12 10v4M12 17v.01"/>',
+  swarm: '<circle cx="12" cy="5.500" r="2.500"/><circle cx="5.500" cy="17.500" r="2.500"/><circle cx="18.500" cy="17.500" r="2.500"/><path d="M10.800 7.700l-4.100 7.600M13.200 7.700l4.100 7.600M8 17.500h8"/>',
+  open: '<path d="M14 4h6v6M20 4l-9 9M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/>',
 };
 const svg = (n) => `<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n] || ''}</svg>`;
 const iconEl = (n, cls = '') => { const s = h('span', { class: `iw ${cls}` }); s.innerHTML = svg(n); return s; };
@@ -123,6 +125,56 @@ const pretty = (v) => { try { return typeof v === 'string' ? v : JSON.stringify(
 const isCoarse = () => matchMedia('(pointer: coarse)').matches;
 const isNarrow = () => matchMedia('(max-width: 860px)').matches;
 const hashNum = (s) => { let n = 0; for (const c of String(s)) n = (n * 31 + c.codePointAt(0)) >>> 0; return n; };
+
+/** Display form of a thread title: no Markdown heading markers or agent XML wrappers, single spaced. */
+function cleanTitle(src) {
+  const raw = String(src ?? '');
+  let s = raw.replace(/<(command-name|command-message|command-args|system-reminder|local-command-caveat)\b[^<>]*>[\s\S]*?(<\/\1>|$)/gi, ' ');
+  if (/<user_action\b/i.test(s)) s = s.replace(/<\/?[a-z][\w-]*[^<>]*(>|$)/gi, ' ');
+  s = s.replace(/<\/?[a-z]+(?:[-_][a-z]+)+(?:\s[^<>]*)?(>|$)/gi, ' ')
+    .replace(/\s+/g, ' ').trim()
+    .replace(/^(?:#{1,6}(?:\s+|$)|>\s*)+/, '').trim();
+  if (s) return s;
+  const cmd = /<command-name>\s*([^<]*)/i.exec(raw)?.[1].trim();
+  return cmd || (/<user_action\b/i.test(raw) ? 'ユーザー操作' : '(無題)');
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** SHA-1 (only for UUIDv5; crypto.subtle is unavailable on plain-http non-loopback origins). */
+function sha1(bytes) {
+  const len = ((bytes.length + 8 >> 6) + 1) * 64;
+  const buf = new Uint8Array(len); buf.set(bytes); buf[bytes.length] = 0x80;
+  const view = new DataView(buf.buffer);
+  view.setUint32(len - 4, (bytes.length * 8) >>> 0);
+  const H = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+  const w = new Uint32Array(80);
+  const rol = (x, n) => (x << n) | (x >>> (32 - n));
+  for (let off = 0; off < len; off += 64) {
+    for (let i = 0; i < 80; i++) w[i] = i < 16 ? view.getUint32(off + i * 4) : rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    let [a, b, c, d, e] = H;
+    for (let i = 0; i < 80; i++) {
+      const [fn, k] = i < 20 ? [(b & c) | (~b & d), 0x5a827999] : i < 40 ? [b ^ c ^ d, 0x6ed9eba1] : i < 60 ? [(b & c) | (b & d) | (c & d), 0x8f1bbcdc] : [b ^ c ^ d, 0xca62c1d6];
+      const t = (rol(a, 5) + fn + e + k + w[i]) | 0;
+      e = d; d = c; c = rol(b, 30); b = a; a = t;
+    }
+    [a, b, c, d, e].forEach((v, i) => { H[i] = (H[i] + v) | 0; });
+  }
+  return H.flatMap((v) => [v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]);
+}
+/**
+ * Local thread id for a payload / link reference. Imported history keeps upstream string ids ("thread:…");
+ * the importer stores those threads under UUIDv5(NAMESPACE_URL, id).
+ */
+function resolveThreadId(raw) {
+  const s = String(raw || '');
+  if (UUID_RE.test(s)) return s.toLowerCase();
+  if (!s.startsWith('thread:')) return '';
+  const ns = [0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8];
+  const b = sha1(new Uint8Array([...ns, ...new TextEncoder().encode(s)])).slice(0, 16);
+  b[6] = (b[6] & 0x0f) | 0x50; b[8] = (b[8] & 0x3f) | 0x80;
+  const hex = b.map((x) => x.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 function toast(msg, kind = '', ms = 3800) {
   const box = $('#toasts');
@@ -207,15 +259,19 @@ const S = {
   kidsOpen: new Map(),    // thread id -> explicit fold state chosen by the user
   collapsedProjects: new Set(ls.json('t3.pcollapsed', [])),
   expandedProjects: new Set(), // projects showing all threads
+  showEmpty: ls.get('t3.pempty', '0') === '1', // unfold the "no threads" project group
+  expandedMsgs: new Set(), // long user messages the reader unfolded
+  loadingOlder: null, // thread id whose older page is being fetched
   behavior: ls.get('t3.behavior', '') === 'queue' ? 'queue' : 'steer',
   atts: [],               // composer attachments
   drafts: new Map(),      // threadId | 'new' -> { text, atts }
-  // composer selection. runtime mode / plan / isolation apply only when a new thread is created.
+  // composer selection. isolation applies only when a new thread is created.
   compose: { sel: null, mode: 'approval-required', plan: false, isolation: 'shared', baseRef: '' },
   heroSel: ls.json('t3.sel', null),
   optimistic: [],
   stick: true,
-  diffOpen: ls.get('t3.diff', '0') === '1',
+  rail: ['diff', 'swarm'].find((x) => x === ls.get('t3.rail', '')) || null, // which panel owns the right rail
+  swarms: new Map(),      // threadId -> SwarmBoardSnapshot
   diffStat: null,         // { threadId, add, del, files }
   ignoreWs: ls.get('t3.ws', '1') !== '0',
   dbStats: null,
@@ -283,7 +339,15 @@ async function api(path, { method = 'GET', json, form, signal } = {}) {
   return ct.includes('json') ? res.json() : res.text();
 }
 
-const blobCache = new Map();
+const blobCache = new Map(); // attachment id -> Promise<object URL>, oldest first
+const BLOB_CACHE_MAX = 120;
+function releaseBlob(id) {
+  const p = blobCache.get(id);
+  if (!p) return;
+  blobCache.delete(id);
+  p.then((u) => URL.revokeObjectURL(u)).catch(() => {});
+}
+const clearBlobCache = () => [...blobCache.keys()].forEach(releaseBlob);
 function attachmentBlobUrl(id) {
   if (blobCache.has(id)) return blobCache.get(id);
   const headers = S.token ? { Authorization: `Bearer ${S.token}` } : {};
@@ -291,6 +355,7 @@ function attachmentBlobUrl(id) {
     .then((r) => { if (!r.ok) throw new Error(r.statusText); return r.blob(); })
     .then((b) => URL.createObjectURL(b));
   blobCache.set(id, p);
+  while (blobCache.size > BLOB_CACHE_MAX) releaseBlob(blobCache.keys().next().value);
   p.catch(() => blobCache.delete(id));
   return p;
 }
@@ -336,7 +401,7 @@ function closePopover() {
   anchor.setAttribute('aria-expanded', 'false');
 }
 /** Opens a floating panel above the anchor (bottom sheet on phones). Toggles when the same anchor is clicked again. */
-function openPopover(anchor, content, { cls = '', align = 'end' } = {}) {
+function openPopover(anchor, content, { cls = '', align = 'end', below = false } = {}) {
   const again = popover?.anchor === anchor;
   closePopover();
   if (again) return null;
@@ -349,8 +414,13 @@ function openPopover(anchor, content, { cls = '', align = 'end' } = {}) {
     const w = el.offsetWidth;
     const left = align === 'end' ? r.right - w : r.left;
     el.style.left = `${Math.max(8, Math.min(left, innerWidth - w - 8))}px`;
-    el.style.bottom = `${Math.max(8, innerHeight - r.top + 8)}px`;
-    el.style.maxHeight = `${Math.max(220, r.top - 20)}px`;
+    if (below) {
+      el.style.top = `${r.bottom + 6}px`;
+      el.style.maxHeight = `${Math.max(160, Math.min(460, innerHeight - r.bottom - 16))}px`;
+    } else {
+      el.style.bottom = `${Math.max(8, innerHeight - r.top + 8)}px`;
+      el.style.maxHeight = `${Math.max(220, r.top - 20)}px`;
+    }
   };
   popover = { el, anchor, place };
   anchor.setAttribute('aria-expanded', 'true');
@@ -363,7 +433,10 @@ document.addEventListener('pointerdown', (e) => {
 addEventListener('resize', () => popover?.place());
 
 // ───────────────────────── Markdown (safe: escape first, never raw HTML) ─────────────────────────
-const SAFE_URL = /^(https?:\/\/|\/|#|mailto:)/i;
+const SAFE_URL = /^(https?:\/\/|\/(?!\/)|#|mailto:)/i;
+const LOCAL_PATH = /^(file:\/\/|~\/|\/(Users|home|private|tmp|var|Volumes|opt|etc)\/)/;
+const MD_MAX_DEPTH = 16; // nested quotes / lists beyond this stay plain text (no stack exhaustion)
+const safeDecode = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
 
 function mdInline(src) {
   const stash = [];
@@ -377,10 +450,21 @@ function mdInline(src) {
     .replace(/(^|[^*\w])\*([^*\s][^*\n]*?)\*(?!\*)/g, '$1<em>$2</em>')
     .replace(/(^|[^\w_])_([^_\s][^_\n]*?)_(?![\w_])/g, '$1<em>$2</em>')
     .replace(/~~([^~\n]+?)~~/g, '<del>$1</del>');
+  // Placeholders (\u0000n\u0001) stand for finished HTML, so no URL pattern may ever swallow one into an attribute.
   // images are never fetched (privacy): show as plain link
-  s = s.replace(/!?\[([^\]\n]+)\]\(([^)\s]+)(?:\s+&quot;[^)]*&quot;)?\)/g, (m, t, u) => (SAFE_URL.test(u)
-    ? put(`<a href="${u}" target="_blank" rel="noopener noreferrer">${emph(t)}</a>`) : m));
-  s = s.replace(/(^|[\s(（])(https?:\/\/[^\s<>()（）]+[^\s<>()（）.,;:!?、。])/g, (m, pre, u) => `${pre}${put(`<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`)}`);
+  s = s.replace(/!?\[([^\]\n]+)\]\((&lt;[^\n\u0000\u0001]*?&gt;|[^)\s\u0000\u0001]+)(?:\s+&quot;[^)\u0000\u0001]*&quot;)?\)/g, (m, t, url) => {
+    const u = url.startsWith('&lt;') && url.endsWith('&gt;') ? url.slice(4, -4) : url;
+    if (u.startsWith('t3-thread:')) {
+      const id = resolveThreadId(safeDecode(u.split('/').pop())) || resolveThreadId(u.split('/').pop());
+      return id ? put(`<button type="button" class="thread-chip" data-thread="${id}">${emph(t)} →</button>`) : m;
+    }
+    if (LOCAL_PATH.test(u)) {
+      const path = esc(safeDecode(u.replace(/^file:\/\//, '').replace(/&amp;/g, '&').replace(/&#39;/g, "'")));
+      return put(`<button type="button" class="path-chip" data-path="${path}" title="${path}（クリックでコピー）">${emph(t)}</button>`);
+    }
+    return SAFE_URL.test(u) ? put(`<a href="${u}" target="_blank" rel="noopener noreferrer">${emph(t)}</a>`) : m;
+  });
+  s = s.replace(/(^|[\s(（])(https?:\/\/[^\s<>"'\u0000\u0001()（）]*[^\s<>"'\u0000\u0001()（）.,;:!?、。])/g, (m, pre, u) => `${pre}${put(`<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`)}`);
   s = emph(s);
   for (let i = 0; i < 4 && /\u0000\d+\u0001/.test(s); i++) s = s.replace(/\u0000(\d+)\u0001/g, (_, n) => stash[+n]);
   return s;
@@ -402,7 +486,7 @@ const RE_LI = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
 const RE_TSEP = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
 const indentOf = (l) => l.match(/^\s*/)[0].length;
 
-function mdBlocks(lines) {
+function mdBlocks(lines, depth = 0) {
   const out = [];
   let i = 0;
   const startsBlock = (l, next) => RE_FENCE.test(l) || /^#{1,6}\s/.test(l) || RE_HR.test(l) || /^\s*>/.test(l) || RE_LI.test(l)
@@ -422,10 +506,10 @@ function mdBlocks(lines) {
     if (!line.trim()) { i++; continue; }
     if ((m = /^(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line))) { out.push(`<h${m[1].length}>${mdInline(m[2])}</h${m[1].length}>`); i++; continue; }
     if (RE_HR.test(line)) { out.push('<hr>'); i++; continue; }
-    if (/^\s*>/.test(line)) {
+    if (depth < MD_MAX_DEPTH && /^\s*>/.test(line)) {
       const buf = [];
       while (i < lines.length && /^\s*>/.test(lines[i])) buf.push(lines[i++].replace(/^\s*>\s?/, ''));
-      out.push(`<blockquote>${mdBlocks(buf).join('')}</blockquote>`);
+      out.push(`<blockquote>${mdBlocks(buf, depth + 1).join('')}</blockquote>`);
       continue;
     }
     if (line.includes('|') && i + 1 < lines.length && RE_TSEP.test(lines[i + 1]) && lines[i + 1].includes('-')) {
@@ -469,7 +553,8 @@ function mdBlocks(lines) {
         let subHtml = '';
         if (it.sub.length) {
           const min = Math.min(...it.sub.filter((x) => x.trim()).map(indentOf));
-          subHtml = mdBlocks(it.sub.map((x) => x.slice(min))).join('');
+          const sub = it.sub.map((x) => x.slice(min));
+          subHtml = depth < MD_MAX_DEPTH ? mdBlocks(sub, depth + 1).join('') : `<p>${esc(sub.join('\n'))}</p>`;
         }
         return `<li>${box}${mdInline(t)}${subHtml}</li>`;
       }).join('')}</${tag}>`);
@@ -635,30 +720,77 @@ function modelPanel({ value, onChange }) {
   return { el, search, get: () => ({ ...sel }) };
 }
 
-/** 3-stage permission switch + Plan toggle. `locked` shows an existing thread's values (the API cannot change them). */
-function permPanel({ mode, plan, locked = false, maxMode = 'full-access', planForced = false, onMode, onPlan, onNew }) {
+/**
+ * 3-stage permission switch + Plan toggle. onMode / onPlan may resolve to false to reject the change.
+ * confirmFull asks inline before switching to full access (used on existing threads).
+ */
+function permPanel({ mode, plan, maxMode = 'full-access', planForced = false, confirmFull = false, note, onMode, onPlan }) {
   const max = MODES.indexOf(maxMode);
+  let current = mode;
   const hint = h('p', { class: `perm-hint${mode === 'full-access' ? ' danger' : ''}`, text: MODE_HINT[mode] });
+  const confirmBox = h('div', { class: 'perm-confirm', role: 'alert', hidden: true });
+  const show = (v) => {
+    $$('button', seg).forEach((b) => { const on = b.dataset.v === v; b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on)); });
+    hint.textContent = MODE_HINT[v]; hint.classList.toggle('danger', v === 'full-access');
+  };
+  const apply = async (v) => {
+    const prev = current; current = v; show(v);
+    if (await onMode?.(v) === false) { current = prev; show(prev); }
+  };
   const seg = segmented(MODES.map((m) => [m, MODE_LABEL[m], MODE_HINT[m]]), mode, (v) => {
-    hint.textContent = MODE_HINT[v]; hint.classList.toggle('danger', v === 'full-access'); onMode?.(v);
-  }, { label: '実行権限', disabled: locked, cls: 'perm' });
-  if (!locked) $$('button', seg).forEach((b) => { b.disabled = MODES.indexOf(b.dataset.v) > max; });
-  const chk = h('input', { type: 'checkbox', checked: plan || planForced, disabled: locked || planForced, onchange: (e) => onPlan?.(e.target.checked) });
-  return h('div', { class: 'perm-panel' }, h('span', { class: 'mp-lab', text: '権限' }), seg, hint,
+    confirmBox.hidden = true;
+    if (confirmFull && v === 'full-access' && current !== v) {
+      show(current);
+      confirmBox.replaceChildren(h('span', { text: 'このスレッドをフルアクセスにしますか？ 承認なしですべて実行されます。' }),
+        h('div', { class: 'actions' },
+          h('button', { type: 'button', class: 'btn xs', text: 'キャンセル', onclick: () => { confirmBox.hidden = true; } }),
+          h('button', { type: 'button', class: 'btn xs warn', text: 'フルアクセスにする', onclick: () => { confirmBox.hidden = true; apply('full-access'); } })));
+      confirmBox.hidden = false;
+      popover?.place();
+      return;
+    }
+    apply(v);
+  }, { label: '実行権限', cls: 'perm' });
+  $$('button', seg).forEach((b) => { b.disabled = MODES.indexOf(b.dataset.v) > max; });
+  const chk = h('input', { type: 'checkbox', checked: plan || planForced, disabled: planForced, onchange: async (e) => { const box = e.target; if (await onPlan?.(box.checked) === false) box.checked = !box.checked; } });
+  return h('div', { class: 'perm-panel' }, h('span', { class: 'mp-lab', text: '権限' }), seg, hint, confirmBox,
     h('label', { class: 'switch plan-switch' }, chk, h('i'), h('span', {}, h('b', { text: 'Plan モード' }), h('small', { text: planForced ? '親が Plan のため子も Plan になります' : '変更せずに調査と計画だけを行います' }))),
-    locked ? h('p', { class: 'perm-lock' }, '権限と Plan はスレッド作成時に固定されます。',
-      onNew ? h('button', { type: 'button', class: 'link', text: '新規スレッドで変更', onclick: onNew }) : null) : null);
+    note ? h('p', { class: 'perm-note', text: note }) : null);
+}
+
+/** Changes permission / plan of an existing thread; resolves false when the server did not apply it. */
+async function patchPerm(id, change) {
+  const t = curThread()?.id === id ? curThread() : threadById(id);
+  if (!t) return false;
+  const body = { runtime_mode: t.runtime_mode, interaction_mode: t.interaction_mode, ...change };
+  try {
+    const r = await api(`/api/threads/${id}`, { method: 'PATCH', json: body });
+    if (r?.runtime_mode !== body.runtime_mode || r?.interaction_mode !== body.interaction_mode) {
+      toast('サーバーが権限の変更を反映しませんでした（サーバーの更新が必要です）', 'err', 6000);
+      return false;
+    }
+    const i = S.threads.findIndex((x) => x.id === id);
+    if (i >= 0) S.threads[i] = r;
+    if (S.detail?.thread?.id === id) S.detail.thread = r;
+    renderComposer();
+    toast('権限設定を変更しました', 'ok', 2000);
+    return true;
+  } catch (e) { toast(`権限の変更に失敗: ${e.message}`, 'err'); return false; }
 }
 
 function composerPerm() {
   const t = curThread();
+  if (!t) {
+    return permPanel({
+      mode: S.compose.mode, plan: S.compose.plan,
+      onMode: (v) => { S.compose.mode = v; renderComposer(); },
+      onPlan: (v) => { S.compose.plan = v; renderComposer(); },
+    });
+  }
   return permPanel({
-    mode: t ? t.runtime_mode : S.compose.mode,
-    plan: t ? t.interaction_mode === 'plan' : S.compose.plan,
-    locked: !!t,
-    onMode: (v) => { S.compose.mode = v; renderComposer(); },
-    onPlan: (v) => { S.compose.plan = v; renderComposer(); },
-    onNew: () => goHome(t?.project_id),
+    mode: t.runtime_mode, plan: t.interaction_mode === 'plan', confirmFull: true, note: '変更は次の実行から適用されます',
+    onMode: (v) => patchPerm(t.id, { runtime_mode: v }),
+    onPlan: (v) => patchPerm(t.id, { interaction_mode: v ? 'plan' : 'default' }),
   });
 }
 
@@ -709,10 +841,11 @@ function threadRow(t, { shelf = false, kids = [] } = {}) {
   const rel = t.parent_thread_id ? (REL_LABEL[t.relationship] || t.relationship || '子') : null;
   const status = STATUS_LABEL[t.status] || t.status;
 
-  const act = (ic, title, fn, on) => ibtn(ic, title, (e) => { e.stopPropagation(); fn(); }, `xs${on ? ' on' : ''}`);
+  const title = cleanTitle(t.title);
+  const act = (name, ic, label, fn, on) => { const b = ibtn(ic, label, (e) => { e.stopPropagation(); fn(); }, `xs${on ? ' on' : ''}`); b.dataset.act = name; return b; };
   const main = h('div', {
     class: 'trow-main', role: 'button', tabindex: 0,
-    title: `${t.title}\n${provLabel(t.model_selection?.provider)} / ${t.model_selection?.model} · ${status}${rel ? ` · ${rel}` : ''}`,
+    title: `${title}\n${provLabel(t.model_selection?.provider)} / ${t.model_selection?.model} · ${status}${rel ? ` · ${rel}` : ''}`,
     onclick: () => openThread(t.id),
     onkeydown: (e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) { e.preventDefault(); openThread(t.id); } },
   },
@@ -722,7 +855,7 @@ function threadRow(t, { shelf = false, kids = [] } = {}) {
   }, iconEl('chevron')) : null,
   shelf ? monogram(projectById(t.project_id), 'sm') : null,
   provDot(t.model_selection?.provider, `${t.status === 'running' ? 'live' : ''} s-${t.status}`),
-  h('span', { class: 'trow-title', text: t.title || '(無題)' }),
+  h('span', { class: 'trow-title', text: title }),
   t.pinned ? iconEl('pin', 'pinmark') : null,
   hasKids && collapsed ? h('span', { class: 'kidcount', title: `子スレッド ${kids.length} 件`, text: String(kids.length) }) : null,
   pend ? h('span', { class: 'flag warn', text: '承認待ち' })
@@ -731,8 +864,8 @@ function threadRow(t, { shelf = false, kids = [] } = {}) {
         : t.status === 'waiting-for-children' ? h('span', { class: 'flag', text: '子待ち' }) : null,
   h('span', { class: 'trow-time', text: fmtAgo(t.updated_at) }),
   h('span', { class: 'trow-actions' },
-    act('pin', t.pinned ? 'ピン留め解除' : 'ピン留め', () => patchThread(t.id, { pinned: !t.pinned }), t.pinned),
-    act('archive', t.archived ? 'アーカイブ解除' : 'アーカイブ', () => patchThread(t.id, { archived: !t.archived }), t.archived)));
+    act('pin', 'pin', t.pinned ? 'ピン留め解除' : 'ピン留め', () => patchThread(t.id, { pinned: !t.pinned }), t.pinned),
+    act('archive', 'archive', t.archived ? 'アーカイブ解除' : 'アーカイブ', () => patchThread(t.id, { archived: !t.archived }), t.archived)));
 
   return h('li', { class: `trow${t.id === S.threadId ? ' active' : ''}${t.archived ? ' archived' : ''}`, dataset: { id: t.id } },
     main, hasKids && !collapsed ? h('ul', { class: 'tkids' }, kids.map((k) => threadRow(k.t, { kids: k.kids }))) : null);
@@ -761,27 +894,90 @@ function projectGroup(p) {
     collapsed ? null : h('ul', { class: 'tlist' },
       shown.map((n) => threadRow(n.t, { kids: n.kids })),
       tree.length > shown.length || (all && tree.length > THREADS_PER_PROJECT) ? h('li', {}, h('button', {
-        type: 'button', class: 'more', text: all ? '折りたたむ' : `さらに ${tree.length - shown.length} 件を表示`,
+        type: 'button', class: 'more', dataset: { more: p.id }, text: all ? '折りたたむ' : `さらに ${tree.length - shown.length} 件を表示`,
         onclick: () => { all ? S.expandedProjects.delete(p.id) : S.expandedProjects.add(p.id); renderSidebar(); },
       })) : null));
+}
+
+/** Projects with threads, most recently active first; projects without threads separately. */
+function orderedProjects() {
+  const latest = new Map();
+  for (const t of S.threads) {
+    if (t.archived && !S.showArchived) continue;
+    const at = Date.parse(t.updated_at) || 0;
+    if (at >= (latest.get(t.project_id) ?? 0)) latest.set(t.project_id, at);
+  }
+  return {
+    active: S.projects.filter((p) => latest.has(p.id)).sort((a, b) => latest.get(b.id) - latest.get(a.id)),
+    empty: S.projects.filter((p) => !latest.has(p.id)),
+  };
+}
+const hasThreads = (projectId) => S.threads.some((t) => t.project_id === projectId && !t.archived);
+/** New threads default to the current project, unless it is empty: then to the most recently active one. */
+function preferActiveProject() {
+  const top = orderedProjects().active[0];
+  if (top && !hasThreads(S.projectId)) { S.projectId = top.id; ls.set('t3.project', top.id); }
+}
+
+function projectList() {
+  if (!S.projects.length) return [h('div', { class: 'empty-note', text: 'プロジェクトを追加すると、ここにスレッドが並びます' })];
+  const { active, empty } = orderedProjects();
+  if (!active.length) return empty.map(projectGroup);
+  const open = S.showEmpty;
+  return [
+    ...active.map(projectGroup),
+    empty.length ? h('button', {
+      type: 'button', class: 'empty-toggle', 'aria-expanded': String(open),
+      onclick: () => { S.showEmpty = !open; ls.set('t3.pempty', S.showEmpty ? '1' : '0'); renderSidebar(); },
+    }, iconEl('chevron', `pg-chev${open ? ' open' : ''}`), h('span', { text: `スレッドなし (${empty.length})` })) : null,
+    ...(open ? empty.map(projectGroup) : []),
+  ].filter(Boolean);
+}
+
+/** Remembers which sidebar control had focus so that a re-render does not drop keyboard users to <body>. */
+function sidebarFocus() {
+  const a = document.activeElement;
+  if (!a || !$('#sidebar .sb-scroll').contains(a)) return null;
+  const row = a.closest('.trow');
+  if (row) {
+    const box = a.closest('#shelf') ? '#shelf-list' : '#project-groups';
+    const main = `${box} .trow[data-id="${CSS.escape(row.dataset.id)}"] > .trow-main`;
+    return a.classList.contains('trow-main') ? main : a.classList.contains('caret') ? `${main} > .caret` : `${main} [data-act="${a.dataset.act}"]`;
+  }
+  if (a.classList.contains('more')) return `.more[data-more="${CSS.escape(a.dataset.more)}"]`;
+  if (a.classList.contains('empty-toggle')) return '.empty-toggle';
+  const g = a.closest('.pgroup');
+  return g ? `.pgroup[data-project="${CSS.escape(g.dataset.project)}"] ${a.classList.contains('pg-add') ? '.pg-add' : '.pg-toggle'}` : null;
+}
+
+/** Unfolds whatever hides the open thread and scrolls its row into view. */
+function revealActiveRow() {
+  const t = curThread();
+  if (!t || (isNarrow() && $('#app').dataset.drawer !== 'open')) return;
+  S.collapsedProjects.delete(t.project_id);
+  for (let p = threadById(t.parent_thread_id), n = 0; p && n < 20; p = threadById(p.parent_thread_id), n++) S.kidsOpen.delete(p.id);
+  renderSidebar();
+  const activeRow = $('#project-groups .trow.active > .trow-main') || $('#shelf-list .trow.active > .trow-main');
+  activeRow?.scrollIntoView({ block: 'nearest' });
 }
 
 let sidebarSig = '';
 function renderSidebar() {
   // skip DOM churn (and hover flicker) when nothing visible changed
-  const sig = JSON.stringify([Math.floor(Date.now() / 60000), S.threadId, S.projectId, S.showArchived, S.showKids, [...S.kidsOpen], [...S.collapsedProjects], [...S.expandedProjects],
+  const sig = JSON.stringify([Math.floor(Date.now() / 60000), S.threadId, S.projectId, S.showArchived, S.showKids, S.showEmpty, [...S.kidsOpen], [...S.collapsedProjects], [...S.expandedProjects],
     [...S.pending].map(([k, v]) => [k, v.length]), S.projects.map((p) => [p.id, p.title]),
     S.threads.map((t) => [t.id, t.title, t.status, t.pinned, t.archived, t.updated_at, t.project_id, t.parent_thread_id, t.model_selection?.provider])]);
   const shelf = S.threads.filter((t) => !t.archived && (isBusy(t.status) && t.status !== 'waiting-for-children' || (S.pending.get(t.id) || []).length));
-  document.title = `${[...S.pending.values()].some((a) => a.length) ? '⚠ ' : shelf.length ? `● ${shelf.length} ` : ''}${curThread() ? `${curThread().title} — ` : ''}t3code-rs`;
+  document.title = `${[...S.pending.values()].some((a) => a.length) ? '⚠ ' : shelf.length ? `● ${shelf.length} ` : ''}${curThread() ? `${cleanTitle(curThread().title)} — ` : ''}t3code-rs`;
   if (sig === sidebarSig) return;
   sidebarSig = sig;
+  const focus = sidebarFocus();
   shelf.sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
   $('#shelf').hidden = !shelf.length;
   $('#shelf-count').textContent = String(shelf.length);
   $('#shelf-list').replaceChildren(...shelf.map((t) => threadRow(t, { shelf: true })));
-  $('#project-groups').replaceChildren(...(S.projects.length ? S.projects.map(projectGroup)
-    : [h('div', { class: 'empty-note', text: 'プロジェクトを追加すると、ここにスレッドが並びます' })]));
+  $('#project-groups').replaceChildren(...projectList());
+  if (focus) $(`#sidebar ${focus}`)?.focus({ preventScroll: true });
 }
 const renderSidebarSoon = rafThrottle(renderSidebar);
 
@@ -840,14 +1036,15 @@ function setHash(hash) {
 function goHome(projectId) {
   closePopover(); closeDrawer();
   stashDraft();
+  if (S.threadId) clearBlobCache();
   S.threadId = null; S.detail = null; S.diffStat = null;
-  if (projectId && projectById(projectId)) { S.projectId = projectId; ls.set('t3.project', projectId); }
+  if (projectId && projectById(projectId)) { S.projectId = projectId; ls.set('t3.project', projectId); } else preferActiveProject();
   S.compose = { sel: defaultSelection(S.projectId), mode: 'approval-required', plan: false, isolation: 'shared', baseRef: '' };
   setHash('');
   restoreDraft();
   syncSubscriptions();
   renderAll();
-  if (S.diffOpen) loadDiff();
+  if (S.rail === 'diff') loadDiff();
   if (!isCoarse()) ta().focus();
 }
 
@@ -859,19 +1056,46 @@ async function openThread(id, { push = true } = {}) {
     stashDraft();
     S.threadId = id;
     S.detail = null; S.diffStat = null;
+    clearBlobCache();
     restoreDraft();
     $('#main').dataset.view = 'thread';
     tl().replaceChildren(h('div', { class: 'loading', text: '読み込み中…' }));
-    renderHeader(); renderApprovals();
+    renderHeader(); renderApprovals(); renderSwarm();
   }
   S.stick = true;
   syncSubscriptions();
+  loadSwarm(id);
   await loadDetail(id, { reset: true });
+  if (id === S.threadId) revealActiveRow();
+}
+
+const PAGE_SIZE = 150;
+/** Accepts both the paginated { items, has_more, total_items } reply and a legacy full { items } one. */
+function normalizeDetail(d) {
+  d.items = [...(d.items || [])].sort((a, b) => a.ordinal - b.ordinal);
+  d.has_more = d.has_more === true;
+  d.total_items = Number(d.total_items) || d.items.length;
+  d.attachments ||= [];
+  return d;
+}
+const mergeById = (a, b) => [...new Map([...a, ...b].map((x) => [x.id, x])).values()];
+/** Keeps already loaded older pages across a refresh, provided the new window still touches them. */
+function keepOlderPages(d, prev) {
+  if (!d.has_more || prev?.thread?.id !== d.thread.id || !prev.items.length || !d.items.length) return d;
+  const fresh = new Set(d.items.map((x) => x.id));
+  if (!prev.items.some((x) => fresh.has(x.id))) return d;
+  const first = d.items[0].ordinal;
+  const older = prev.items.filter((x) => x.ordinal < first && !fresh.has(x.id));
+  if (!older.length) return d;
+  d.items = [...older, ...d.items];
+  d.has_more = prev.has_more;
+  d.attachments = mergeById(prev.attachments, d.attachments);
+  return d;
 }
 
 async function loadDetail(id, { reset = false } = {}) {
   let d;
-  try { d = await api(`/api/threads/${id}`); } catch (e) {
+  try { d = normalizeDetail(await api(`/api/threads/${id}?limit=${PAGE_SIZE}`)); } catch (e) {
     if (id === S.threadId) {
       toast(`スレッドを読み込めません: ${e.message}`, 'err');
       if (e.status === 404) goHome();
@@ -880,7 +1104,7 @@ async function loadDetail(id, { reset = false } = {}) {
     return;
   }
   if (id !== S.threadId) return;
-  S.detail = d;
+  S.detail = keepOlderPages(d, S.detail);
   pruneOptimistic(d);
   S.projectId = d.thread.project_id; ls.set('t3.project', S.projectId);
   const i = S.threads.findIndex((t) => t.id === id);
@@ -889,9 +1113,38 @@ async function loadDetail(id, { reset = false } = {}) {
   renderAll();
   if (reset) {
     scrollBottom(true);
-    if (S.diffOpen) loadDiff(); else refreshDiffStat();
+    if (S.rail === 'diff') loadDiff(); else refreshDiffStat();
   }
 }
+
+/** Prepends the previous page and keeps the reader's place. Resolves true when something was added. */
+async function loadOlder(limit = PAGE_SIZE) {
+  const d = S.detail;
+  if (!d?.has_more || S.loadingOlder === d.thread.id || !d.items.length) return false;
+  const id = d.thread.id;
+  S.loadingOlder = id;
+  const btn = $('#load-older');
+  if (btn) { btn.disabled = true; btn.textContent = '読み込み中…'; }
+  try {
+    const r = await api(`/api/threads/${id}?before_ordinal=${d.items[0].ordinal}&limit=${limit}`);
+    if (S.detail?.thread?.id !== id) return false;
+    const cur = S.detail;
+    const first = cur.items[0].ordinal;
+    const older = (r.items || []).filter((x) => x.ordinal < first).sort((a, b) => a.ordinal - b.ordinal);
+    cur.items = [...older, ...cur.items];
+    cur.has_more = r.has_more === true && older.length > 0;
+    cur.attachments = mergeById(cur.attachments, r.attachments || []);
+    S.loadingOlder = null;
+    renderKeepingAnchor();
+    return older.length > 0;
+  } catch (e) {
+    toast(`以前の履歴を読み込めません: ${e.message}`, 'err');
+    S.loadingOlder = null;
+    if (S.detail?.thread?.id === id) renderKeepingAnchor();
+    return false;
+  } finally { if (S.loadingOlder === id) S.loadingOlder = null; }
+}
+
 function pruneOptimistic(d) {
   const users = d.items.filter((x) => x.kind === 'user_message');
   S.optimistic = S.optimistic.filter((o) => {
@@ -911,6 +1164,7 @@ function renderAll() {
   renderApprovals();
   renderComposer();
   renderStatPill();
+  renderSwarm();
 }
 
 // ───────────────────────── topbar ─────────────────────────
@@ -919,7 +1173,11 @@ const latestRun = () => { const r = S.detail?.runs || []; return r.length ? r[r.
 function renderHeader() {
   const t = curThread();
   const box = $('#tb-title');
-  const cb = $('#children-bar');
+  const kidsBtn = $('#btn-children');
+  const kids = (t && S.detail?.children) || [];
+  kidsBtn.hidden = !kids.length;
+  $('.n', kidsBtn).textContent = String(kids.length);
+  kidsBtn.setAttribute('aria-label', `子スレッド ${kids.length} 件`);
   $$('.thread-only').forEach((b) => { b.hidden = !S.threadId; b.disabled = !t; });
   renderDiffBadge();
   if (box.querySelector('input.title-edit') && box.dataset.id === t?.id) return; // don't clobber an inline rename
@@ -928,23 +1186,26 @@ function renderHeader() {
   const badge = project ? h('span', { class: 'proj-pill', title: project.workspace_root }, monogram(project, 'sm'), h('span', { text: project.title })) : null;
   if (!t) {
     box.replaceChildren(...[h('span', { class: 'tb-draft', text: S.threadId ? '' : '新規スレッド' }), S.threadId ? null : badge].filter(Boolean));
-    cb.hidden = true; return;
+    return;
   }
   const parent = t.parent_thread_id ? threadById(t.parent_thread_id) : null;
   box.replaceChildren(...[
     t.parent_thread_id ? h('button', { class: 'crumb', type: 'button', title: '親スレッドを開く', onclick: () => openThread(t.parent_thread_id) },
-      h('span', { text: clip(parent?.title || t.parent_thread_id.slice(0, 8), 20) }), h('span', { class: 'sep', text: '/' })) : null,
-    h('button', { type: 'button', id: 'thread-title', class: 'title-btn', title: 'クリックして名前を変更', text: t.title || '(無題)', onclick: renameInline }),
+      h('span', { text: clip(parent ? cleanTitle(parent.title) : t.parent_thread_id.slice(0, 8), 20) }), h('span', { class: 'sep', text: '/' })) : null,
+    h('button', { type: 'button', id: 'thread-title', class: 'title-btn', title: 'クリックして名前を変更', text: cleanTitle(t.title), onclick: renameInline }),
     badge,
     t.branch ? h('span', { class: 'branch-pill', title: t.worktree_path ? `worktree: ${t.worktree_path}` : 'ブランチ' }, iconEl('fork'), h('span', { text: t.branch }), t.worktree_path ? h('em', { text: 'worktree' }) : null) : null,
     ['idle', 'completed'].includes(t.status) ? null : h('span', { class: `status-pill s-${t.status}`, text: STATUS_LABEL[t.status] || t.status }),
   ].filter(Boolean));
+}
 
-  const kids = S.detail.children || [];
-  cb.hidden = !kids.length;
-  cb.replaceChildren(h('span', { class: 'muted', text: `子スレッド ${kids.length}` }),
-    ...kids.map((k) => h('button', { class: 'child-chip', type: 'button', title: `${k.title} — ${STATUS_LABEL[k.status] || k.status}`, dataset: { child: k.id }, onclick: () => openThread(k.id) },
-      provDot(k.model_selection?.provider, `${k.status === 'running' ? 'live' : ''} s-${k.status}`), h('span', { text: clip(k.title, 28) }))));
+function childrenMenu(anchor) {
+  const kids = S.detail?.children || [];
+  if (!kids.length) return;
+  openPopover(anchor, h('div', { class: 'menu kids-list', role: 'menu', 'aria-label': '子スレッド' }, [...kids].sort(threadCmp).map((k) => h('button', {
+    type: 'button', role: 'menuitem', class: 'menu-item kid-item', title: cleanTitle(k.title), dataset: { child: k.id },
+    onclick: () => openThread(k.id),
+  }, provDot(k.model_selection?.provider, `${k.status === 'running' ? 'live' : ''} s-${k.status}`), h('span', { class: 't', text: cleanTitle(k.title) }), h('small', { text: STATUS_LABEL[k.status] || k.status })))), { cls: 'kids-pop', below: true });
 }
 
 function renameInline() {
@@ -979,7 +1240,7 @@ function renderHero() {
     h('h1', { text: '何を作りますか？' }),
     h('p', { class: 'hero-sub' }, project ? [h('b', { text: project.title }), h('span', { class: 'path', text: project.workspace_root })] : 'まずプロジェクト（作業ディレクトリ）を追加してください'),
     h('div', { class: 'proj-chips', role: 'radiogroup', 'aria-label': 'プロジェクト' },
-      S.projects.map((p) => h('button', {
+      Object.values(orderedProjects()).flat().map((p) => h('button', {
         type: 'button', role: 'radio', class: `proj-chip${p.id === S.projectId ? ' on' : ''}`, 'aria-checked': String(p.id === S.projectId), title: p.workspace_root, dataset: { project: p.id },
         onclick: () => {
           S.projectId = p.id; ls.set('t3.project', p.id);
@@ -994,6 +1255,8 @@ function renderHero() {
     h('div', { class: 'iso-row' }, h('span', { class: 'muted', text: '作業ツリー' }),
       segmented([['shared', '共有', '現在の作業ディレクトリをそのまま使う'], ['worktree', 'git worktree', '別ブランチの作業ツリーを作る']], S.compose.isolation,
         (v) => { S.compose.isolation = v; base.hidden = v !== 'worktree'; }, { label: '作業ツリー', cls: 'mini' }), base),
+    h('button', { type: 'button', class: 'swarm-cta', id: 'btn-swarm-cta', title: '入力欄の先頭に /swarm を挿入', onclick: insertSwarmCommand },
+      iconEl('swarm'), h('code', { text: '/swarm' }), h('span', { text: 'で複数エージェントの協調を始める' })),
     h('div', { id: 'hero-recent' }));
   renderHeroRecent();
 }
@@ -1002,8 +1265,8 @@ function renderHeroRecent() {
   if (!box) return;
   const recent = S.threads.filter((t) => !t.archived).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)).slice(0, 4);
   box.replaceChildren(...[
-    recent.length ? h('div', { class: 'recent' }, h('span', { class: 'recent-lab', text: '最近のスレッド' }), recent.map((t) => h('button', { type: 'button', class: 'recent-chip', title: t.title, onclick: () => openThread(t.id) },
-      provDot(t.model_selection?.provider, `s-${t.status}`), h('span', { class: 't', text: t.title || '(無題)' }), h('small', { text: fmtAgo(t.updated_at) })))) : null,
+    recent.length ? h('div', { class: 'recent' }, h('span', { class: 'recent-lab', text: '最近のスレッド' }), recent.map((t) => h('button', { type: 'button', class: 'recent-chip', title: cleanTitle(t.title), onclick: () => openThread(t.id) },
+      provDot(t.model_selection?.provider, `s-${t.status}`), h('span', { class: 't', text: cleanTitle(t.title) }), h('small', { text: fmtAgo(t.updated_at) })))) : null,
     h('div', { class: 'hero-keys' }, [['K', '検索'], ['N', '新規'], ['B', 'サイドバー'], ['D', '差分'], ['U', '使用量']].map(([k, l]) => h('span', {}, h('kbd', { text: kbd(k) }), l))),
   ].filter(Boolean));
 }
@@ -1060,6 +1323,10 @@ function kindLetter(k) {
 
 // ── compact task step cards ──
 const STEP_KINDS = new Set(['tool_call', 'tool_result', 'command_execution', 'file_change', 'subagent', 'handoff']);
+const SEARCH_NOTICES = new Set(['file_search', 'web_search']);
+const noticeType = (it) => (it.kind === 'system_notice' ? it.payload?.type || '' : '');
+const isStep = (it) => STEP_KINDS.has(it.kind) || SEARCH_NOTICES.has(noticeType(it));
+const isErrorNotice = (p) => p?.status === 'failed' || p?.level === 'error' || p?.is_error === true;
 const TOOL_VERBS = [
   [/^(bash|shell|exec|exec_command|run_command|run_shell_command|command|local_shell)$/i, 'コマンド実行', 'terminal'],
   [/^(read|read_file|view|view_file|cat)$/i, 'ファイル読込', 'file'],
@@ -1068,6 +1335,7 @@ const TOOL_VERBS = [
   [/^(web_?search|web_?fetch|google_web_search|fetch|read_url)$/i, 'Web 参照', 'globe'],
   [/^(task|agent|subagent|delegate_task|mcp__.*delegate_task)$/i, 'サブエージェント', 'bot'],
 ];
+const DRIVER_PROVIDER = { claudeAgent: 'claude', codex: 'codex', antigravity: 'antigravity', opencode: 'open-code' };
 const callIdOf = (p) => p?.tool_use_id || p?.callID || p?.call_id || p?.id || null;
 const resultText = (p) => textOf(p?.output ?? p?.content ?? p?.result ?? p?.state?.output ?? p?.state?.error ?? p?.error ?? p?.text ?? p);
 const isErrorResult = (p) => !!(p?.is_error || p?.error || p?.state?.status === 'error' || p?.status === 'failed');
@@ -1079,15 +1347,25 @@ function pre(text, max = 40000) {
   el.append(ibtn('copy', 'コピー', () => copyText(s), 'xs ocopy'));
   return el;
 }
+/** Output block that starts as a preview when the text is huge. */
+function outputBlock(text) {
+  const s = String(text ?? '');
+  const lines = s.split('\n');
+  if (s.length <= 3000 && lines.length <= 40) return pre(s);
+  const preview = lines.slice(0, 40).join('\n').slice(0, 3000);
+  const box = h('div', { class: 'out-trunc' }, pre(`${preview}\n…`));
+  box.append(h('button', { type: 'button', class: 'btn xs out-more', text: `すべて表示（${fmtNum(s.length)} 文字・${fmtNum(lines.length)} 行）`, onclick: () => box.replaceChildren(pre(s, 200000)) }));
+  return box;
+}
 const section = (label, node) => h('div', { class: 's-sec' }, h('div', { class: 's-lab', text: label }), node);
 
 /** One single-line expandable row. The body is built lazily on first expand (outputs can be huge). */
-function stepRow({ item, icon, verb, target, badges = [], sections = [], cls = '', trailing }) {
+function stepRow({ item, icon, verb, target, targetTitle, badges = [], sections = [], cls = '', trailing }) {
   const body = h('div', { class: 's-body' });
   const bytes = h('span', { class: 'sbytes' });
   const badgeBox = h('span', { class: 's-badges' }, badges, bytes);
   const el = h('details', { class: `step ${cls}`, dataset: { item: item.id } },
-    h('summary', {}, iconEl(icon, 's-ic'), h('span', { class: 's-verb', text: verb }), h('span', { class: 's-target', text: target, title: target }), badgeBox, trailing, iconEl('chevron', 's-chev')),
+    h('summary', {}, iconEl(icon, 's-ic'), h('span', { class: 's-verb', text: verb }), h('span', { class: 's-target', text: target, title: targetTitle || target }), badgeBox, trailing, iconEl('chevron', 's-chev')),
     body);
   const queue = [...sections];
   const flush = () => { if (el.open) while (queue.length) body.append(queue.shift()()); };
@@ -1108,10 +1386,91 @@ function stepRow({ item, icon, verb, target, badges = [], sections = [], cls = '
   return el;
 }
 
+// ── file changes ──
+const compactPath = (p) => { const parts = String(p).split('/').filter(Boolean); return parts.length > 2 ? `…/${parts.slice(-2).join('/')}` : String(p); };
+/** Splits a unified diff that may cover several files. */
+function splitDiff(diff) {
+  const lines = String(diff || '').split('\n');
+  const parts = [];
+  let cur = null;
+  lines.forEach((l, i) => {
+    const git = l.startsWith('diff --git ');
+    const pair = l.startsWith('--- ') && lines[i + 1]?.startsWith('+++ ') && lines[i + 2]?.startsWith('@@');
+    if (!cur || git || (pair && cur.hunk)) { cur = { lines: [], hunk: false, path: '', old: '' }; parts.push(cur); }
+    if (!cur.hunk && l.startsWith('--- ')) cur.old = l.slice(4).split('\t')[0].replace(/^a\//, '');
+    if (!cur.hunk && l.startsWith('+++ ')) cur.path = l.slice(4).split('\t')[0].replace(/^b\//, '');
+    if (l.startsWith('@@')) cur.hunk = true;
+    cur.lines.push(l);
+  });
+  return parts.map((x) => ({ patch: x.lines.join('\n'), path: x.path && x.path !== '/dev/null' ? x.path : x.old, added: x.old === '/dev/null', deleted: x.path === '/dev/null' }))
+    .filter((x) => x.patch.trim());
+}
+function countPatch(patch) {
+  let add = 0; let del = 0;
+  const lines = String(patch || '').split('\n');
+  let inHunk = !lines.some((l) => l.startsWith('@@'));
+  for (const l of lines) {
+    if (l.startsWith('@@')) inHunk = true;
+    else if (l.startsWith('diff ')) inHunk = false;
+    else if (inHunk && l.startsWith('+') && !l.startsWith('+++ ')) add += 1;
+    else if (inHunk && l.startsWith('-') && !l.startsWith('--- ')) del += 1;
+  }
+  return { add, del };
+}
+/** One entry per changed file, with its inline patch and line counts when the payload carries them. */
+function changedFiles(p) {
+  const files = fileEntries(p).map((f) => ({ ...f, patch: typeof f.diff === 'string' ? f.diff : typeof f.patch === 'string' ? f.patch : '' }));
+  if (typeof p?.diff === 'string' && p.diff && !files.some((f) => f.patch)) {
+    const parts = splitDiff(p.diff);
+    if (parts.length === 1 && files.length <= 1) {
+      if (files.length) Object.assign(files[0], { patch: parts[0].patch, added: parts[0].added, deleted: parts[0].deleted });
+      else files.push({ ...parts[0], path: parts[0].path || p.path || '(不明なファイル)' });
+    } else {
+      for (const part of parts) {
+        const hit = files.find((f) => !f.patch && part.path && (f.path === part.path || f.path.endsWith(`/${part.path}`)));
+        if (hit) Object.assign(hit, { patch: part.patch, added: part.added, deleted: part.deleted });
+        else files.push({ ...part, path: part.path || p.path || '(不明なファイル)' });
+      }
+    }
+  }
+  return files.map((f) => {
+    const n = f.patch ? countPatch(f.patch) : null;
+    const created = f.added === true || /^--- \/dev\/null/m.test(f.patch);
+    const removed = f.deleted === true || /^\+\+\+ \/dev\/null/m.test(f.patch);
+    return { ...f, add: n ? n.add : Number(f.additions ?? f.added_lines) || 0, del: n ? n.del : Number(f.deletions ?? f.removed_lines) || 0,
+      letter: kindLetter(f.kind ?? f.status ?? f.change_type ?? (created ? 'A' : removed ? 'D' : f.operation)) };
+  });
+}
+const lineBadges = (add, del) => [add ? badge(`+${add}`, 'plus') : null, del ? badge(`−${del}`, 'minus') : null].filter(Boolean);
+function fileBlock(f, open) {
+  if (!f.patch) {
+    return h('button', { class: 'fchip', type: 'button', title: `${f.path}\nGit 差分を開く`, onclick: () => setRail('diff') },
+      h('span', { class: `fk ${f.letter}`, text: f.letter }), h('span', { class: 'p', text: compactPath(f.path) }), lineBadges(f.add, f.del));
+  }
+  const d = h('details', { class: 'finline', open },
+    h('summary', {}, iconEl('chevron', 's-chev'), h('span', { class: `fk ${f.letter}`, text: f.letter }), h('span', { class: 'p', title: f.path, text: compactPath(f.path) }),
+      lineBadges(f.add, f.del), ibtn('copy', 'パスをコピー', (e) => { e.preventDefault(); e.stopPropagation(); copyText(f.path, 'パスをコピーしました'); }, 'xs')));
+  let drawn = false;
+  const draw = () => { if (d.open && !drawn) { drawn = true; d.append(patchLines(f.patch, 400)); } };
+  d.addEventListener('toggle', draw);
+  draw();
+  return d;
+}
+
 function buildStep(item) {
   const p = item.payload;
   const sum = item.summary || '';
-  switch (item.kind) {
+  switch (SEARCH_NOTICES.has(noticeType(item)) ? 'search' : item.kind) {
+    case 'search': {
+      const patterns = [...new Set([p.pattern, ...(Array.isArray(p.patterns) ? p.patterns : []), p.query].filter((x) => typeof x === 'string' && x))];
+      const web = p.type === 'web_search';
+      const target = patterns.join(' · ') || p.title || sum || '検索';
+      return stepRow({
+        item, icon: web ? 'globe' : 'search', verb: web ? 'Web 検索' : 'ファイル検索', target: oneLine(target, 220),
+        badges: isErrorNotice(p) ? [badge('エラー', 'bad')] : [], cls: isErrorNotice(p) ? 'search bad' : 'search',
+        sections: [() => section('検索語', pre(patterns.join('\n') || target))],
+      });
+    }
     case 'tool_call': {
       const name = pstr(p, 'name', 'tool', 'tool_name', 'title') || (p?.type === 'web_search' ? 'web_search' : '') || sum || 'tool';
       const args = p?.input ?? p?.arguments ?? p?.args ?? p?.params ?? p?.state?.input ?? p;
@@ -1121,15 +1480,20 @@ function buildStep(item) {
       const specific = verb !== 'ツール呼び出し';
       const label = p?.server ? `${p.server} · ${name}` : name;
       const target = oneLine(textOf(found) || sum, 220);
-      return stepRow({
+      const out = textOf(p?.output ?? p?.state?.output);
+      const bad = isErrorResult(p);
+      const row = stepRow({
         item, icon, verb, target: specific ? target || label : [label, target && target !== label ? target : ''].filter(Boolean).join('  '),
-        cls: 'tool', sections: [() => section(`入力 · ${label}`, pre(pretty(args)))],
+        cls: bad ? 'tool bad' : 'tool', badges: bad ? [badge('エラー', 'bad')] : [],
+        sections: [() => section(`入力 · ${label}`, pre(pretty(args))), ...(out ? [() => section('出力', outputBlock(out))] : [])],
       });
+      row.output = out;
+      return row;
     }
     case 'tool_result': {
       const out = resultText(p) || sum;
       const bad = isErrorResult(p);
-      return stepRow({ item, icon: bad ? 'alert' : 'check', verb: 'ツール結果', target: oneLine(out, 220), badges: bad ? [badge('エラー', 'bad')] : [], cls: bad ? 'tool bad' : 'tool', sections: [() => section('出力', pre(out))] });
+      return stepRow({ item, icon: bad ? 'alert' : 'check', verb: 'ツール結果', target: oneLine(out, 220), badges: bad ? [badge('エラー', 'bad')] : [], cls: bad ? 'tool bad' : 'tool', sections: [() => section('出力', outputBlock(out))] });
     }
     case 'command_execution': {
       const cmd = pstr(p, 'command', 'cmd', 'title') || (Array.isArray(p?.command) ? p.command.join(' ') : '') || sum || pstr(p, 'step_type');
@@ -1139,41 +1503,45 @@ function buildStep(item) {
       return stepRow({
         item, icon: 'terminal', verb: 'コマンド実行', target: oneLine(cmd, 260), cls: bad ? 'cmd bad' : 'cmd',
         badges: code == null ? [] : [badge(`exit ${code}`, bad ? 'bad' : 'good')],
-        sections: [() => section('コマンド', pre(cmd)), () => section('出力', out ? pre(out) : h('div', { class: 'muted', text: '出力はありません' }))],
+        sections: [() => section('コマンド', pre(cmd)), () => section('出力', out ? outputBlock(out) : h('div', { class: 'muted', text: '出力はありません' }))],
       });
     }
     case 'file_change': {
-      const files = fileEntries(p);
-      const total = (...k) => files.reduce((a, f) => a + (Number(f[k[0]] ?? f[k[1]]) || 0), 0);
-      const add = total('additions', 'added'); const del = total('deletions', 'removed');
-      const target = files.length ? `${files[0].path}${files.length > 1 ? ` 他 ${files.length - 1} 件` : ''}` : oneLine(sum || pstr(p, 'step_type'), 220);
+      const files = changedFiles(p);
+      const add = files.reduce((a, f) => a + f.add, 0); const del = files.reduce((a, f) => a + f.del, 0);
+      const target = files.length ? `${compactPath(files[0].path)}${files.length > 1 ? ` 他 ${files.length - 1} 件` : ''}` : oneLine(sum || pstr(p, 'step_type') || 'ファイル', 220);
       return stepRow({
-        item, icon: 'filePen', verb: 'ファイル変更', target, cls: 'fchg',
-        badges: [add ? badge(`+${add}`, 'plus') : null, del ? badge(`−${del}`, 'minus') : null].filter(Boolean),
-        sections: [() => (files.length ? h('div', { class: 'files' }, files.slice(0, 80).map((f) => {
-          const L = kindLetter(f.kind ?? f.status ?? f.change_type);
-          return h('button', { class: 'fchip', type: 'button', title: 'Git 差分を開く', onclick: () => setDiffOpen(true) },
-            h('span', { class: `fk ${L}`, text: L }), h('span', { class: 'p', text: f.path }));
-        })) : section('詳細', pre(pretty(p))))],
+        item, icon: 'filePen', verb: 'ファイル変更', target, targetTitle: files.map((f) => f.path).join('\n'), cls: 'fchg',
+        badges: lineBadges(add, del),
+        sections: [() => (files.length ? h('div', { class: 'files' }, files.slice(0, 80).map((f) => fileBlock(f, files.length <= 3)))
+          : h('div', { class: 'muted', text: '変更内容の詳細はありません' }))],
       });
     }
     case 'subagent': {
-      const cid = pstr(p, 'child_thread_id', 'thread_id', 'id');
-      const child = cid && threadById(cid);
+      const cid = resolveThreadId(pstr(p, 'child_thread_id', 'childThreadId') || pstr(p, 'thread_id'));
+      const child = cid ? threadById(cid) : null;
       const st = child?.status || pstr(p, 'status') || 'idle';
-      const title = child?.title || pstr(p, 'title', 'name', 'task') || sum || 'サブエージェント';
-      const sel = child?.model_selection || (p?.provider ? { provider: p.provider, model: p.model } : null);
+      const title = cleanTitle(child?.title || pstr(p, 'title', 'name', 'task') || sum || 'サブエージェント');
+      const provider = DRIVER_PROVIDER[p?.driver] || p?.provider;
+      const sel = child?.model_selection || (provider ? { provider, model: p.model } : null);
+      const prompt = pstr(p, 'prompt', 'task');
+      const result = typeof p?.result === 'string' ? p.result : pstr(p?.result, 'text', 'summary', 'content', 'message') || (Array.isArray(p?.result) ? textOf(p.result) : '');
+      const progress = pstr(p, 'progress');
       const row = stepRow({
         item, icon: 'bot', verb: 'サブエージェント', target: title, cls: 'sub',
         badges: [sel ? h('span', { class: 'sbadge prov' }, provDot(sel.provider), provLabel(sel.provider)) : null, h('span', { class: `sbadge sub-status s-${st}`, text: STATUS_LABEL[st] || st })].filter(Boolean),
-        trailing: child || /^[0-9a-f-]{36}$/i.test(cid) ? h('button', { class: 'btn xs', type: 'button', text: '開く', onclick: (e) => { e.preventDefault(); openThread(cid); } }) : null,
-        sections: [() => section('詳細', pre(pretty(p)))],
+        trailing: cid ? h('button', { class: 'btn xs open-child', type: 'button', text: 'スレッドを開く →', onclick: (e) => { e.preventDefault(); openThread(cid); } }) : null,
+        sections: [
+          ...(prompt ? [() => h('details', { class: 'sub-prompt' }, h('summary', {}, iconEl('chevron', 's-chev'), h('span', { text: '指示内容（プロンプト）' }), h('small', { text: `${fmtNum(prompt.length)}文字` })), pre(prompt))] : []),
+          ...(progress && !result ? [() => section('進捗', h('div', { class: 'muted', text: progress }))] : []),
+          () => section('結果', result ? mdEl(result, 'md sub-result') : h('div', { class: 'muted', text: 'まだ結果はありません' })),
+        ],
       });
       row.dataset.child = cid;
       return row;
     }
     case 'handoff': {
-      const text = pstr(p, 'summary', 'text', 'content') || sum || textOf(p);
+      const text = pstr(p, 'summary', 'text', 'content') || sum || 'コンテキストを引き継ぎました';
       return stepRow({ item, icon: 'handoff', verb: 'コンテキスト引き継ぎ', target: oneLine(text, 160), cls: 'handoff', sections: [() => mdEl(text)] });
     }
     default:
@@ -1185,7 +1553,7 @@ const callRows = new Map(); // `${run}:${callId}` -> tool_call row, so results f
 
 /** Appends an item to `container` (before `before`), grouping consecutive steps into one stack. */
 function appendItem(item, container, before = null) {
-  if (!STEP_KINDS.has(item.kind)) { container.insertBefore(renderMessage(item), before); return; }
+  if (!isStep(item)) { const el = renderMessage(item); if (el) container.insertBefore(el, before); return; }
   const cid = callIdOf(item.payload);
   const key = cid ? `${item.run_id}:${cid}` : null;
   if (item.kind === 'tool_result' && key && callRows.has(key)) {
@@ -1195,7 +1563,7 @@ function appendItem(item, container, before = null) {
     row.dataset.also = item.id;
     if (isErrorResult(item.payload)) { row.classList.add('bad'); row.addBadge(badge('エラー', 'bad')); }
     row.addBytes(item);
-    row.addSection(() => section('出力', pre(out)));
+    if (out !== row.output) row.addSection(() => section('出力', outputBlock(out)));
     return;
   }
   let group = before ? before.previousElementSibling : container.lastElementChild;
@@ -1217,8 +1585,136 @@ const STEPS_VISIBLE = 8;
 function labelSteps(g) {
   const n = g.childElementCount - 1;
   const btn = g.firstElementChild;
-  btn.hidden = n <= STEPS_VISIBLE;
+  btn.hidden = n <= STEPS_VISIBLE || !!g.closest('.work-fold');
   btn.textContent = g.classList.contains('expanded') ? '以前のステップを隠す' : `以前の ${n - STEPS_VISIBLE} ステップを表示`;
+}
+
+// ── "worked for X" fold of a finished run ──
+const foldIndex = new Map(); // item id -> work fold that contains it
+let keepOpen = new Set();    // item ids whose <details> the reader had open before a re-render
+const FOLD_COUNTS = [
+  ['コマンド', (it) => it.kind === 'command_execution'],
+  ['ツール', (it) => it.kind === 'tool_call'],
+  ['編集', (it) => it.kind === 'file_change'],
+  ['検索', (it) => SEARCH_NOTICES.has(noticeType(it))],
+  ['サブエージェント', (it) => it.kind === 'subagent'],
+  ['思考', (it) => it.kind === 'reasoning'],
+  ['途中経過', (it) => it.kind === 'assistant_message'],
+  ['通知', (it) => noticeType(it) === 'notification'],
+];
+function foldLabel(items, durationMs) {
+  const counts = FOLD_COUNTS.map(([label, test]) => [label, items.filter(test).length]).filter(([, n]) => n > 0);
+  const parts = counts.map(([label, n]) => `${label} ${fmtNum(n)}`);
+  if (durationMs > 0) parts.unshift(`${fmtDur(durationMs).replace(/\.\d秒$/, '秒')}作業`);
+  if (!counts.length) parts.push(`作業ステップ ${fmtNum(items.length)}`);
+  return parts.join(' · ');
+}
+/** Collapsed summary row; the step DOM is only built when the reader opens it. */
+function workFold(items, durationMs) {
+  const body = h('div', { class: 'wf-body' });
+  const bad = items.filter((it) => (it.kind === 'command_execution' && Number(it.payload?.exitCode ?? it.payload?.exit_code ?? 0) !== 0) || (it.kind === 'subagent' && it.payload?.status === 'failed')).length;
+  const el = h('details', { class: 'work-fold', dataset: { last: items.at(-1).id } },
+    h('summary', {}, iconEl('chevron', 's-chev'), h('span', { class: 'wf-sum', text: foldLabel(items, durationMs) }), bad ? h('span', { class: 'wf-bad', title: '失敗したステップ', text: `失敗 ${bad}` }) : null),
+    body);
+  let built = false;
+  el.build = () => {
+    if (built) return;
+    built = true;
+    for (const it of items) appendItem(it, body);
+    $$('.steps', body).forEach((g) => g.classList.add('expanded'));
+    $$('details[data-item]', body).forEach((d) => { if (keepOpen.has(d.dataset.item)) d.open = true; });
+  };
+  el.addEventListener('toggle', () => { if (el.open) el.build(); });
+  for (const it of items) foldIndex.set(it.id, el);
+  return el;
+}
+
+const isRunDone = (run, fallback) => (run ? !['queued', 'running', 'waiting-for-children', 'rate-limited'].includes(run.status) : fallback);
+
+/** Renders one finished stretch: user message(s) → work fold → final answer → trailing notes. */
+function appendFinished(items, group, durationMs) {
+  const chunks = [{ users: [], rest: [] }];
+  for (const it of items) {
+    let c = chunks.at(-1);
+    if (it.kind === 'user_message') {
+      if (c.rest.length) { c = { users: [], rest: [] }; chunks.push(c); }
+      c.users.push(it);
+    } else c.rest.push(it);
+  }
+  for (const { users, rest } of chunks) {
+    users.forEach((it) => appendItem(it, group));
+    const final = rest.findLast((it) => it.kind === 'assistant_message');
+    const tail = []; const inner = [];
+    for (const it of rest) {
+      if (it === final) continue;
+      const type = noticeType(it);
+      if (type === 'checkpoint') { if (fileEntries(it.payload).length) tail.push(it); } else if (it.kind === 'system_notice' && !SEARCH_NOTICES.has(type) && isErrorNotice(it.payload)) tail.push(it); else inner.push(it);
+    }
+    const worked = inner.some((it) => it.kind !== 'assistant_message' && (it.kind !== 'system_notice' || isStep(it)));
+    if (!worked) { rest.forEach((it) => appendItem(it, group)); continue; }
+    const fold = workFold(inner, chunks.length === 1 ? durationMs : null);
+    if (inner.some((it) => keepOpen.has(it.id))) { fold.build(); fold.open = true; }
+    group.append(fold);
+    if (final) appendItem(final, group);
+    tail.forEach((it) => appendItem(it, group));
+  }
+}
+
+// ── messages ──
+/** Rough visual line count, so that long prompts fold without forcing a layout. */
+function isLongText(text) {
+  const perLine = isNarrow() ? 40 : 78;
+  let lines = 0;
+  for (const l of String(text).split('\n')) {
+    lines += Math.max(1, Math.ceil((l.length + (l.match(/[^\u0000-ÿ]/g)?.length || 0)) / perLine));
+    if (lines > 14) return true;
+  }
+  return false;
+}
+function userBubble(text, key) {
+  const bubble = h('div', { class: 'bubble', text });
+  if (!isLongText(text)) return [bubble];
+  const btn = h('button', { type: 'button', class: 'bubble-toggle' });
+  const set = (open) => {
+    bubble.classList.toggle('clamp', !open);
+    btn.textContent = open ? '折りたたむ' : '全文を表示';
+    btn.setAttribute('aria-expanded', String(open));
+  };
+  btn.onclick = () => {
+    const open = bubble.classList.contains('clamp');
+    open ? S.expandedMsgs.add(key) : S.expandedMsgs.delete(key);
+    S.stick = false;
+    set(open);
+    if (!open) bubble.scrollIntoView({ block: 'nearest' });
+  };
+  set(S.expandedMsgs.has(key));
+  return [bubble, btn];
+}
+
+/** system_notice → one compact line. Payloads are never dumped as JSON; empty checkpoints are hidden. */
+function renderNotice(item) {
+  const p = item.payload && typeof item.payload === 'object' ? item.payload : { message: String(item.payload ?? '') };
+  const id = { item: item.id };
+  if (p.type === 'checkpoint') {
+    const files = fileEntries(p);
+    if (!files.length) return null;
+    return h('button', { type: 'button', class: 'ckpt', dataset: id, title: `${files.map((f) => f.path).join('\n')}\nGit 差分を開く`, onclick: () => setRail('diff') },
+      iconEl('filePen'), h('span', { text: `${fmtNum(files.length)} ファイル変更` }));
+  }
+  const bad = isErrorNotice(p);
+  let text; let cid = '';
+  if (p.type === 'notification') {
+    text = p.summary || p.title || 'システム通知';
+    cid = resolveThreadId(p.source?.childThreadId || p.child_thread_id);
+  } else {
+    text = p.title || p.message || p.type || 'システム通知';
+    const detail = p.type === 'error' ? p.failure?.message : '';
+    if (detail && detail !== text) text = `${text}: ${detail}`;
+  }
+  text = String(typeof text === 'string' ? text : 'システム通知');
+  return h('div', { class: `notice${bad ? ' err' : ''}`, dataset: id }, iconEl(bad ? 'alert' : 'info'),
+    h('span', { class: 'notice-text', title: clip(text, 600), text: oneLine(text, 240) }),
+    cid ? h('button', { type: 'button', class: 'link notice-open', text: 'スレッドを開く →', onclick: () => openThread(cid) }) : null);
 }
 
 function renderMessage(item) {
@@ -1233,7 +1729,7 @@ function renderMessage(item) {
       const ids = Array.isArray(p?.attachment_ids) ? p.attachment_ids : [];
       return h('div', { class: 'msg user', ...id },
         ids.length ? h('div', { class: 'msg-atts' }, ids.map(attThumb)) : null,
-        text ? h('div', { class: 'bubble', text }) : null,
+        text ? userBubble(text, item.id) : null,
         h('div', { class: 'msg-meta' }, time(), ibtn('copy', 'メッセージをコピー', () => copyText(text), 'xs')));
     }
     case 'assistant_message': {
@@ -1243,13 +1739,12 @@ function renderMessage(item) {
     }
     case 'reasoning': {
       const text = pstr(p, 'text', 'content', 'summary') || sum || textOf(p);
-      return h('details', { class: 'reasoning', ...id }, h('summary', {}, iconEl('brain'), h('span', { text: '思考プロセス' }), h('small', { text: `${fmtNum(text.length)}文字` }), iconEl('chevron', 's-chev')), h('pre', { text }));
+      const d = h('details', { class: 'reasoning', ...id }, h('summary', {}, iconEl('brain'), h('span', { text: '思考プロセス' }), h('small', { text: `${fmtNum(text.length)}文字` }), iconEl('chevron', 's-chev')));
+      d.addEventListener('toggle', () => { if (d.open && !d.querySelector('pre')) d.append(h('pre', { text })); });
+      return d;
     }
-    case 'system_notice': {
-      const text = pstr(p, 'message', 'text', 'content') || sum || textOf(p);
-      const bad = /error|fail|エラー|失敗/i.test(text);
-      return h('div', { class: `notice${bad ? ' err' : ''}`, ...id }, iconEl(bad ? 'alert' : 'info'), h('span', { text }));
-    }
+    case 'system_notice':
+      return renderNotice(item);
     default:
       return h('details', { class: 'reasoning', ...id }, h('summary', {}, iconEl('info'), h('span', { text: kind }), h('small', { text: oneLine(sum, 80) }), iconEl('chevron', 's-chev')), h('pre', { text: pretty(p) }));
   }
@@ -1263,54 +1758,87 @@ function runFooter(run) {
       provDot(run.provider),
       h('span', { text: `${run.model}${run.effort ? ` · ${run.effort}` : ''}` }),
       run.duration_ms != null ? h('span', { text: fmtDur(run.duration_ms) }) : null,
-      run.input_tokens != null || run.output_tokens != null ? h('span', { title: '入力 / 出力トークン', text: `↑${fmtTok(run.input_tokens)} ↓${fmtTok(run.output_tokens)}` }) : null,
+      run.input_tokens || run.output_tokens ? h('span', { title: '入力 / 出力トークン', text: `↑${fmtTok(run.input_tokens)} ↓${fmtTok(run.output_tokens)}` }) : null,
       ok ? null : h('span', { class: 'rf-status', text: STATUS_LABEL[run.status] || run.status })),
     run.status === 'failed' && run.error_message ? h('div', { class: 'rf-error', text: run.error_message }) : null);
 }
 
+const runGroup = (runId) => h('div', { class: 'run-group', dataset: { run: runId || '' } });
+
 function renderTimeline() {
   const root = tl();
   const d = S.detail;
-  if (!d) { if (!S.threadId) root.replaceChildren(); callRows.clear(); return; }
+  if (!d) { if (!S.threadId) root.replaceChildren(); callRows.clear(); foldIndex.clear(); return; }
   // keep what the reader had expanded (and their scroll position) across refreshes
   const same = root.dataset.thread === d.thread.id;
-  const open = new Set(same ? $$('details[open][data-item]', root).map((e) => e.dataset.item) : []);
+  keepOpen = new Set(same ? $$('details[open][data-item]', root).map((e) => e.dataset.item) : []);
+  if (same) $$('details.work-fold[open]', root).forEach((e) => keepOpen.add(e.dataset.last));
   const expanded = new Set(same ? $$('.steps.expanded', root).map((e) => e.dataset.run) : []);
   const top = scroller().scrollTop;
   root.dataset.thread = d.thread.id;
-  callRows.clear();
+  callRows.clear(); foldIndex.clear();
   const frag = document.createDocumentFragment();
+  if (d.has_more) {
+    const left = d.total_items - d.items.length;
+    frag.append(h('button', { type: 'button', id: 'load-older', class: 'load-older', disabled: S.loadingOlder === d.thread.id, text: S.loadingOlder === d.thread.id ? '読み込み中…' : `以前の履歴を読み込む${left > 0 ? ` (残り ${fmtNum(left)} 件)` : ''}`, onclick: () => loadOlder() }));
+  }
   // incoming handoff (this thread was forked from another)
-  for (const ho of (d.handoffs || []).filter((x) => x.target_thread_id === d.thread.id)) {
+  for (const ho of d.has_more ? [] : (d.handoffs || []).filter((x) => x.target_thread_id === d.thread.id)) {
     const src = threadById(ho.source_thread_id);
     frag.append(h('details', { class: 'handoff-in', dataset: { item: ho.id } }, h('summary', {},
       iconEl('handoff'),
       h('span', { class: 'k', text: '引き継ぎ元' }),
-      h('span', { class: 'v', text: `${src?.title || ho.source_thread_id.slice(0, 8)}（${provLabel(ho.from_model?.provider)} ${ho.from_model?.model} → ${provLabel(ho.to_model?.provider)} ${ho.to_model?.model}）` }),
+      h('span', { class: 'v', text: `${src ? cleanTitle(src.title) : ho.source_thread_id.slice(0, 8)}（${provLabel(ho.from_model?.provider)} ${ho.from_model?.model} → ${provLabel(ho.to_model?.provider)} ${ho.to_model?.model}）` }),
       h('button', { class: 'btn xs', type: 'button', text: '元を開く', onclick: (e) => { e.preventDefault(); openThread(ho.source_thread_id); } }),
       iconEl('chevron', 's-chev')),
     mdEl(ho.summary || '')));
   }
-  const items = [...(d.items || [])].sort((a, b) => a.ordinal - b.ordinal);
+  const items = d.items;
   const runs = new Map((d.runs || []).map((r) => [r.id, r]));
-  items.forEach((it, i) => {
-    appendItem(it, frag);
-    if (items[i + 1]?.run_id !== it.run_id) { const f = runFooter(runs.get(it.run_id)); if (f) frag.append(f); }
-  });
+  for (let i = 0; i < items.length;) {
+    const runId = items[i].run_id;
+    let j = i + 1;
+    while (j < items.length && items[j].run_id === runId) j++;
+    const seg = items.slice(i, j);
+    const run = runs.get(runId);
+    const group = runGroup(runId);
+    if (isRunDone(run, j < items.length || !isBusy(d.thread.status))) appendFinished(seg, group, run?.duration_ms);
+    else seg.forEach((it) => appendItem(it, group));
+    const foot = runFooter(run);
+    if (foot) group.append(foot);
+    if (group.childElementCount) frag.append(group);
+    i = j;
+  }
   const lr = latestRun();
   if (lr && !items.some((it) => it.run_id === lr.id)) { const f = runFooter(lr); if (f) frag.append(f); }
   for (const o of S.optimistic) if (o.threadId === d.thread.id) frag.append(optimisticEl(o));
   frag.append(h('div', { id: 'live' }));
   if (!items.length && !isBusy(d.thread.status)) frag.prepend(h('div', { class: 'blank' }, h('p', { text: 'まだメッセージはありません。下の入力欄から始めてください。' })));
-  $$('.steps', frag).forEach((g) => { if (expanded.has(g.dataset.run)) { g.classList.add('expanded'); labelSteps(g); } });
-  $$('details[data-item]', frag).forEach((e) => { if (open.has(e.dataset.item)) e.open = true; });
+  $$('.steps', frag).forEach((g) => { if (!g.closest('.work-fold') && expanded.has(g.dataset.run)) { g.classList.add('expanded'); labelSteps(g); } });
+  $$('details[data-item]', frag).forEach((e) => { if (keepOpen.has(e.dataset.item)) e.open = true; });
   root.replaceChildren(frag);
   if (same && !S.stick) scroller().scrollTop = top;
   renderLive();
   scrollBottom();
 }
 
-function optimisticEl(o) { return h('div', { class: 'msg user pending', dataset: { opt: o.key } }, h('div', { class: 'bubble', text: o.text })); }
+/** Re-renders after older items were prepended, holding the first visible message where it was. */
+function renderKeepingAnchor() {
+  const sc = scroller();
+  const edge = sc.getBoundingClientRect().top;
+  const anchor = $$('#timeline .msg[data-item]').find((e) => e.getBoundingClientRect().bottom > edge);
+  const was = anchor?.getBoundingClientRect().top;
+  S.stick = false;
+  renderTimeline();
+  if (!anchor) return;
+  const fix = () => {
+    const now = $(`#timeline .msg[data-item="${CSS.escape(anchor.dataset.item)}"]`);
+    if (now) sc.scrollTop += now.getBoundingClientRect().top - was;
+  };
+  fix(); requestAnimationFrame(() => { fix(); requestAnimationFrame(fix); });
+}
+
+function optimisticEl(o) { return h('div', { class: 'msg user pending', dataset: { opt: o.key } }, userBubble(o.text, `opt:${o.key}`)); }
 
 const renderLive = rafThrottle(() => {
   const host = $('#live');
@@ -1344,7 +1872,15 @@ function tickTimer() {
 }
 setInterval(() => { if (isBusy(curThread()?.status)) tickTimer(); }, 1000);
 
-function jumpToItem(itemId) {
+async function jumpToItem(itemId) {
+  const threadId = S.threadId;
+  // the hit may be on an older page
+  while (S.threadId === threadId && S.detail?.has_more && !S.detail.items.some((x) => x.id === itemId)) {
+    if (!await loadOlder(1000)) break;
+  }
+  if (S.threadId !== threadId) return;
+  const fold = foldIndex.get(itemId);
+  if (fold) { fold.build(); fold.open = true; }
   const el = $(`#timeline [data-item="${CSS.escape(itemId)}"], #timeline [data-also="${CSS.escape(itemId)}"]`);
   if (!el) return;
   const g = el.closest('.steps');
@@ -1352,6 +1888,7 @@ function jumpToItem(itemId) {
   if (el.tagName === 'DETAILS') el.open = true;
   S.stick = false;
   el.scrollIntoView({ block: 'center' });
+  requestAnimationFrame(() => el.scrollIntoView({ block: 'center' })); // sizes settle once skipped content is rendered
   el.classList.add('flash');
   setTimeout(() => el.classList.remove('flash'), 1600);
 }
@@ -1423,7 +1960,24 @@ function renderComposer() {
   send.disabled = sending || (!ta().value.trim() && !S.atts.length);
   $('#btn-stop').disabled = !t || !busy;
 }
-const syncSendEnabled = () => { $('#btn-send').disabled = sending || (!ta().value.trim() && !S.atts.length); };
+const syncSendEnabled = () => { $('#btn-send').disabled = sending || (!ta().value.trim() && !S.atts.length); syncSwarmHint(); };
+
+const SWARM_COMMAND = /^\s*\/swarm(\s|$)/;
+/** Pill above the textarea while the message is a /swarm command. Touches the DOM only on a change (it is a live region). */
+function syncSwarmHint() {
+  const box = $('#swarm-hint');
+  const on = SWARM_COMMAND.test(ta().value);
+  if (on === !!box.firstChild) return;
+  box.replaceChildren(...(on ? [h('span', { class: 'swarm-pill' }, iconEl('swarm'), h('span', { text: 'Swarm モード · マルチエージェント協調ボードを起動' }))] : []));
+}
+function insertSwarmCommand() {
+  const input = ta();
+  if (!SWARM_COMMAND.test(input.value)) input.value = `/swarm ${input.value}`;
+  else if (input.value.trim() === '/swarm') input.value = '/swarm ';
+  autosize(); syncSendEnabled();
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
 
 function autosize() { const el = ta(); el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight, Math.max(120, window.innerHeight * 0.36))}px`; }
 
@@ -1498,7 +2052,9 @@ async function send() {
     if (S.threadId === t.id) { $('#timeline .blank')?.remove(); $('#live')?.before(optimisticEl(opt)); scrollBottom(true); }
     try {
       await api(`/api/threads/${t.id}/messages`, { method: 'POST', json: body });
+      atts.forEach((a) => { if (a.local) URL.revokeObjectURL(a.local); });
       loadDetailSoon();
+      if (SWARM_COMMAND.test(text)) loadSwarm(t.id);
     } catch (e) {
       S.optimistic = S.optimistic.filter((o) => o.key !== key);
       $(`[data-opt="${key}"]`)?.remove();
@@ -1526,14 +2082,14 @@ async function interrupt() {
   try { await api(`/api/threads/${t.id}/interrupt`, { method: 'POST' }); toast('停止を要求しました'); } catch (e) { toast(`停止に失敗: ${e.message}`, 'err'); }
 }
 
-async function copyText(text) {
-  try { await navigator.clipboard.writeText(text); toast('コピーしました', 'ok', 1500); return true; } catch { /* fall through */ }
+async function copyText(text, done = 'コピーしました') {
+  try { await navigator.clipboard.writeText(text); toast(done, 'ok', 1500); return true; } catch { /* fall through */ }
   const x = h('textarea', { value: text, style: 'position:fixed;opacity:0' });
   (document.querySelector('dialog[open]') || document.body).append(x); x.select();
   let ok = false;
   try { ok = document.execCommand('copy'); } catch { /* noop */ }
   x.remove();
-  toast(ok ? 'コピーしました' : 'コピーできません', ok ? 'ok' : 'err', 1500);
+  toast(ok ? done : 'コピーできません', ok ? 'ok' : 'err', 1500);
   return ok;
 }
 
@@ -1551,15 +2107,11 @@ function renderStatPill() {
   const runs = S.detail?.runs;
   if (runs) {
     const sum = (k) => runs.reduce((a, r) => a + (Number(r[k]) || 0), 0);
-    parts.push(h('span', { class: 'sp', title: 'このスレッドの Run 数', dataset: { utab: 'model' }, text: `${fmtNum(runs.length)} runs` }),
-      h('span', { class: 'sp', title: 'このスレッドの入力 / 出力トークン', dataset: { utab: 'model' }, text: `↑${fmtTok(sum('input_tokens'))} ↓${fmtTok(sum('output_tokens'))}` }));
+    parts.push(h('span', { class: 'sp', title: 'このスレッドの Run 数', dataset: { utab: 'model' }, text: `${fmtNum(runs.length)} runs` }));
+    const up = sum('input_tokens'); const down = sum('output_tokens');
+    if (up || down) parts.push(h('span', { class: 'sp', title: 'このスレッドの入力 / 出力トークン', dataset: { utab: 'model' }, text: `↑${fmtTok(up)} ↓${fmtTok(down)}` }));
   } else if (S.dbStats) {
     parts.push(h('span', { class: 'sp', dataset: { utab: 'system' }, text: `${fmtNum(S.dbStats.threads_count)} スレッド` }), h('span', { class: 'sp', dataset: { utab: 'model' }, text: `${fmtNum(S.dbStats.runs_count)} runs` }));
-  }
-  if (S.dbStats) {
-    const raw = Number(S.dbStats.raw_payload_bytes) || 0; const stored = Number(S.dbStats.stored_payload_bytes) || 0;
-    const saved = Math.max(0, raw - stored);
-    parts.push(h('span', { class: 'sp zstd', dataset: { utab: 'system' }, title: `DB 全体の zstd 圧縮: ${fmtBytes(raw)} → ${fmtBytes(stored)}`, text: `zstd −${fmtBytes(saved)}${raw ? ` (${((saved / raw) * 100).toFixed(0)}%)` : ''}` }));
   }
   if (S.meta) {
     const clean = S.meta.telemetry_enabled === false && S.meta.privacy?.telemetry_enabled !== true;
@@ -1605,6 +2157,7 @@ function projectDialog() {
         e.preventDefault();
         try {
           const p = await api('/api/projects', { method: 'POST', json: { title: title.value.trim(), workspace_root: root.value.trim() } });
+          S.showEmpty = true; // a new project has no threads yet, so show where it went
           await loadProjects();
           close(); goHome(p.id); toast('プロジェクトを追加しました', 'ok');
         } catch (err) { toast(`追加に失敗: ${err.message}`, 'err'); }
@@ -1618,7 +2171,7 @@ function projectDialog() {
 function forkDialog() {
   const t = curThread(); if (!t) return;
   openModal('分岐・モデル切替', (body, close) => {
-    const title = h('input', { class: 'inp', value: `${t.title} (分岐)`, 'aria-label': 'タイトル' });
+    const title = h('input', { class: 'inp', value: `${cleanTitle(t.title)} (分岐)`, 'aria-label': 'タイトル' });
     const picker = modelPanel({ value: S.compose.sel || t.model_selection });
     const memo = h('textarea', { class: 'inp', rows: 3, placeholder: '空欄ならサーバー側が会話履歴から引き継ぎ要約を作成します', 'aria-label': '引き継ぎメモ' });
     const go = h('button', { class: 'btn primary', type: 'submit', text: '分岐して開く' });
@@ -1665,7 +2218,7 @@ function delegateDialog() {
         };
         try {
           const r = await api(`/api/threads/${t.id}/delegate`, { method: 'POST', json: spec });
-          close(); toast(`子スレッドを開始しました: ${r.thread?.title || ''}`, 'ok');
+          close(); toast(`子スレッドを開始しました: ${r.thread ? cleanTitle(r.thread.title) : ''}`, 'ok');
           if (draft && ta().value.trim() === draft) { ta().value = ''; autosize(); syncSendEnabled(); }
           await loadThreads(); loadDetailSoon();
         } catch (err) { go.disabled = false; toast(`委譲に失敗: ${err.message}`, 'err'); }
@@ -1678,6 +2231,48 @@ function delegateDialog() {
   }, { cls: 'form-modal' });
 }
 
+/** Search snippet as plain prose: server highlight tags and Markdown syntax removed. */
+const plainSnippet = (s) => String(s || '')
+  .replace(/<\/?(mark|b)>/gi, '')
+  .replace(/!?\[([^\]\n]*)\]\([^)\n]*\)?/g, '$1')
+  .replace(/```[\w-]*|`|\*\*|__|~~/g, '')
+  .replace(/(^|\n)\s*(#{1,6}\s+|>\s*|[-*+]\s+)/g, '$1')
+  .replace(/\|?\s*:?-{3,}:?\s*\|?|\|/g, ' ')
+  .replace(/\s+/g, ' ').trim();
+const searchTerms = (q) => [...new Set(q.split(/\s+/).map((t) => t.replace(/^["'*]+|["'*]+$/g, '')).filter(Boolean))].sort((a, b) => b.length - a.length);
+/** Text nodes with <mark> around every query term (works for trigram and 1–2 character LIKE searches alike). */
+function highlight(text, terms) {
+  if (!terms.length) return [text];
+  const re = new RegExp(`(${terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'giu');
+  return text.split(re).map((part, i) => (i % 2 ? h('mark', { text: part }) : part)).filter((x) => x !== '');
+}
+/** Starts a long snippet shortly before its first match so the highlight stays inside the two visible lines. */
+function aroundMatch(text, terms) {
+  const low = text.toLowerCase();
+  const at = Math.min(...terms.map((t) => low.indexOf(t.toLowerCase())).filter((i) => i >= 0));
+  return Number.isFinite(at) && at > 50 ? `…${text.slice(at - 30)}` : text;
+}
+/** One group per thread with at most two distinct snippets; snippets that only repeat the title are dropped. */
+function groupHits(rows, terms) {
+  const norm = (s) => s.toLowerCase().replace(/…|\.\.\./g, '').replace(/\s+/g, '');
+  const groups = new Map();
+  for (const r of rows) {
+    let g = groups.get(r.thread_id);
+    if (!g) {
+      g = { thread_id: r.thread_id, title: cleanTitle(r.thread_title), updated_at: r.updated_at, snippets: [], seen: [] };
+      groups.set(r.thread_id, g);
+    }
+    if (g.snippets.length >= 2) continue;
+    const text = plainSnippet(r.snippet);
+    const key = norm(cleanTitle(text));
+    if (!key || norm(g.title).startsWith(key) || norm(plainSnippet(r.thread_title)).startsWith(norm(text))) continue;
+    if (g.seen.some((k) => k.includes(key) || key.includes(k))) continue;
+    g.seen.push(key);
+    g.snippets.push({ text: aroundMatch(text, terms), item_id: r.item_id });
+  }
+  return [...groups.values()];
+}
+
 function searchDialog() {
   const open = $('dialog.search');
   if (open) { open.close(); return; }
@@ -1685,44 +2280,62 @@ function searchDialog() {
   openModal('全文検索', (body, close) => {
     const inp = h('input', { class: 'srch-input', type: 'text', enterKeyHint: 'search', placeholder: '会話・コマンド出力を検索（日本語対応）', autocomplete: 'off', spellcheck: false, 'aria-label': '検索語' });
     const list = h('ul', { class: 'hits', role: 'listbox' });
-    const note = h('div', { class: 'srch-note' });
-    let hits = []; let sel = 0; let seq = 0;
-    const mark = (snip) => esc(snip).replace(/&lt;(\/?)(mark|b)&gt;/gi, '<$1mark>');
-    const draw = () => {
-      list.replaceChildren(...hits.map((x, i) => {
-        const th = threadById(x.thread_id);
-        const li = h('li', { class: `hit${i === sel ? ' sel' : ''}`, role: 'option', onclick: () => go(x), onmousemove: () => { if (sel !== i) { sel = i; $$('.hit', list).forEach((e, k) => e.classList.toggle('sel', k === i)); } } },
-          h('div', { class: 'ht' }, th ? provDot(th.model_selection?.provider) : null, h('span', { text: x.thread_title || '(無題)' }), th ? h('em', { text: projectTitle(th.project_id) }) : null, h('small', { text: fmtAgo(x.updated_at) })),
-          x.snippet ? h('div', { class: 'sn' }) : null);
-        if (x.snippet) li.querySelector('.sn').innerHTML = mark(x.snippet);
+    const note = h('div', { class: 'srch-note', role: 'status' });
+    let options = []; let sel = 0; let seq = 0;
+    const select = (i, scroll) => {
+      sel = i;
+      options.forEach((o, k) => { o.el.classList.toggle('sel', k === i); o.el.setAttribute('aria-selected', String(k === i)); });
+      if (scroll) options[i]?.el.scrollIntoView({ block: 'nearest' });
+    };
+    const go = async (x) => { close(); await openThread(x.thread_id); if (x.item_id) await jumpToItem(x.item_id); };
+    const draw = (groups, terms) => {
+      options = [];
+      const option = (el, target) => {
+        const i = options.length;
+        el.setAttribute('role', 'option');
+        el.addEventListener('click', () => go(target));
+        el.addEventListener('mousemove', () => { if (sel !== i) select(i); });
+        options.push({ el, target });
+        return el;
+      };
+      list.replaceChildren(...groups.map((g) => {
+        const th = threadById(g.thread_id);
+        const head = h('div', { class: 'ht' }, th ? provDot(th.model_selection?.provider) : null, h('span', { class: 'ht-title' }, highlight(g.title, terms)), th ? h('em', { text: projectTitle(th.project_id) }) : null, h('small', { text: fmtAgo(g.updated_at) }));
+        const li = h('li', { class: 'hit-group', role: 'presentation', dataset: { thread: g.thread_id } });
+        if (!g.snippets.length) li.append(option(h('div', { class: 'hit' }, head), { thread_id: g.thread_id }));
+        else {
+          head.addEventListener('click', () => go({ thread_id: g.thread_id, item_id: g.snippets[0].item_id }));
+          li.append(head, ...g.snippets.map((s) => option(h('div', { class: 'hit sub' }, h('div', { class: 'sn' }, highlight(s.text, terms))), { thread_id: g.thread_id, item_id: s.item_id })));
+        }
         return li;
       }));
+      if (options.length) select(0);
     };
     const recent = () => {
-      hits = S.threads.filter((t) => !t.archived).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)).slice(0, 8)
-        .map((t) => ({ thread_id: t.id, thread_title: t.title, updated_at: t.updated_at }));
-      sel = 0; draw(); note.textContent = hits.length ? '最近のスレッド' : 'スレッドはまだありません';
+      draw(S.threads.filter((t) => !t.archived).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)).slice(0, 8)
+        .map((t) => ({ thread_id: t.id, title: cleanTitle(t.title), updated_at: t.updated_at, snippets: [] })), []);
+      note.textContent = options.length ? '最近のスレッド' : 'スレッドはまだありません';
     };
-    const go = async (x) => { close(); await openThread(x.thread_id); if (x.item_id) requestAnimationFrame(() => jumpToItem(x.item_id)); };
     const run = debounce(async () => {
       const q = inp.value.trim();
       const my = ++seq;
       if (!q) { recent(); return; }
       try {
-        const r = await api(`/api/search?q=${encodeURIComponent(q)}&limit=30`);
+        const r = await api(`/api/search?q=${encodeURIComponent(q)}&limit=60`);
         if (my !== seq) return;
-        hits = Array.isArray(r) ? r : []; sel = 0; draw();
-        note.textContent = hits.length ? `${hits.length}件` : '一致なし';
+        const terms = searchTerms(q);
+        const groups = groupHits(Array.isArray(r) ? r : [], terms);
+        draw(groups, terms);
+        note.textContent = groups.length ? `${groups.length}スレッド` : '一致なし';
       } catch (e) { note.textContent = `検索に失敗: ${e.message}`; }
     }, 120);
     inp.addEventListener('input', run);
     inp.addEventListener('keydown', (e) => {
       if (e.isComposing || e.keyCode === 229) return;
       if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-        e.preventDefault(); if (!hits.length) return;
-        sel = (sel + (e.key === 'ArrowDown' ? 1 : -1) + hits.length) % hits.length;
-        $$('.hit', list).forEach((el, i) => { el.classList.toggle('sel', i === sel); if (i === sel) el.scrollIntoView({ block: 'nearest' }); });
-      } else if (e.key === 'Enter' && hits[sel]) { e.preventDefault(); go(hits[sel]); }
+        e.preventDefault(); if (!options.length) return;
+        select((sel + (e.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length, true);
+      } else if (e.key === 'Enter' && options[sel]) { e.preventDefault(); go(options[sel].target); }
     });
     body.append(h('div', { class: 'srch-row' }, iconEl('search'), inp, h('kbd', { text: 'esc' })), note, list);
     recent();
@@ -1732,10 +2345,10 @@ function searchDialog() {
 
 // ───────────────────────── usage: data (T3 Code UsagePage) ─────────────────────────
 const U_PROVIDERS = {
-  claude: { label: 'Claude Code', color: '#d97757' },
-  codex: { label: 'Codex', color: 'var(--text)' },
-  antigravity: { label: 'Antigravity', color: '#8c7bd1' },
-  opencode: { label: 'OpenCode', color: '#5b9bbd' },
+  claude: { label: 'Claude Code', color: 'var(--p-claude)' },
+  codex: { label: 'Codex', color: 'var(--text)' }, // high-contrast foreground; follows the surface it sits on
+  antigravity: { label: 'Antigravity', color: 'var(--p-antigravity)' },
+  opencode: { label: 'OpenCode', color: 'var(--p-opencode)' },
 };
 const U_PERIODS = [['1', '過去24時間'], ['7', '7日間'], ['30', '30日間'], ['90', '90日間']];
 const U_METRICS = [['cost', 'コスト'], ['tokens', 'トークン']];
@@ -1783,7 +2396,8 @@ function normalizeUsage(raw) {
   const rows = (a) => (Array.isArray(a) ? a.filter((x) => x && typeof x === 'object') : []);
   const shares = (x) => ({ cost_share: uNum(x.cost_share), token_share: uNum(x.token_share) });
   const providers = rows(raw.providers).map((p) => ({ ...uStats(p), ...shares(p), ...uProvider(uId(p.provider), p.label, p.color) }));
-  const models = rows(raw.models).map((m) => ({ ...uStats(m), ...shares(m), ...uProvider(uId(m.provider)), model: String(m.model || '(不明なモデル)') }));
+  const models = rows(raw.models).map((m) => ({ ...uStats(m), ...shares(m), ...uProvider(uId(m.provider)), model: String(m.model || '(不明なモデル)') }))
+    .filter((m) => !(m.model === '<synthetic>' && !m.total_tokens)); // placeholder rows of locally generated replies
   const buckets = rows(raw.buckets).map((b) => {
     const by = new Map();
     for (const [k, v] of Object.entries(b.by_provider || {})) {
@@ -1815,7 +2429,7 @@ function loadUsage(days, { refresh = false } = {}) {
   u.seq.set(days, seq);
   if (refresh) u.refreshing.add(days);
   const latest = () => u.seq.get(days) === seq; // an older response must never overwrite a newer one
-  const p = api(`/api/usage?days=${days}${refresh ? '&refresh=1' : ''}`)
+  const p = api(`/api/usage?days=${days}&tz_offset_mins=${-new Date().getTimezoneOffset()}${refresh ? '&refresh=1' : ''}`)
     .then(normalizeUsage)
     .then((d) => { if (latest()) { u.cache.set(days, d); u.errors.delete(days); } })
     .catch((e) => { if (latest()) u.errors.set(days, e.message || String(e)); })
@@ -1880,6 +2494,7 @@ const uEmpty = (text = 'この期間の利用はありません') => h('div', { 
 
 const WEEKDAYS = '日月火水木金土';
 const hhmm = (t) => `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
+const hourLabel = (t) => `${String(t.getHours()).padStart(2, '0')}:00`;
 /** Bucket keys are "YYYY-MM-DD" or an hourly timestamp; zoned timestamps are shown in local time. */
 function bucketDate(key) {
   const m = /^(\d{4})-(\d\d)-(\d\d)(?:[T ](\d\d)(?::(\d\d))?)?/.exec(key);
@@ -1892,14 +2507,14 @@ function bucketDate(key) {
 function bucketTick(b, hourly) {
   const p = bucketDate(b.key);
   if (!p || (hourly && !p.timed)) return b.label;
-  return hourly ? hhmm(p.t) : `${p.t.getMonth() + 1}/${p.t.getDate()}`;
+  return hourly ? hourLabel(p.t) : `${p.t.getMonth() + 1}/${p.t.getDate()}`;
 }
 function bucketTitle(b, hourly, short = false) {
   const p = bucketDate(b.key);
   if (!p) return b.label;
   const { t } = p;
   const day = short ? `${t.getMonth() + 1}/${t.getDate()}` : `${t.getMonth() + 1}月${t.getDate()}日`;
-  return hourly ? `${day} ${p.timed ? hhmm(t) : b.label}` : `${day} (${WEEKDAYS[t.getDay()]})`;
+  return hourly ? `${day} ${p.timed ? hourLabel(t) : b.label}` : `${day} (${WEEKDAYS[t.getDay()]})`;
 }
 function rangeText(w) {
   const f = (s) => {
@@ -1910,13 +2525,14 @@ function rangeText(w) {
   return w.since || w.until ? `${f(w.since)} – ${f(w.until)}` : '';
 }
 
-/** Four equal intervals up to a round number at or above the peak. */
+/** 1 / 2 / 5 steps, about four intervals, up to a round number at or above the peak. */
 function niceScale(peak) {
   if (!(peak > 0)) return { max: 1, step: 0.25, ticks: [0, 0.25, 0.5, 0.75, 1], labeled: false };
   const raw = peak / 4;
   const mag = 10 ** Math.floor(Math.log10(raw));
-  const step = [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].find((x) => raw / mag <= x + 1e-9) * mag;
-  return { max: step * 4, step, ticks: [0, 1, 2, 3, 4].map((i) => step * i), labeled: true };
+  const step = [1, 2, 5, 10].find((x) => x * mag >= raw * (1 - 1e-9)) * mag;
+  const count = Math.max(1, Math.ceil(peak / step - 1e-9));
+  return { max: step * count, step, ticks: Array.from({ length: count + 1 }, (_, i) => step * i), labeled: true };
 }
 function tickText(v, step) {
   if (S.usage.metric === 'tokens') return v === 0 ? '0' : fmtCompact(v);
@@ -1927,40 +2543,85 @@ function tickText(v, step) {
   return `$${v.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 }
 
-/** UsageProviderChart: one stacked column per bucket, plain HTML. */
-function usageChart(view) {
-  const { columns, key, hourly } = view;
+/** Cubic Bézier path with monotone (Fritsch–Carlson) tangents: smooth, and never overshoots below zero. */
+function monotonePath(pts) {
+  const n = pts.length;
+  const f = (v) => Math.round(v * 100) / 100;
+  if (n < 2) return n ? `M${f(pts[0][0])} ${f(pts[0][1])}` : '';
+  const m = pts.slice(1).map((p, i) => (p[1] - pts[i][1]) / (p[0] - pts[i][0]));
+  const t = pts.map((_, i) => (i === 0 ? m[0] : i === n - 1 ? m[n - 2] : m[i - 1] * m[i] <= 0 ? 0 : (m[i - 1] + m[i]) / 2));
+  m.forEach((s, i) => {
+    if (s === 0) { t[i] = 0; t[i + 1] = 0; return; }
+    const a = t[i] / s; const b = t[i + 1] / s; const q = a * a + b * b;
+    if (q > 9) { const k = 3 / Math.sqrt(q); t[i] = k * a * s; t[i + 1] = k * b * s; }
+  });
+  let d = `M${f(pts[0][0])} ${f(pts[0][1])}`;
+  for (let i = 0; i < n - 1; i++) {
+    const [x0, y0] = pts[i]; const [x1, y1] = pts[i + 1]; const dx = (x1 - x0) / 3;
+    d += `C${f(x0 + dx)} ${f(y0 + t[i] * dx)} ${f(x1 - dx)} ${f(y1 - t[i + 1] * dx)} ${f(x1)} ${f(y1)}`;
+  }
+  return d;
+}
+const svgNode = (tag, attrs) => {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  return el;
+};
+/** Indices that get an x-axis label: whole hours for the 24h view, otherwise evenly spaced days ending today. */
+function axisMarks(columns, hourly) {
   const n = columns.length;
-  const scale = niceScale(Math.max(0, ...columns.map((c) => c[key])));
-  const at = (el, v) => { el.style.top = `${(1 - v / scale.max) * 100}%`; return el; };
+  const narrow = matchMedia('(max-width: 640px)').matches;
+  const all = columns.map((_, i) => i);
+  if (hourly) {
+    const every = narrow ? 6 : 4;
+    const marks = all.filter((i) => bucketDate(columns[i].bucket.key)?.t.getHours() % every === 0);
+    if (marks.length) return marks;
+  }
+  const every = Math.max(1, Math.ceil(n / (narrow ? 4 : 7)));
+  return all.filter((i) => (n - 1 - i) % every === 0);
+}
+
+/** UsageProviderChart: overlapping monotone areas, one per provider, each from the zero baseline. */
+function usageChart(view) {
+  const { columns, visible, key, hourly } = view;
+  const n = columns.length;
+  const scale = niceScale(Math.max(0, ...columns.flatMap((c) => c.parts.map((x) => x[key]))));
+  const px = (i) => (n > 1 ? (i / (n - 1)) * 100 : 50); // percent
+  const py = (v) => (1 - v / scale.max) * 100;
+  const at = (el, v) => { el.style.top = `${py(v)}%`; return el; };
   const yaxis = h('div', { class: 'u-yaxis', 'aria-hidden': 'true' },
     scale.labeled ? scale.ticks.map((v) => at(h('span', { text: tickText(v, scale.step) }), v)) : null);
-  const cols = columns.map((c) => {
-    if (!(c[key] > 0)) return h('div', { class: 'u-col' });
-    const stack = h('div', { class: 'u-stack' }, c.parts.filter((x) => x[key] > 0).map((x) => {
-      const seg = uTint(h('i', { dataset: { provider: x.p.id } }), x.p.color);
-      seg.style.flexGrow = String(x[key] / c[key]);
-      return seg;
-    }));
-    stack.style.height = `${(c[key] / scale.max) * 100}%`;
-    return h('div', { class: 'u-col' }, stack);
-  });
-  const colBox = h('div', { class: 'u-cols' }, cols);
-  colBox.style.gap = `${n <= 10 ? 10 : n <= 31 ? 3 : 1}px`;
+  const graph = svgNode('svg', { class: 'u-svg', viewBox: '0 0 1000 1000', preserveAspectRatio: 'none', 'aria-hidden': 'true' });
+  const series = visible.map((p, k) => ({ p, values: columns.map((c) => c.parts[k][key]) }))
+    .filter((s) => s.values.some((v) => v > 0))
+    .sort((a, b) => b.values.reduce((x, y) => x + y, 0) - a.values.reduce((x, y) => x + y, 0)); // small series paint on top
+  for (const s of series) {
+    const pts = s.values.map((v, i) => [px(i) * 10, py(v) * 10]);
+    if (pts.length === 1) pts.splice(0, 1, [0, pts[0][1]], [1000, pts[0][1]]);
+    const line = monotonePath(pts);
+    const area = svgNode('path', { class: 'u-area', d: `${line}L${pts.at(-1)[0]} 1000L${pts[0][0]} 1000Z`, 'fill-opacity': '0.12', stroke: 'none' });
+    const stroke = svgNode('path', { class: 'u-line', d: line, fill: 'none', 'stroke-width': '2', 'vector-effect': 'non-scaling-stroke', 'stroke-linejoin': 'round', 'stroke-linecap': 'round' });
+    area.style.fill = s.p.color; stroke.style.stroke = s.p.color;
+    area.dataset.provider = s.p.id; stroke.dataset.provider = s.p.id;
+    graph.append(area, stroke);
+  }
+  const cross = h('div', { class: 'u-cross', hidden: true, 'aria-hidden': 'true' });
+  const dots = series.map((s) => { const d = h('i', { class: 'u-hdot', hidden: true, 'aria-hidden': 'true', dataset: { provider: s.p.id } }); d.style.color = s.p.color; return d; });
   const tip = h('div', { class: 'u-tip', role: 'status', hidden: true });
   const plot = h('div', {
     class: 'u-plot', tabindex: 0, role: 'group',
     'aria-label': `${hourly ? '時間別' : '日別'}の${S.usage.metric === 'cost' ? 'コスト' : 'トークン'}グラフ。左右キーで期間を移動`,
-  }, scale.ticks.map((v) => at(h('div', { class: `u-grid${v === 0 ? ' base' : ''}`, 'aria-hidden': 'true' }), v)), colBox,
+  }, scale.ticks.map((v) => at(h('div', { class: `u-grid${v === 0 ? ' base' : ''}`, 'aria-hidden': 'true' }), v)), graph, cross, dots,
   n && scale.labeled ? null : uEmpty(), tip);
 
   let active = -1;
-  const hide = () => { active = -1; tip.hidden = true; plot.classList.remove('hovering'); cols.forEach((c) => c.classList.remove('hover')); };
+  const hide = () => { active = -1; tip.hidden = true; cross.hidden = true; dots.forEach((d) => { d.hidden = true; }); };
   const show = (i, x, y) => {
     if (i !== active) {
       active = i;
-      cols.forEach((c, k) => c.classList.toggle('hover', k === i));
       const c = columns[i];
+      cross.style.left = `${px(i)}%`;
+      dots.forEach((d, k) => { d.style.left = `${px(i)}%`; d.style.top = `${py(series[k].values[i])}%`; });
       const line = (cls, head, row) => h('div', { class: cls }, head, h('span', { class: 'u-tip-v' },
         h('b', { text: fmtUsd(row.cost_usd) }), h('small', { text: `${fmtNum(Math.round(row.total_tokens))} tok` })));
       const used = c.parts.filter((p) => p.cost_usd > 0 || p.total_tokens > 0);
@@ -1968,10 +2629,10 @@ function usageChart(view) {
         ...(used.length ? used.map((p) => line('u-tip-row', h('span', { class: 'u-tip-l' }, uDot(p.p.color), p.p.label), p)) : [h('div', { class: 'u-tip-l', text: '利用なし' })]),
         line('u-tip-row total', h('span', { class: 'u-tip-l', text: '合計' }), c));
     }
-    plot.classList.add('hovering');
-    tip.hidden = false;
+    cross.hidden = false; tip.hidden = false;
+    dots.forEach((d) => { d.hidden = false; });
     const w = tip.offsetWidth; const th = tip.offsetHeight;
-    const left = x + 12 + w <= plot.clientWidth ? x + 12 : x - 12 - w;
+    const left = x + 14 + w <= plot.clientWidth ? x + 14 : x - 14 - w;
     const top = y + 12 + th <= plot.clientHeight ? y + 12 : y - 12 - th;
     tip.style.left = `${Math.max(0, Math.min(left, plot.clientWidth - w))}px`;
     tip.style.top = `${Math.max(0, Math.min(top, plot.clientHeight - th))}px`;
@@ -1980,7 +2641,7 @@ function usageChart(view) {
     const r = plot.getBoundingClientRect();
     if (!n || !r.width) return;
     const x = e.clientX - r.left;
-    show(Math.max(0, Math.min(n - 1, Math.floor((x / r.width) * n))), x, e.clientY - r.top);
+    show(Math.max(0, Math.min(n - 1, Math.round((x / r.width) * (n - 1)))), x, e.clientY - r.top);
   };
   plot.addEventListener('pointermove', point);
   plot.addEventListener('pointerdown', point);
@@ -1990,13 +2651,15 @@ function usageChart(view) {
     if (!n || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
     e.preventDefault();
     const i = active < 0 ? n - 1 : Math.max(0, Math.min(n - 1, active + (e.key === 'ArrowLeft' ? -1 : 1)));
-    show(i, ((i + 0.5) / n) * plot.clientWidth, 8);
+    show(i, (px(i) / 100) * plot.clientWidth, 8);
   });
 
-  const every = n > 0 && n <= 10;
-  const marks = every ? columns : n ? [columns[0], columns[Math.floor(n / 2)], columns[n - 1]] : [];
-  const xaxis = h('div', { class: `u-xaxis${every ? ' every' : ''}`, 'aria-hidden': 'true' }, marks.map((c) => h('span', { text: bucketTick(c.bucket, hourly) })));
-  if (every) xaxis.style.gap = '10px';
+  const xaxis = h('div', { class: 'u-xaxis', 'aria-hidden': 'true' }, axisMarks(columns, hourly).map((i) => {
+    const x = px(i);
+    const el = h('span', { class: x < 4 ? 'start' : x > 96 ? 'end' : '', text: bucketTick(columns[i].bucket, hourly) });
+    el.style.left = `${x}%`;
+    return el;
+  }));
   return { el: h('div', { class: 'u-chart-box' }, h('div', { class: 'u-chart' }, yaxis, plot), xaxis), hide, plot };
 }
 
@@ -2029,13 +2692,18 @@ function usageTotals(view) {
   const stat = (label, value, title) => h('div', { title }, h('dt', { text: label }), h('dd', { text: value }));
   const mix = U_KINDS.map((k) => ({ ...k, value: t[k.key] })).filter((k) => k.value > 0);
   const mixSum = mix.reduce((a, k) => a + k.value, 0);
+  const prompt = t.input_tokens + t.cache_read_tokens + t.cache_write_tokens;
+  const exact = (v) => `${fmtNum(v)} tok`;
   return [
-    h('section', { class: 'u-section' }, h('h3', { text: '合計' }), h('dl', { class: 'u-totals' },
-      stat('処理トークン', fmtCompact(t.total_tokens), `${fmtNum(t.total_tokens)} tok`),
-      stat('キャッシュ読込', fmtCompact(t.cache_read_tokens)),
-      stat('キャッシュ書込', fmtCompact(t.cache_write_tokens)),
-      stat('入力', fmtCompact(t.input_tokens)),
-      stat('出力', fmtCompact(t.output_tokens), t.reasoning_tokens ? `うち推論 ${fmtNum(t.reasoning_tokens)} tok` : null))),
+    h('section', { class: 'u-section' },
+      h('div', { class: 'u-thead' }, h('h3', { text: '合計' }),
+        prompt > 0 ? h('span', { class: 'u-hit', title: `キャッシュ読込 ÷ (入力 + キャッシュ読込 + キャッシュ書込)\n${fmtNum(t.cache_read_tokens)} / ${fmtNum(prompt)} tok` }, 'キャッシュヒット率 ', h('b', { text: fmtShare(t.cache_read_tokens / prompt) })) : null),
+      h('dl', { class: 'u-totals' },
+        stat('処理トークン', fmtCompact(t.total_tokens), exact(t.total_tokens)),
+        stat('入力', fmtCompact(t.input_tokens), exact(t.input_tokens)),
+        stat('出力', fmtCompact(t.output_tokens), t.reasoning_tokens ? `${exact(t.output_tokens)}（うち推論 ${fmtNum(t.reasoning_tokens)}）` : exact(t.output_tokens)),
+        stat('キャッシュ読込', fmtCompact(t.cache_read_tokens), exact(t.cache_read_tokens)),
+        stat('キャッシュ書込', fmtCompact(t.cache_write_tokens), exact(t.cache_write_tokens)))),
     S.usage.metric === 'tokens' && mixSum > 0 ? h('section', { class: 'u-section u-mix' }, h('h3', { text: '種類別トークン' }),
       h('div', { class: 'u-mixbar', 'aria-hidden': 'true' }, mix.map((k) => {
         const seg = uTint(h('i', { title: `${k.label} · ${fmtCompact(k.value)} · ${fmtShare(k.value / mixSum)}` }), k.color);
@@ -2247,14 +2915,23 @@ let diffSeq = 0;
 let diffShownFor = null;
 const diffOpenFiles = new Set();
 
-function setDiffOpen(open) {
-  S.diffOpen = open;
-  ls.set('t3.diff', open ? '1' : '0');
-  $('#diff-panel').hidden = !open;
-  $('#app').dataset.diff = open ? 'open' : 'closed';
-  $('#btn-diff').setAttribute('aria-pressed', String(open));
-  if (open) loadDiff();
+/** The panel actually on screen: the Swarm board only shows for a thread that has one. */
+const shownRail = () => (S.rail === 'swarm' && !curBoard() ? null : S.rail);
+function renderRail() {
+  const shown = shownRail();
+  $('#diff-panel').hidden = shown !== 'diff';
+  $('#swarm-panel').hidden = shown !== 'swarm';
+  $('#app').dataset.rail = shown || 'none';
+  $('#btn-diff').setAttribute('aria-pressed', String(shown === 'diff'));
+  $('#btn-swarm').setAttribute('aria-pressed', String(shown === 'swarm'));
 }
+function setRail(name) {
+  S.rail = name;
+  ls.set('t3.rail', name || '');
+  renderRail();
+  if (name === 'diff') loadDiff();
+}
+const toggleDiff = () => setRail(S.rail === 'diff' ? null : 'diff');
 
 function renderDiffBadge() {
   const b = $('#diff-badge');
@@ -2263,6 +2940,7 @@ function renderDiffBadge() {
   b.hidden = !dirty;
   if (dirty) b.replaceChildren(h('span', { class: 'plus', text: `+${d.add}` }), h('span', { class: 'minus', text: `−${d.del}` }));
 }
+const nonGitProjects = new Set();
 const fetchDiff = (id) => api(`/api/threads/${id}/diff?ignore_whitespace=${S.ignoreWs}`);
 function noteDiffStat(threadId, d) {
   S.diffStat = { threadId, add: d.total_additions, del: d.total_deletions, files: d.clean ? 0 : d.files.length };
@@ -2270,7 +2948,11 @@ function noteDiffStat(threadId, d) {
 }
 async function refreshDiffStat() {
   const id = S.threadId; if (!id) return;
-  try { const d = await fetchDiff(id); if (id === S.threadId) noteDiffStat(id, d); } catch { /* not a git repository: no badge */ }
+  const project = curThread()?.id === id ? curThread().project_id : null;
+  if (project && nonGitProjects.has(project)) return;
+  try { const d = await fetchDiff(id); if (id === S.threadId) noteDiffStat(id, d); } catch (e) {
+    if (project && /not a git repository/i.test(e.message)) nonGitProjects.add(project); // no badge, and no repeat requests
+  }
 }
 
 async function loadDiff() {
@@ -2294,30 +2976,42 @@ async function loadDiff() {
     if (my !== diffSeq) return;
     diffShownFor = null; S.diffStat = null; renderDiffBadge();
     sum.replaceChildren(); branch.textContent = '';
-    body.replaceChildren(h('div', { class: 'dp-empty errtxt', text: `差分を取得できません: ${e.message}` }));
+    body.replaceChildren(/not a git repository/i.test(e.message)
+      ? h('div', { class: 'dp-empty' }, iconEl('fork'), h('span', { text: 'このプロジェクトは Git リポジトリではありません' }))
+      : h('div', { class: 'dp-empty errtxt', text: `差分を取得できません: ${e.message}` }));
   }
 }
-const refreshDiffSoon = debounce(() => { if (S.diffOpen) loadDiff(); else refreshDiffStat(); }, 600);
+const refreshDiffSoon = debounce(() => { if (S.rail === 'diff') loadDiff(); else refreshDiffStat(); }, 600);
 
-function patchLines(patch) {
+function patchLines(patch, max = 3000) {
   const lines = String(patch || '').split('\n');
   if (lines.at(-1) === '') lines.pop();
   const frag = document.createDocumentFragment();
-  let a = 0; let b = 0; let inHunk = false;
+  let a = 0; let b = 0; let numbered = false;
+  let inHunk = !lines.some((l) => l.startsWith('@@'));
   const row = (cls, o, n, sign, text) => frag.append(h('div', { class: `dl ${cls}` },
     h('span', { class: 'ln', text: o }), h('span', { class: 'ln', text: n }), h('span', { class: 'sg', text: sign }), h('span', { class: 'tx', text })));
-  for (const l of lines) {
-    const hunk = /^@@+ -(\d+)(?:,\d+)? (?:-\d+(?:,\d+)? )*\+(\d+)/.exec(l);
-    if (hunk) { a = +hunk[1]; b = +hunk[2]; inHunk = true; frag.append(h('div', { class: 'dl hunk', text: l })); continue; }
+  for (const l of lines.slice(0, max)) {
+    if (l.startsWith('@@')) {
+      const hunk = /^@@+ -(\d+)(?:,\d+)? (?:-\d+(?:,\d+)? )*\+(\d+)/.exec(l);
+      numbered = !!hunk;
+      if (hunk) { a = +hunk[1]; b = +hunk[2]; }
+      inHunk = true; frag.append(h('div', { class: 'dl hunk', text: l })); continue;
+    }
     if (l.startsWith('diff ')) inHunk = false;
     if (!inHunk) { if (/^(rename|copy|new file|deleted file|old mode|new mode|Binary)/.test(l)) frag.append(h('div', { class: 'dl meta', text: l })); continue; }
-    if (l.startsWith('+')) row('add', '', b++, '+', l.slice(1));
-    else if (l.startsWith('-')) row('del', a++, '', '−', l.slice(1));
+    if (l.startsWith('+')) row('add', '', numbered ? b++ : '', '+', l.slice(1));
+    else if (l.startsWith('-')) row('del', numbered ? a++ : '', '', '−', l.slice(1));
     else if (l.startsWith('\\')) frag.append(h('div', { class: 'dl meta', text: l }));
-    else row('', a++, b++, '', l.slice(1));
+    else row('', numbered ? a++ : '', numbered ? b++ : '', '', l.slice(1));
   }
   if (!frag.childNodes.length) frag.append(h('div', { class: 'dl meta', text: '（パッチ本文なし：バイナリ or 空白のみの変更）' }));
-  return h('div', { class: 'patch' }, h('div', { class: 'patch-in' }, frag));
+  const inner = h('div', { class: 'patch-in' }, frag);
+  const box = h('div', { class: 'patch' }, inner);
+  if (lines.length > max) {
+    box.append(h('button', { type: 'button', class: 'btn xs out-more', text: `残り ${fmtNum(lines.length - max)} 行を表示`, onclick: () => box.replaceWith(patchLines(patch, Infinity)) }));
+  }
+  return box;
 }
 
 function diffFile(f) {
@@ -2335,6 +3029,259 @@ function diffFile(f) {
   return d;
 }
 
+// ───────────────────────── swarm board ─────────────────────────
+const SWARM_STATE = { working: '稼働中', waiting: '待機', killed: '終了' };
+const curBoard = () => (S.threadId && S.swarms.get(S.threadId)) || null;
+const swarmOverlay = () => matchMedia('(max-width: 1180px)').matches;
+const bareName = (n) => String(n ?? '').replace(/^@/, '');
+const swarmWorkers = (b) => b.members.filter((m) => m.role !== 'coordinator');
+
+const swarmPushes = new Map();  // threadId -> count of boards pushed by WS / POST (outdates GETs in flight)
+const swarmGets = new Map();    // threadId -> sequence of the latest GET
+const swarmKilling = new Set(); // `${board_id}:${name}`
+const swarmDrafts = new Map();  // board_id -> unsent quick post
+let swarmPosting = false;
+let swarmShownBoard = null;     // board_id the panel currently renders
+let swarmRosterSig = '';
+let swarmStick = true;          // the feed follows new posts until the reader scrolls up
+
+function normalizeBoard(b) {
+  if (!b || typeof b !== 'object' || !b.board_id) return null;
+  const objects = (x) => (Array.isArray(x) ? x.filter((v) => v && typeof v === 'object') : []);
+  const messages = objects(b.messages).sort((a, c) => a.seq - c.seq);
+  return { ...b, members: objects(b.members), messages, head_seq: Number(b.head_seq) || Number(messages.at(-1)?.seq) || 0 };
+}
+/** Stores a snapshot for one thread. A snapshot older than the cached one (by head_seq) is ignored. */
+function storeSwarm(threadId, board) {
+  const prev = S.swarms.get(threadId);
+  if (board && prev?.board_id === board.board_id && board.head_seq < prev.head_seq) return;
+  if (board) S.swarms.set(threadId, board); else S.swarms.delete(threadId);
+  if (threadId === S.threadId) renderSwarm();
+}
+/** A pushed snapshot belongs to its thread and to every other cached view of the same board. */
+function pushSwarm(threadId, raw) {
+  const board = normalizeBoard(raw);
+  const ids = new Set([threadId]);
+  if (board) for (const [id, b] of S.swarms) if (b.board_id === board.board_id) ids.add(id);
+  for (const id of ids) {
+    swarmPushes.set(id, (swarmPushes.get(id) || 0) + 1);
+    storeSwarm(id, board);
+  }
+}
+async function loadSwarm(threadId, { manual = false } = {}) {
+  const seq = (swarmGets.get(threadId) || 0) + 1;
+  swarmGets.set(threadId, seq);
+  const pushes = swarmPushes.get(threadId) || 0;
+  try {
+    const r = await api(`/api/threads/${threadId}/swarm`);
+    if (swarmGets.get(threadId) !== seq || (swarmPushes.get(threadId) || 0) !== pushes) return;
+    storeSwarm(threadId, normalizeBoard(r));
+  } catch (e) {
+    if (manual) toast(`Swarm ボードを取得できません: ${e.message}`, 'err'); // background fetches stay quiet
+  }
+}
+/** POST returning a snapshot. If something newer was pushed meanwhile, re-reads instead of going backwards. */
+async function postSwarm(path, json) {
+  const threadId = S.threadId;
+  const coordinator = curBoard().coordinator_thread_id;
+  const pushes = swarmPushes.get(threadId) || 0;
+  const next = normalizeBoard(await api(`/api/threads/${coordinator}/swarm/${path}`, { method: 'POST', json }));
+  const raced = (swarmPushes.get(threadId) || 0) !== pushes && next?.head_seq <= (S.swarms.get(threadId)?.head_seq ?? -1);
+  if (!next || raced) loadSwarm(threadId); else pushSwarm(threadId, next);
+}
+
+function renderSwarmPill(b) {
+  const btn = $('#btn-swarm');
+  btn.hidden = !b;
+  if (!b) return;
+  const workers = swarmWorkers(b);
+  const working = workers.filter((m) => m.state === 'working').length;
+  const alive = workers.filter((m) => m.state !== 'killed').length;
+  $('.swarm-count', btn).textContent = String(alive);
+  $('.pulse', btn).hidden = !working;
+  const label = `Swarm ボード: ワーカー ${alive}（稼働 ${working}） (${IS_MAC ? '⌥S' : 'Alt+S'})`;
+  btn.title = label; btn.setAttribute('aria-label', label);
+}
+
+function swarmCard(b, m) {
+  const name = bareName(m.name);
+  const state = Object.hasOwn(SWARM_STATE, m.state) ? m.state : 'waiting';
+  const here = m.thread_id === S.threadId;
+  const open = ibtn('open', here ? `@${name} のスレッドを表示中` : `@${name} のスレッドを開く`, () => {
+    if (swarmOverlay()) setRail(null); // the overlay would hide the thread that was asked for
+    openThread(m.thread_id);
+  }, 'sm sw-open');
+  open.disabled = !m.thread_id || here;
+  open.dataset.fk = `open:${name}`;
+  const stop = ibtn('stop', state === 'killed' ? `@${name} は終了しています` : `@${name} を停止`, () => confirmKill(name), 'sm sw-stop');
+  stop.disabled = state === 'killed' || swarmKilling.has(`${b.board_id}:${name}`);
+  stop.dataset.fk = `stop:${name}`;
+  return h('li', { class: `sw-card s-${state}`, dataset: { worker: name } },
+    h('div', { class: 'sw-row' },
+      provDot(m.provider, state === 'working' ? 'live' : ''),
+      h('span', { class: 'sw-name', title: `@${name}`, text: `@${name}` }),
+      h('span', { class: `sw-state s-${state}` }, state === 'working' ? h('span', { class: 'pulse', 'aria-hidden': 'true' }) : null, SWARM_STATE[state]),
+      h('span', { class: 'grow' }), open, stop),
+    h('div', { class: 'sw-meta' },
+      h('span', { class: 'sbadge', title: `${provLabel(m.provider)} / ${m.model || ''}`, text: m.model || provLabel(m.provider) }),
+      m.effort ? h('span', { class: 'sbadge', title: 'effort', text: m.effort }) : null,
+      m.role && m.role !== 'worker' ? h('span', { class: 'sbadge zip', text: m.role }) : null));
+}
+
+// in-app dialog: window.confirm is unavailable in some webviews
+function confirmKill(name) {
+  const board = curBoard(); if (!board) return;
+  openModal('ワーカーを停止', (body, close) => {
+    const cancel = h('button', { type: 'button', class: 'btn', text: 'キャンセル', onclick: close });
+    body.append(h('div', { class: 'form' },
+      h('p', { text: `@${name} を停止しますか？ 実行中の作業は中断されます。` }),
+      h('div', { class: 'actions' }, cancel,
+        h('button', { type: 'button', class: 'btn danger-ghost', id: 'btn-swarm-kill-ok', text: '停止する', onclick: () => { close(); killWorker(board.board_id, name); } }))));
+    setTimeout(() => cancel.focus(), 0);
+  }, { cls: 'form-modal' });
+}
+async function killWorker(boardId, name) {
+  if (curBoard()?.board_id !== boardId) return;
+  const key = `${boardId}:${name}`;
+  const redraw = () => { swarmRosterSig = ''; renderSwarm(); };
+  swarmKilling.add(key); redraw();
+  try {
+    await postSwarm(`workers/${encodeURIComponent(name)}/kill`);
+    toast(`@${name} の停止を要求しました`);
+  } catch (e) {
+    toast(`停止に失敗 (@${name}): ${e.message}`, 'err');
+  } finally { swarmKilling.delete(key); redraw(); }
+}
+
+/** Post body as text nodes, with @mentions and [done] wrapped in chips. Never parses HTML. */
+function swarmText(text) {
+  const parts = String(text ?? '').split(/((?<![A-Za-z0-9_.])@[A-Za-z0-9_][A-Za-z0-9_-]*|\[done\])/i);
+  return h('div', { class: 'sw-text' }, parts.map((part, i) => (i % 2
+    ? h('span', { class: part.startsWith('@') ? 'sw-mention' : 'sw-done', text: part })
+    : part)));
+}
+function swarmMessage(b, msg) {
+  const sender = bareName(msg.sender);
+  const member = b.members.find((m) => bareName(m.name) === sender);
+  const kind = sender === 'coordinator' || sender === 'user' ? sender : 'worker';
+  const at = new Date(msg.created_at);
+  return h('article', { class: 'sw-msg', dataset: { seq: String(msg.seq) } },
+    h('div', { class: 'sw-msg-head' },
+      h('span', { class: 'sw-seq', text: `#${msg.seq}` }),
+      h('span', { class: `sw-sender ${kind}` }, member ? provDot(member.provider) : null, h('span', { text: kind === 'worker' ? `@${sender}` : sender })),
+      h('time', { dateTime: String(msg.created_at ?? ''), title: Number.isNaN(at.getTime()) ? '' : at.toLocaleString('ja-JP'), text: fmtAgo(msg.created_at) })),
+    swarmText(msg.text));
+}
+/** Keyed by seq (posts are immutable), so a live update only appends and the log announces just the new ones. */
+function renderSwarmFeed(b) {
+  const feed = $('#swarm-feed');
+  if (b.messages.length) $('.sw-empty', feed)?.remove();
+  const have = new Map($$('.sw-msg', feed).map((el) => [el.dataset.seq, el]));
+  let at = $('.sw-msg', feed);
+  for (const msg of b.messages) {
+    const old = have.get(String(msg.seq));
+    have.delete(String(msg.seq));
+    if (old && old === at) at = at.nextElementSibling;
+    else feed.insertBefore(old || swarmMessage(b, msg), at);
+  }
+  have.forEach((el) => el.remove());
+  if (!b.messages.length && !$('.sw-empty', feed)) feed.append(h('div', { class: 'sw-empty', text: 'まだ投稿がありません' }));
+  if (swarmStick) feed.scrollTop = feed.scrollHeight;
+}
+function tickSwarmTimes() {
+  if ($('#swarm-panel').hidden) return;
+  $$('#swarm-feed time').forEach((el) => { el.textContent = fmtAgo(el.dateTime); });
+}
+
+const syncSwarmSend = () => { $('#btn-swarm-send').disabled = swarmPosting || !$('#swarm-input').value.trim(); };
+
+function renderSwarm() {
+  const b = curBoard();
+  const hadFocus = $('#swarm-panel').contains(document.activeElement);
+  renderSwarmPill(b);
+  renderRail();
+  syncSubscriptions();
+  if (!b) { if (hadFocus) ta().focus(); return; }
+
+  const input = $('#swarm-input');
+  if (swarmShownBoard !== b.board_id) {
+    swarmShownBoard = b.board_id; swarmRosterSig = ''; swarmStick = true;
+    $('#swarm-feed').replaceChildren();
+    input.value = swarmDrafts.get(b.board_id) || '';
+  }
+  const workers = swarmWorkers(b);
+  const count = (s) => workers.filter((m) => m.state === s).length;
+  const title = $('#swarm-title');
+  title.textContent = b.title || 'Swarm ボード'; title.title = title.textContent;
+  const sum = `稼働 ${count('working')} / 待機 ${count('waiting')}${count('killed') ? ` / 終了 ${count('killed')}` : ''}`;
+  if ($('#swarm-sum').textContent !== sum) $('#swarm-sum').textContent = sum;
+  $('#swarm-head-seq').textContent = b.head_seq ? `#${b.head_seq}` : '';
+
+  // rebuilt only when a card would look different; keyboard focus stays on the same button
+  const sig = JSON.stringify([S.threadId, workers.map((m) => [m.name, m.thread_id, m.provider, m.model, m.effort, m.state, m.role])]);
+  if (sig !== swarmRosterSig) {
+    swarmRosterSig = sig;
+    const list = $('#swarm-roster');
+    const focused = list.contains(document.activeElement) ? document.activeElement.dataset.fk : null;
+    list.replaceChildren(...(workers.length ? workers.map((m) => swarmCard(b, m)) : [h('li', { class: 'sw-empty', text: 'ワーカーはまだいません' })]));
+    if (focused) ($(`[data-fk="${CSS.escape(focused)}"]:not(:disabled)`, list) || $('#btn-swarm-close')).focus();
+  }
+  renderSwarmFeed(b);
+  syncSwarmSend();
+}
+
+function toggleSwarm() {
+  if (!curBoard()) { toast('このスレッドには Swarm ボードがありません。/swarm で起動できます'); return; }
+  if (shownRail() === 'swarm') { closeSwarm(); return; }
+  closePopover(); closeDrawer();
+  setRail('swarm');
+  if (swarmOverlay()) $('#btn-swarm-close').focus();
+}
+function closeSwarm() {
+  const hadFocus = $('#swarm-panel').contains(document.activeElement);
+  setRail(null);
+  if (hadFocus) $('#btn-swarm').focus();
+}
+
+function insertMention(name) {
+  const input = $('#swarm-input');
+  const before = input.value.slice(0, input.selectionStart);
+  const after = input.value.slice(input.selectionEnd);
+  const token = `${before && !/\s$/.test(before) ? ' ' : ''}@${name}${/^\s/.test(after) ? '' : ' '}`;
+  input.value = before + token + after;
+  input.focus();
+  input.setSelectionRange(before.length + token.length, before.length + token.length);
+  input.dispatchEvent(new Event('input'));
+}
+async function sendSwarmPost() {
+  const input = $('#swarm-input');
+  const text = input.value.trim();
+  const board = curBoard();
+  if (!text || !board || swarmPosting) return;
+  swarmPosting = true; swarmStick = true; syncSwarmSend();
+  try {
+    await postSwarm('messages', { text });
+    if (swarmDrafts.get(board.board_id)?.trim() === text) swarmDrafts.delete(board.board_id);
+    if (swarmShownBoard === board.board_id && input.value.trim() === text) input.value = '';
+  } catch (e) {
+    toast(`投稿に失敗: ${e.message}`, 'err'); // the text stays in the input
+  } finally { swarmPosting = false; syncSwarmSend(); }
+}
+
+function wireSwarm() {
+  $('#btn-swarm').onclick = toggleSwarm;
+  $('#btn-swarm-close').onclick = closeSwarm;
+  $('#btn-swarm-refresh').onclick = () => { if (S.threadId) loadSwarm(S.threadId, { manual: true }); };
+  $$('.sw-chip').forEach((b) => { b.onclick = () => insertMention(b.dataset.mention); });
+  const input = $('#swarm-input');
+  input.addEventListener('input', () => { if (swarmShownBoard) swarmDrafts.set(swarmShownBoard, input.value); syncSwarmSend(); });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.isComposing || e.keyCode === 229)) e.preventDefault(); });
+  $('#swarm-post').addEventListener('submit', (e) => { e.preventDefault(); sendSwarmPost(); });
+  const feed = $('#swarm-feed');
+  feed.addEventListener('scroll', () => { if (feed.clientHeight) swarmStick = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60; }, { passive: true });
+  if (typeof ResizeObserver === 'function') new ResizeObserver(() => { if (swarmStick) feed.scrollTop = feed.scrollHeight; }).observe(feed);
+}
+
 // ───────────────────────── WebSocket ─────────────────────────
 let backoff = 500; let reconnectTimer = null; let pingTimer = null;
 
@@ -2349,6 +3296,8 @@ function wsSend(obj) { if (S.ws && S.ws.readyState === WebSocket.OPEN) S.ws.send
 function syncSubscriptions() {
   const want = new Set();
   if (S.threadId) want.add(S.threadId);
+  const coordinator = curBoard()?.coordinator_thread_id;
+  if (coordinator) want.add(coordinator);
   for (const t of S.threads) if (isBusy(t.status)) want.add(t.id);
   if (!S.wsOk) return;
   for (const id of want) if (!S.subscribed.has(id)) { wsSend({ type: 'subscribe', thread_id: id }); S.subscribed.add(id); }
@@ -2371,7 +3320,7 @@ function connectWs() {
     clearInterval(pingTimer);
     pingTimer = setInterval(() => wsSend({ type: 'ping' }), 25000);
     // catch up on anything missed while disconnected
-    loadThreadsSoon(); if (S.threadId) loadDetailSoon();
+    loadThreadsSoon(); if (S.threadId) { loadDetailSoon(); loadSwarm(S.threadId); }
   };
   ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch { return; } try { handleWs(m); } catch (e) { console.error('ws handler', e); } };
   ws.onclose = () => { S.wsOk = false; S.subscribed.clear(); clearInterval(pingTimer); setConn('retry', `再接続中… (${(backoff / 1000).toFixed(1)}s)`); renderStatPill(); scheduleReconnect(); };
@@ -2428,7 +3377,7 @@ function handleWs(m) {
       if (TERMINAL_RUN.has(m.status)) {
         S.live.delete(m.thread_id);
         if (m.status === 'failed' && m.error) toast(`実行失敗: ${m.error}`, 'err', 6000);
-        if (m.thread_id === cur) { loadDetailSoon(); refreshDiffSoon(); }
+        if (m.thread_id === cur) { loadDetailSoon(); refreshDiffSoon(); loadSwarm(cur); }
         loadThreadsSoon(); loadDbStatsSoon(); loadUsageSoon();
       } else if (m.thread_id === cur) { renderHeader(); renderLive(); }
       break;
@@ -2451,6 +3400,7 @@ function handleWs(m) {
       if (m.thread_id !== cur || !S.detail) break;
       if (S.detail.items.some((x) => x.id === it.id)) break;
       S.detail.items.push(it);
+      S.detail.total_items += 1;
       if (it.kind === 'user_message') {
         const k = S.optimistic.findIndex((x) => x.threadId === m.thread_id);
         if (k >= 0) { const [o] = S.optimistic.splice(k, 1); $(`[data-opt="${o.key}"]`)?.remove(); }
@@ -2460,7 +3410,10 @@ function handleWs(m) {
       if (host) {
         $('#timeline .blank')?.remove();
         // optimistic bubbles stay below the items that were sent before them
-        appendItem(it, tl(), $('#timeline > .msg.user.pending') || host);
+        const anchor = $('#timeline > .msg.user.pending') || host;
+        let group = anchor.previousElementSibling;
+        if (!group?.classList.contains('run-group') || group.dataset.run !== (it.run_id || '')) { group = runGroup(it.run_id); anchor.before(group); }
+        appendItem(it, group, $(':scope > .run-foot', group));
       }
       renderLive(); scrollBottom();
       if (it.kind === 'file_change') refreshDiffSoon();
@@ -2490,6 +3443,9 @@ function handleWs(m) {
       syncSubscriptions(); renderSidebarSoon();
       break;
     }
+    case 'swarm_updated':
+      pushSwarm(m.thread_id, m.board);
+      break;
     case 'error':
       toast(`サーバーエラー: ${m.message}`, 'err', 6000);
       break;
@@ -2498,7 +3454,7 @@ function handleWs(m) {
 }
 
 // ───────────────────────── sidebar visibility ─────────────────────────
-function openDrawer() { $('#app').dataset.drawer = 'open'; $('#scrim').hidden = false; }
+function openDrawer() { $('#app').dataset.drawer = 'open'; $('#scrim').hidden = false; revealActiveRow(); }
 function closeDrawer() { $('#app').dataset.drawer = 'closed'; $('#scrim').hidden = true; }
 function toggleSidebar() {
   closePopover();
@@ -2543,8 +3499,9 @@ function wire() {
     e.currentTarget.setAttribute('aria-pressed', String(S.showArchived));
     renderSidebar(); loadThreads().catch(() => {});
   };
-  $('#btn-diff').onclick = () => setDiffOpen(!S.diffOpen);
-  $('#btn-diff-close').onclick = () => setDiffOpen(false);
+  $('#btn-diff').onclick = toggleDiff;
+  $('#btn-diff-close').onclick = () => setRail(null);
+  wireSwarm();
   $('#btn-diff-refresh').onclick = loadDiff;
   $('#btn-diff-expand').onclick = () => {
     const all = $$('#diff-body details.dfile');
@@ -2554,6 +3511,7 @@ function wire() {
   $('#chk-ws').onchange = (e) => { S.ignoreWs = e.target.checked; ls.set('t3.ws', S.ignoreWs ? '1' : '0'); loadDiff(); };
   $('#btn-fork').onclick = forkDialog;
   $('#btn-delegate').onclick = delegateDialog;
+  $('#btn-children').onclick = (e) => childrenMenu(e.currentTarget);
   $('#btn-stop').onclick = interrupt;
   $('#btn-jump').onclick = () => scrollBottom(true);
   $('#btn-model').onclick = (e) => openModelPopover(e.currentTarget);
@@ -2611,8 +3569,26 @@ function wire() {
     if (main.contains(e.target) && e.dataTransfer.files.length) addFiles([...e.dataTransfer.files]);
   });
 
-  // code block copy (delegated; works for every rendered Markdown)
+  // sidebar: arrow keys walk the visible rows
+  $('#sidebar').addEventListener('keydown', (e) => {
+    if ((e.key !== 'ArrowDown' && e.key !== 'ArrowUp') || e.altKey || e.metaKey || e.ctrlKey) return;
+    const rows = $$('.sb-scroll .trow-main, .sb-scroll .pg-toggle, .sb-scroll .more, .sb-scroll .empty-toggle').filter((el) => el.offsetParent);
+    if (!rows.length) return;
+    const from = e.target.closest('.trow-main') || e.target.closest('.pg-head')?.querySelector('.pg-toggle') || e.target;
+    const i = rows.indexOf(from);
+    const next = rows[i < 0 ? (e.key === 'ArrowDown' ? 0 : rows.length - 1) : Math.max(0, Math.min(rows.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)))];
+    e.preventDefault();
+    next.focus();
+    next.scrollIntoView({ block: 'nearest' });
+  });
+
+  // Markdown chips and code block copy (delegated; work for every rendered Markdown)
   document.addEventListener('click', async (e) => {
+    const chip = e.target.closest?.('.md .thread-chip, .md .path-chip');
+    if (chip) {
+      if (chip.dataset.thread) { $('dialog[open]')?.close(); openThread(chip.dataset.thread); } else copyText(chip.dataset.path, 'パスをコピーしました');
+      return;
+    }
     const b = e.target.closest?.('[data-copy]');
     if (!b) return;
     const code = b.closest('.codeblock')?.querySelector('code');
@@ -2627,17 +3603,24 @@ function wire() {
   // global shortcuts (⌘ on macOS so that Ctrl+K/B/D keep their text-editing meaning there)
   document.addEventListener('keydown', (e) => {
     if (e.isComposing || e.keyCode === 229) return;
+    const typing = !!e.target.closest?.('input, textarea, select, [contenteditable="true"]');
     if (e.key === 'Escape') {
+      if (e.defaultPrevented) return;
       if (popover) { e.preventDefault(); const a = popover.anchor; closePopover(); a.focus(); } else if ($('#app').dataset.drawer === 'open') closeDrawer();
+      else if (!$('dialog[open]') && shownRail() === 'swarm' && (swarmOverlay() || $('#swarm-panel').contains(e.target))) { e.preventDefault(); closeSwarm(); }
+      else if (!typing && !$('dialog[open]')) { e.preventDefault(); ta().focus(); }
       return;
     }
+    if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey && !typing && !popover && !$('dialog[open]')) { e.preventDefault(); ta().focus(); return; }
+    // Alt+S (⌥S types "ß" on macOS, so match the physical key)
+    if (e.code === 'KeyS' && e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) { e.preventDefault(); if (!$('dialog[open]')) toggleSwarm(); return; }
     const mod = IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
     if (!mod || e.altKey || e.shiftKey) return;
     const k = e.key.toLowerCase();
     const modal = $('dialog[open]');
     if (k === 'k') { if (modal && !modal.classList.contains('search')) return; e.preventDefault(); searchDialog(); return; }
     if (k === 'u') {
-      if (e.target.closest?.('input, textarea, select, [contenteditable="true"]')) return;
+      if (!IS_MAC && typing) return; // ⌘U has no text-editing meaning on macOS, so it also works from the composer
       e.preventDefault(); // Ctrl+U would otherwise open "view source"
       if (modal?.classList.contains('usage')) modal.close(); else if (!modal) usageDialog();
       return;
@@ -2646,7 +3629,7 @@ function wire() {
     e.preventDefault();
     if (modal) return;
     if (k === 'b') toggleSidebar();
-    else if (k === 'd') setDiffOpen(!S.diffOpen);
+    else if (k === 'd') toggleDiff();
     else goHome();
   });
   addEventListener('hashchange', () => { const id = threadFromHash(); if (id && id !== S.threadId) openThread(id, { push: false }); else if (!id && S.threadId) goHome(); });
@@ -2662,7 +3645,7 @@ async function boot() {
   const hashId = threadFromHash();
   if (hashId) $('#main').dataset.view = 'thread';
   renderHeader(); renderHero(); renderComposer(); renderStatPill();
-  setDiffOpen(S.diffOpen);
+  setRail(S.rail);
   connectWs();
   try {
     const [meta, providers] = await Promise.all([
@@ -2676,6 +3659,11 @@ async function boot() {
     S.compose.sel = defaultSelection(S.projectId);
     renderComposer(); renderStatPill(); loadDbStats(); loadUsage(7);
     await loadThreads();
+    if (!S.threadId && !hashId) {
+      preferActiveProject();
+      S.compose.sel = defaultSelection(S.projectId);
+      renderSidebar(); renderHeader(); renderHero(); renderComposer();
+    }
   } catch (e) {
     setConn('bad', `サーバーに接続できません: ${e.message}`);
     toast(`初期化に失敗: ${e.message}`, 'err', 6000);
@@ -2685,6 +3673,7 @@ async function boot() {
   $('#app').classList.add('ready');
   setInterval(() => { if (!document.hidden) loadThreads().catch(() => {}); }, 15000);
   setInterval(() => { if (!document.hidden) loadUsage(7); }, 5 * 60000);
+  setInterval(tickSwarmTimes, 30000);
 }
 
 boot();

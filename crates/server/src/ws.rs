@@ -71,6 +71,7 @@ async fn run(mut socket: WebSocket, coordinator: RunCoordinator, identity: AuthI
                         let visible = match &event {
                             WsServerMessage::Delta { thread_id, .. }
                             | WsServerMessage::TurnItemAdded { thread_id, .. } => subscriptions.contains(thread_id),
+                            WsServerMessage::SwarmUpdated { board, .. } => board.members.iter().any(|member| subscriptions.contains(&member.thread_id)),
                             _ => true,
                         };
                         if visible && !send(&mut socket, &event).await { return; }

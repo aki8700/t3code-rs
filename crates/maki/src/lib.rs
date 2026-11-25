@@ -2,20 +2,17 @@
 
 mod diff;
 mod econ;
+mod file;
 mod syntax;
 
-pub use diff::{code_diff, code_diff_scoped};
+pub use diff::{code_diff, code_diff_in_worktree, code_diff_scoped};
 pub use econ::{CompactionEconInput, CompactionEconResult, Prices, compaction_econ};
 
 use globset::GlobBuilder;
 use ignore::{Walk, WalkBuilder};
 use regex::Regex;
 use serde_json::{Value, json};
-use std::{
-    fs::{self, File},
-    io::Read,
-    path::Path,
-};
+use std::{fs, io::Read, path::Path};
 use syntax::{Grammar, enclosing_symbol, symbols};
 
 pub const DEFAULT_MAX_BYTES: usize = 32 * 1024;
@@ -27,6 +24,9 @@ const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = MAX_FILE_BYTES;
 const MAX_INDEX_LINES: usize = 4_000;
 const MAX_GREP_HITS: usize = 10_000;
+const MAX_GREP_FILES: usize = 2_000;
+const MAX_GREP_READ_BYTES: usize = 32 * 1024 * 1024;
+const MAX_GREP_LINE_CHARS: usize = 2_000;
 
 const GENERATED_GLOBS: &[&str] = &[
     "**/*.lock",
@@ -72,19 +72,34 @@ fn walk(path: &Path, max_depth: Option<usize>) -> Walk {
 }
 
 fn read_text(path: &Path) -> Result<String, String> {
-    let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut remaining = MAX_FILE_BYTES + 1;
+    read_text_bounded(path, &mut remaining)
+}
+
+fn read_text_bounded(path: &Path, remaining: &mut usize) -> Result<String, String> {
+    let path_error = |error| format!("{}: {error}", path.display());
+    let file = file::open(path).map_err(path_error)?;
+    let metadata = file.metadata().map_err(path_error)?;
     if !metadata.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
     if metadata.len() > MAX_FILE_BYTES as u64 {
         return Err(format!("{} exceeds the 2 MiB file limit", path.display()));
     }
+    if metadata.len() > *remaining as u64 {
+        *remaining = 0;
+        return Err("grep read limit reached".into());
+    }
+    let limit = (MAX_FILE_BYTES + 1).min(*remaining);
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    File::open(path)
-        .and_then(|file| file.take(MAX_FILE_BYTES as u64 + 1).read_to_end(&mut bytes))
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let result = file.take(limit as u64).read_to_end(&mut bytes);
+    *remaining -= bytes.len();
+    result.map_err(path_error)?;
     if bytes.len() > MAX_FILE_BYTES {
         return Err(format!("{} exceeds the 2 MiB file limit", path.display()));
+    }
+    if bytes.len() == limit && metadata.len() < bytes.len() as u64 {
+        return Err("grep read limit reached".into());
     }
     if bytes.contains(&0) {
         return Err(format!("{} is a binary file", path.display()));
@@ -109,7 +124,7 @@ pub fn code_index(path: &Path, max_depth: usize, max_lines: usize) -> Result<Val
     let mut remaining = max_lines.min(MAX_INDEX_LINES);
     let mut files = Vec::new();
     let mut truncated = false;
-    if path.is_dir() {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
         for entry in walk(path, Some(max_depth)).filter_map(Result::ok) {
             if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                 continue;
@@ -280,7 +295,8 @@ pub fn code_grep(
     let mut bytes = 0;
     let mut truncated = false;
     let mut files = Vec::new();
-    let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let entries = if metadata.is_dir() {
         Box::new(
             walk(path, None)
@@ -296,7 +312,12 @@ pub fn code_grep(
     } else {
         path.parent().unwrap_or(Path::new(""))
     };
-    for file in entries {
+    let mut remaining = MAX_GREP_READ_BYTES;
+    for (scanned, file) in entries.enumerate() {
+        if scanned == MAX_GREP_FILES || remaining == 0 {
+            truncated = true;
+            break;
+        }
         let label = file.strip_prefix(base).unwrap_or(&file);
         if generated(&file)
             || glob.as_ref().is_some_and(|(glob, by_name)| {
@@ -310,15 +331,15 @@ pub fn code_grep(
         {
             continue;
         }
-        let Ok(source) = read_text(&file) else {
-            continue;
+        let source = match read_text_bounded(&file, &mut remaining) {
+            Ok(source) => source,
+            Err(_) if remaining == 0 => {
+                truncated = true;
+                break;
+            }
+            Err(_) => continue,
         };
-        if source
-            .lines()
-            .any(|line| line.len() > 2_000 && line.chars().take(2_001).count() > 2_000)
-        {
-            continue;
-        }
+        let mut output_full = false;
         let mut tree = None;
         let mut matches = Vec::new();
         let mut offset = 0;
@@ -326,11 +347,15 @@ pub fn code_grep(
             let text = line.lines().next().unwrap_or_default();
             let line_start = offset;
             offset += line.len();
+            if text.len() > MAX_GREP_LINE_CHARS && text.chars().nth(MAX_GREP_LINE_CHARS).is_some() {
+                truncated = true;
+                continue;
+            }
             let Some(found) = regex.find(text) else {
                 continue;
             };
             if hits == max_hits {
-                truncated = true;
+                output_full = true;
                 break;
             }
             let tree = tree.get_or_insert_with(|| {
@@ -352,7 +377,7 @@ pub fn code_grep(
                     0
                 };
             if cost > max_bytes - bytes {
-                truncated = true;
+                output_full = true;
                 break;
             }
             bytes += cost;
@@ -362,7 +387,8 @@ pub fn code_grep(
         if !matches.is_empty() {
             files.push(json!({"path": label.to_string_lossy(), "matches": matches}));
         }
-        if truncated {
+        if output_full {
+            truncated = true;
             break;
         }
     }

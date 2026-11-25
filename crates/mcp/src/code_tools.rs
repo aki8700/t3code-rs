@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use t3_core::{CoreError, CoreResult};
 use t3_maki::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_DEPTH, DEFAULT_MAX_HITS, DEFAULT_MAX_LINES, code_diff,
-    code_diff_scoped, code_grep, code_index, code_slice,
+    code_diff_in_worktree, code_diff_scoped, code_grep, code_index, code_slice,
 };
 
 #[derive(Deserialize)]
@@ -45,13 +45,21 @@ pub(crate) async fn call(
     name: String,
     args: Value,
     workspace: Option<PathBuf>,
+    project: Option<PathBuf>,
 ) -> CoreResult<Value> {
-    tokio::task::spawn_blocking(move || execute(&name, args, workspace.as_deref()))
-        .await
-        .map_err(|error| CoreError::Internal(error.to_string()))?
+    tokio::task::spawn_blocking(move || {
+        execute(&name, args, workspace.as_deref(), project.as_deref())
+    })
+    .await
+    .map_err(|error| CoreError::Internal(error.to_string()))?
 }
 
-fn execute(name: &str, args: Value, workspace: Option<&Path>) -> CoreResult<Value> {
+fn execute(
+    name: &str,
+    args: Value,
+    workspace: Option<&Path>,
+    project: Option<&Path>,
+) -> CoreResult<Value> {
     let workspace = workspace
         .map(Path::canonicalize)
         .transpose()
@@ -96,9 +104,12 @@ fn execute(name: &str, args: Value, workspace: Option<&Path>) -> CoreResult<Valu
             let rev = args.rev.as_deref();
             let path = args.path.as_deref();
             let max_bytes = args.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
-            match workspace {
-                Some(root) => code_diff_scoped(&cwd, rev, path, max_bytes, &root),
-                None => code_diff(&cwd, rev, path, max_bytes),
+            match (workspace, project) {
+                (Some(root), Some(project)) => {
+                    code_diff_in_worktree(&cwd, rev, path, max_bytes, &root, project)
+                }
+                (Some(root), None) => code_diff_scoped(&cwd, rev, path, max_bytes, &root),
+                (None, _) => code_diff(&cwd, rev, path, max_bytes),
             }
         }
         _ => return Err(CoreError::InvalidArgument(format!("unknown tool: {name}"))),

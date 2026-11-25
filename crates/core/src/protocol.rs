@@ -1,4 +1,6 @@
-use crate::types::{PendingRequest, Run, RunStatus, ThreadStatus, TurnItem, TurnItemKind};
+use crate::types::{
+    PendingRequest, Run, RunStatus, SwarmBoardSnapshot, ThreadStatus, TurnItem, TurnItemKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -80,6 +82,10 @@ pub enum WsServerMessage {
         parent_thread_id: Uuid,
         child_thread_id: Uuid,
         status: ThreadStatus,
+    },
+    SwarmUpdated {
+        thread_id: Uuid,
+        board: SwarmBoardSnapshot,
     },
     Error {
         message: String,

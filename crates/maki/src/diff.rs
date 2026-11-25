@@ -14,7 +14,7 @@ pub fn code_diff(
     path: Option<&str>,
     max_bytes: usize,
 ) -> Result<Value, String> {
-    diff(cwd, rev, path, max_bytes, None)
+    diff(cwd, rev, path, max_bytes, None, None)
 }
 
 /// Restrict Git discovery and path selection to the caller's workspace.
@@ -25,7 +25,19 @@ pub fn code_diff_scoped(
     max_bytes: usize,
     workspace: &Path,
 ) -> Result<Value, String> {
-    diff(cwd, rev, path, max_bytes, Some(workspace))
+    diff(cwd, rev, path, max_bytes, Some(workspace), None)
+}
+
+/// Restrict a linked checkout to its workspace and the registered project's worktree metadata.
+pub fn code_diff_in_worktree(
+    cwd: &Path,
+    rev: Option<&str>,
+    path: Option<&str>,
+    max_bytes: usize,
+    workspace: &Path,
+    project: &Path,
+) -> Result<Value, String> {
+    diff(cwd, rev, path, max_bytes, Some(workspace), Some(project))
 }
 
 fn diff(
@@ -34,6 +46,7 @@ fn diff(
     path: Option<&str>,
     max_bytes: usize,
     workspace: Option<&Path>,
+    project: Option<&Path>,
 ) -> Result<Value, String> {
     let cwd = cwd.canonicalize().map_err(|error| error.to_string())?;
     let workspace = workspace
@@ -41,22 +54,33 @@ fn diff(
         .transpose()
         .map_err(|error| error.to_string())?;
     let path = literal_path(&cwd, path, workspace.as_deref())?;
-    if let Some(workspace) = &workspace {
-        let (root, truncated) =
-            git_text(command(&cwd).args(["rev-parse", "--show-toplevel"]), 32_768)?;
-        if truncated {
-            return Err("Git repository path exceeds the limit".into());
-        }
-        let root = Path::new(root.strip_suffix('\n').unwrap_or(&root))
-            .canonicalize()
-            .map_err(|error| error.to_string())?;
-        if !root.starts_with(workspace) {
-            return Err("Git repository is outside the caller's workspace".into());
-        }
+    let root = git_path(&cwd, "--show-toplevel")?;
+    let boundary = workspace.as_deref().unwrap_or(&root);
+    if !root.starts_with(boundary) {
+        return Err("Git repository is outside the caller's workspace".into());
     }
+    let git_dir = git_path(&cwd, "--git-dir")?;
+    let common_dir = git_path(&cwd, "--git-common-dir")?;
+    if !(git_dir.starts_with(boundary) && common_dir.starts_with(boundary))
+        && !project.is_some_and(|project| {
+            workspace.as_deref() == Some(root.as_path())
+                && registered_worktree(project, &root, &git_dir, &common_dir)
+        })
+    {
+        return Err("Git metadata is outside the caller's workspace".into());
+    }
+    let scoped_git = || {
+        let mut git = command(&cwd);
+        git.arg("--git-dir")
+            .arg(&git_dir)
+            .arg("--work-tree")
+            .arg(&root)
+            .env("GIT_COMMON_DIR", &common_dir);
+        git
+    };
     let tree = if let Some(rev) = rev {
         let (tree, truncated) = git_text(
-            command(&cwd).args([
+            scoped_git().args([
                 "rev-parse",
                 "--verify",
                 "--end-of-options",
@@ -76,9 +100,9 @@ fn diff(
         None
     };
 
-    let filters = disabled_filters(&cwd)?;
+    let filters = disabled_filters(scoped_git())?;
     let make_diff = |format: &[&str], include_generated: bool| {
-        let mut git = command(&cwd);
+        let mut git = scoped_git();
         for filter in &filters {
             git.args(["-c", filter]);
         }
@@ -140,6 +164,46 @@ fn diff(
         "skipped_generated": skipped_generated,
         "truncated": names_truncated || hunks_truncated,
     }))
+}
+
+fn git_path(cwd: &Path, flag: &str) -> Result<PathBuf, String> {
+    let (path, truncated) = git_text(
+        command(cwd).args(["rev-parse", "--path-format=absolute", flag]),
+        32_768,
+    )?;
+    if truncated {
+        return Err("Git repository path exceeds the limit".into());
+    }
+    Path::new(path.strip_suffix('\n').unwrap_or(&path))
+        .canonicalize()
+        .map_err(|error| error.to_string())
+}
+
+fn registered_worktree(project: &Path, root: &Path, git_dir: &Path, common_dir: &Path) -> bool {
+    let Ok(project) = project.canonicalize() else {
+        return false;
+    };
+    // Match the actual in-project metadata directory and its single worktree registration.
+    if common_dir != project.join(".git")
+        || git_dir.parent() != Some(common_dir.join("worktrees").as_path())
+    {
+        return false;
+    }
+    let Ok(file) = crate::file::open(&git_dir.join("gitdir")) else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
+    let mut backref = String::new();
+    if file.take(32_769).read_to_string(&mut backref).is_err() || backref.len() > 32_768 {
+        return false;
+    }
+    let backref = Path::new(backref.trim_end_matches(['\r', '\n']));
+    git_dir
+        .join(backref)
+        .canonicalize()
+        .is_ok_and(|path| path == root.join(".git"))
 }
 
 fn literal_path(
@@ -231,10 +295,10 @@ fn command(cwd: &Path) -> Command {
     command
 }
 
-fn disabled_filters(cwd: &Path) -> Result<Vec<String>, String> {
+fn disabled_filters(mut git: Command) -> Result<Vec<String>, String> {
     // A worktree diff can invoke configured clean filters even with textconv disabled.
     let (keys, truncated) = git_text(
-        command(cwd).args(["config", "--null", "--name-only", "--list"]),
+        git.args(["config", "--null", "--name-only", "--list"]),
         65_536,
     )?;
     if truncated {

@@ -18,7 +18,7 @@
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-<div id="app" class="app" data-sb="open" data-drawer="closed" data-diff="closed">
+<div id="app" class="app" data-sb="open" data-drawer="closed" data-rail="none">
 
   <!-- ===== サイドバー ===== -->
   <aside id="sidebar" class="sidebar" aria-label="スレッド一覧">
@@ -60,14 +60,15 @@
       <button type="button" class="ibtn sb-open" id="btn-sb-open" data-icon="panel" data-kbd="B" data-title="サイドバーを開く" aria-label="サイドバーを開く"></button>
       <div class="tb-title" id="tb-title"></div>
       <div class="tb-actions">
+        <button type="button" class="tbtn" id="btn-children" aria-haspopup="dialog" aria-expanded="false" title="子スレッドの一覧" hidden><span class="lbl">子スレッド</span><b class="n">0</b><span class="caretdown" aria-hidden="true">▾</span></button>
         <button type="button" class="tbtn thread-only" id="btn-fork" data-icon="fork" title="別のプロバイダ／モデルへ文脈ごと分岐 (Fork / Handoff)"><span class="lbl">分岐</span></button>
         <button type="button" class="tbtn thread-only" id="btn-delegate" data-icon="split" title="子スレッドとして並列に委譲 (Delegate)"><span class="lbl">委譲</span></button>
         <button type="button" class="tbtn thread-only" id="btn-diff" data-icon="diff" data-kbd="D" data-title="Git 差分" aria-pressed="false"><span class="lbl">Diff</span><span class="diff-badge" id="diff-badge" hidden></span></button>
+        <button type="button" class="tbtn swarm-btn" id="btn-swarm" data-icon="swarm" aria-pressed="false" aria-controls="swarm-panel" aria-keyshortcuts="Alt+S" hidden><span class="lbl">Swarm</span><b class="swarm-count">0</b><span class="pulse" aria-hidden="true" hidden></span></button>
         <button type="button" class="ibtn wide-only" id="btn-search" data-icon="search" data-kbd="K" data-title="全文検索" aria-label="検索"></button>
         <button type="button" class="ibtn wide-only" id="btn-top-usage" data-icon="chart" data-kbd="U" data-title="使用量" aria-label="使用量"></button>
       </div>
     </header>
-    <div id="children-bar" class="children-bar" hidden></div>
 
     <div class="tl-wrap" id="tl-wrap">
       <div class="tl-scroll" id="tl-scroll">
@@ -81,6 +82,7 @@
       <div id="approval" class="approval-stack"></div>
 
       <form id="composer" class="composer" autocomplete="off">
+        <div id="swarm-hint" class="swarm-hint" role="status"></div>
         <div id="att-chips" class="att-chips" hidden></div>
         <textarea id="prompt" rows="1" aria-label="メッセージ"></textarea>
         <div class="cbar">
@@ -106,7 +108,7 @@
   </main>
 
   <!-- ===== 右: Git 差分 ===== -->
-  <aside id="diff-panel" class="diff-panel" aria-label="Git 差分" hidden>
+  <aside id="diff-panel" class="rail-panel diff-panel" aria-label="Git 差分" hidden>
     <div class="dp-head drag-region">
       <strong>差分</strong>
       <span class="dp-sum" id="diff-sum"></span>
@@ -121,6 +123,33 @@
       <label class="switch"><input type="checkbox" id="chk-ws" checked><i></i><span>空白の差を無視</span></label>
     </div>
     <div class="dp-body" id="diff-body"></div>
+  </aside>
+
+  <!-- ===== 右: Swarm ボード（差分と同じ枠を切り替えて使う） ===== -->
+  <aside id="swarm-panel" class="rail-panel swarm-panel" aria-label="Swarm ボード" hidden>
+    <div class="dp-head drag-region">
+      <div class="sw-heading">
+        <h2 class="sw-title" id="swarm-title"></h2>
+        <small class="sw-sum" id="swarm-sum" role="status"></small>
+      </div>
+      <button type="button" class="ibtn sm" id="btn-swarm-refresh" data-icon="refresh" title="更新" aria-label="Swarm ボードを更新"></button>
+      <button type="button" class="ibtn sm" id="btn-swarm-close" data-icon="close" title="閉じる" aria-label="Swarm ボードを閉じる"></button>
+    </div>
+    <section class="sw-roster" aria-label="ワーカー一覧">
+      <ul id="swarm-roster"></ul>
+    </section>
+    <div class="sw-feed-head"><h3>共有メッセージボード</h3><span id="swarm-head-seq"></span></div>
+    <div class="sw-feed" id="swarm-feed" role="log" aria-label="共有メッセージボード" tabindex="0"></div>
+    <form class="sw-post" id="swarm-post" autocomplete="off">
+      <div class="sw-chips" role="group" aria-label="宛先を挿入">
+        <button type="button" class="sw-chip" data-mention="coordinator">@coordinator</button>
+        <button type="button" class="sw-chip" data-mention="all">@all</button>
+      </div>
+      <div class="sw-post-row">
+        <input type="text" class="inp" id="swarm-input" placeholder="@worker や @coordinator に指示を送る..." aria-label="ボードへの投稿" enterkeyhint="send">
+        <button type="submit" class="round-btn send" id="btn-swarm-send" data-icon="arrowUp" title="投稿" aria-label="ボードに投稿" disabled></button>
+      </div>
+    </form>
   </aside>
 </div>
 <div id="toasts" class="toasts" popover="manual" aria-live="polite"></div>

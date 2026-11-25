@@ -1,6 +1,10 @@
 use super::*;
 use std::process::Command;
-use tempfile::{TempDir, tempdir};
+use tempfile::TempDir;
+
+fn tempdir() -> std::io::Result<TempDir> {
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)
+}
 
 fn fixture(dir: &TempDir, name: &str, text: impl AsRef<[u8]>) -> std::path::PathBuf {
     let path = dir.path().join(name);
@@ -330,4 +334,68 @@ fn compaction_economics_match_reference_costs() {
     let result = compaction_econ(input);
     assert_eq!(result.break_even_turns, None);
     assert_eq!(result.worth_compacting, Some(false));
+}
+
+#[test]
+fn grep_keeps_short_lines_and_other_files_when_a_line_is_too_long() {
+    let dir = tempdir().unwrap();
+    fixture(
+        &dir,
+        "first.txt",
+        format!("{}\nneedle\n", "字".repeat(2_001)),
+    );
+    fixture(&dir, "second.txt", "needle\n");
+    let result = code_grep("needle", dir.path(), None, 10, 4096).unwrap();
+    assert_eq!(result["truncated"], true);
+    assert_eq!(result["hits"], 2);
+    let first = result["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "first.txt")
+        .unwrap();
+    assert_eq!(first["matches"][0]["line"], 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn slice_rejects_symlink_files_and_symlink_directories() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let source = fixture(&dir, "plain.txt", "text\n");
+    let link = root.join("link.txt");
+    symlink(&source, &link).unwrap();
+    assert!(code_slice(&link, None, None, None, 100).is_err());
+
+    let outside = tempdir().unwrap();
+    fixture(&outside, "plain.txt", "text\n");
+    symlink(outside.path(), root.join("linked-dir")).unwrap();
+    assert!(code_slice(&root.join("linked-dir/plain.txt"), None, None, None, 100).is_err());
+}
+
+#[test]
+fn grep_caps_the_number_of_files_scanned() {
+    let dir = tempdir().unwrap();
+    for index in 0..2_001 {
+        fixture(&dir, &format!("{index}.txt"), "short line\n");
+    }
+    let result = code_grep("missing", dir.path(), None, 10, 4096).unwrap();
+    assert_eq!(result["hits"], 0);
+    assert_eq!(result["truncated"], true);
+}
+
+#[test]
+fn grep_counts_binary_reads_against_the_total_byte_budget() {
+    let dir = tempdir().unwrap();
+    for index in 0..17 {
+        fs::File::create(dir.path().join(format!("{index}.bin")))
+            .unwrap()
+            .set_len(2 * 1024 * 1024)
+            .unwrap();
+    }
+    let result = code_grep("missing", dir.path(), None, 10, 4096).unwrap();
+    assert_eq!(result["hits"], 0);
+    assert_eq!(result["truncated"], true);
 }

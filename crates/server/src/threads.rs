@@ -34,6 +34,10 @@ pub struct CreateThread {
 pub struct PatchThread {
     pub title: Option<String>,
     pub model_selection: Option<ModelSelection>,
+    #[serde(default)]
+    pub runtime_mode: Option<RuntimeMode>,
+    #[serde(default)]
+    pub interaction_mode: Option<InteractionMode>,
     pub archived: Option<bool>,
     pub pinned: Option<bool>,
 }
@@ -59,6 +63,15 @@ impl RunCoordinator {
         }
         if let Some(selection) = patch.model_selection {
             self.select_model(&thread, &selection).await?;
+        }
+        if patch.runtime_mode.is_some() || patch.interaction_mode.is_some() {
+            store
+                .update_thread_modes(
+                    id,
+                    patch.runtime_mode.unwrap_or(thread.runtime_mode),
+                    patch.interaction_mode.unwrap_or(thread.interaction_mode),
+                )
+                .await?;
         }
         if let Some(archived) = patch.archived {
             store.archive_thread(id, archived).await?;
@@ -130,7 +143,7 @@ impl RunCoordinator {
         GitManager::diff_summary(&self.workspace(&thread).await?, ignore_whitespace).await
     }
 
-    async fn new_thread(
+    pub(crate) async fn new_thread(
         &self,
         input: CreateThread,
         parent: Option<(&Thread, &str)>,
@@ -319,7 +332,7 @@ impl RunCoordinator {
         Ok(format_handoff(&thread.title, &items, &runs))
     }
 
-    async fn discard_thread(&self, thread: &Thread) {
+    pub(crate) async fn discard_thread(&self, thread: &Thread) {
         let id = thread.id.to_string();
         if let Err(error) = self
             .sql(move |db| {
@@ -648,6 +661,43 @@ pub(crate) fn validate_title(title: &str) -> CoreResult<()> {
 
 #[async_trait]
 impl OrchestratorBackend for RunCoordinator {
+    async fn swarm_status(&self, thread_id: Uuid) -> CoreResult<Option<SwarmBoardSnapshot>> {
+        self.get_board(thread_id).await
+    }
+
+    async fn swarm_add_worker(
+        &self,
+        thread_id: Uuid,
+        spec: SwarmWorkerSpec,
+    ) -> CoreResult<SwarmMember> {
+        self.add_worker(thread_id, spec).await
+    }
+
+    async fn swarm_post_message(
+        &self,
+        thread_id: Uuid,
+        text: String,
+    ) -> CoreResult<SwarmBoardSnapshot> {
+        self.post_message(thread_id, None, text).await
+    }
+
+    async fn swarm_read_board(
+        &self,
+        thread_id: Uuid,
+        since: i64,
+        limit: usize,
+    ) -> CoreResult<Vec<SwarmMessage>> {
+        self.read_board(thread_id, since, limit).await
+    }
+
+    async fn swarm_kill_worker(
+        &self,
+        thread_id: Uuid,
+        name: &str,
+    ) -> CoreResult<SwarmBoardSnapshot> {
+        self.kill_worker(thread_id, name, true).await
+    }
+
     async fn get_thread(&self, id: Uuid) -> CoreResult<Thread> {
         self.0.store.get_thread(id).await
     }

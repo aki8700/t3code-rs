@@ -77,6 +77,44 @@ pub trait OrchestratorBackend: Send + Sync {
     ) -> CoreResult<Uuid>;
     async fn thread_fork(&self, thread_id: Uuid, options: ForkOptions) -> CoreResult<Thread>;
     async fn orch_stats(&self) -> CoreResult<Vec<OrchModelStat>>;
+    async fn swarm_status(&self, _thread_id: Uuid) -> CoreResult<Option<SwarmBoardSnapshot>> {
+        swarm_unsupported()
+    }
+    async fn swarm_add_worker(
+        &self,
+        _thread_id: Uuid,
+        _spec: SwarmWorkerSpec,
+    ) -> CoreResult<SwarmMember> {
+        swarm_unsupported()
+    }
+    async fn swarm_post_message(
+        &self,
+        _thread_id: Uuid,
+        _text: String,
+    ) -> CoreResult<SwarmBoardSnapshot> {
+        swarm_unsupported()
+    }
+    async fn swarm_read_board(
+        &self,
+        _thread_id: Uuid,
+        _since: i64,
+        _limit: usize,
+    ) -> CoreResult<Vec<SwarmMessage>> {
+        swarm_unsupported()
+    }
+    async fn swarm_kill_worker(
+        &self,
+        _thread_id: Uuid,
+        _name: &str,
+    ) -> CoreResult<SwarmBoardSnapshot> {
+        swarm_unsupported()
+    }
+}
+
+fn swarm_unsupported<T>() -> CoreResult<T> {
+    Err(CoreError::InvalidArgument(
+        "swarm tools are unsupported by this backend".into(),
+    ))
 }
 
 pub struct McpServer<B> {
@@ -188,10 +226,68 @@ impl<B: OrchestratorBackend> McpServer<B> {
         let CallContext { thread_id, caller } = context;
         match name {
             "orchestrator_capabilities" => encode(backend.capabilities().await?),
+            "swarm_status" => {
+                let args: SwarmStatus = decode(args)?;
+                encode(
+                    backend
+                        .swarm_status(swarm_thread(args.thread_id, context)?)
+                        .await?,
+                )
+            }
+            "swarm_add_worker" => {
+                let args: SwarmArgs<SwarmWorkerSpec> = decode(args)?;
+                encode(
+                    backend
+                        .swarm_add_worker(swarm_thread(args.thread_id, context)?, args.input)
+                        .await?,
+                )
+            }
+            "swarm_post_message" => {
+                let args: SwarmArgs<SwarmPost> = decode(args)?;
+                encode(
+                    backend
+                        .swarm_post_message(swarm_thread(args.thread_id, context)?, args.input.text)
+                        .await?,
+                )
+            }
+            "swarm_read_board" => {
+                let args: SwarmArgs<SwarmRead> = decode(args)?;
+                encode(
+                    backend
+                        .swarm_read_board(
+                            swarm_thread(args.thread_id, context)?,
+                            args.input.since,
+                            args.input.limit,
+                        )
+                        .await?,
+                )
+            }
+            "swarm_kill_worker" => {
+                let args: SwarmArgs<SwarmKill> = decode(args)?;
+                encode(
+                    backend
+                        .swarm_kill_worker(swarm_thread(args.thread_id, context)?, &args.input.name)
+                        .await?,
+                )
+            }
             "delegate_task" => {
                 let args: DelegateArgs = decode(args)?;
                 let parent_thread_id = resolve_thread(args.parent_thread_id, thread_id)?;
-                self.scoped_thread(parent_thread_id, caller).await?;
+                let parent = self.scoped_thread(parent_thread_id, caller).await?;
+                if args.isolation == IsolationMode::Worktree {
+                    let parent = match parent {
+                        Some(parent) => parent,
+                        None => backend.get_thread(parent_thread_id).await?,
+                    };
+                    if parent.interaction_mode == InteractionMode::Plan
+                        || caller
+                            .is_some_and(|caller| caller.interaction_mode == InteractionMode::Plan)
+                    {
+                        return Err(CoreError::InvalidArgument(
+                            "a plan thread cannot delegate to a worktree".into(),
+                        ));
+                    }
+                }
                 let spec = DelegationSpec {
                     parent_thread_id,
                     title: args.title,
@@ -275,15 +371,27 @@ impl<B: OrchestratorBackend> McpServer<B> {
             "orch_stats" => encode(backend.orch_stats().await?),
             "compaction_econ" => encode(t3_maki::compaction_econ(decode(args)?)),
             "code_index" | "code_slice" | "code_grep" | "code_diff" => {
-                let workspace = match (caller, thread_id) {
-                    (Some(caller), _) => Some(backend.workspace_root(caller).await?),
-                    (None, Some(id)) => {
-                        let caller = backend.get_thread(id).await?;
-                        Some(backend.workspace_root(&caller).await?)
-                    }
+                let thread = match (caller, thread_id) {
+                    (Some(caller), _) => Some(caller.clone()),
+                    (None, Some(id)) => Some(backend.get_thread(id).await?),
                     (None, None) => None,
                 };
-                code_tools::call(name.to_owned(), args, workspace).await
+                let mut project = None;
+                let workspace = if let Some(mut thread) = thread {
+                    let workspace = backend.workspace_root(&thread).await?;
+                    if name == "code_diff" && thread.worktree_path.take().is_some() {
+                        // A linked checkout can use the registered project's Git metadata.
+                        match backend.workspace_root(&thread).await {
+                            Ok(root) => project = Some(root),
+                            Err(CoreError::NotFound(_)) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Some(workspace)
+                } else {
+                    None
+                };
+                code_tools::call(name.to_owned(), args, workspace, project).await
             }
             _ => Err(CoreError::InvalidArgument(format!("unknown tool: {name}"))),
         }
@@ -323,6 +431,16 @@ fn resolve_thread(arg: Option<Uuid>, context: Option<Uuid>) -> CoreResult<Uuid> 
         .ok_or_else(|| CoreError::InvalidArgument("thread ID is required".into()))
 }
 
+fn swarm_thread(arg: Option<Uuid>, context: CallContext<'_>) -> CoreResult<Uuid> {
+    let id = resolve_thread(arg, context.thread_id)?;
+    if context.caller.is_some_and(|caller| caller.id != id) {
+        return Err(CoreError::InvalidArgument(
+            "swarm tools must use the caller's thread".into(),
+        ));
+    }
+    Ok(id)
+}
+
 fn decode<T: DeserializeOwned>(args: Value) -> CoreResult<T> {
     serde_json::from_value(args).map_err(|error| CoreError::InvalidArgument(error.to_string()))
 }
@@ -343,6 +461,36 @@ fn empty_object() -> Value {
 }
 fn default_limit() -> usize {
     50
+}
+
+#[derive(Deserialize)]
+struct SwarmStatus {
+    thread_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct SwarmArgs<T> {
+    thread_id: Option<Uuid>,
+    #[serde(flatten)]
+    input: T,
+}
+
+#[derive(Deserialize)]
+struct SwarmPost {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct SwarmRead {
+    #[serde(default)]
+    since: i64,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+#[derive(Deserialize)]
+struct SwarmKill {
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -441,6 +589,37 @@ fn tools() -> Vec<Value> {
             "List provider health and curated models by tier.",
             json!({}),
             &[],
+        ),
+        make(
+            "swarm_status",
+            "Get the swarm board for the current thread.",
+            json!({"thread_id": uuid}),
+            &[],
+        ),
+        make(
+            "swarm_add_worker",
+            "Start a named worker on this swarm with a brief and optional provider, model, effort and isolation.",
+            json!({"thread_id": uuid, "name": string, "brief": string, "provider": provider,
+                "model": string, "effort": string, "isolation": {"enum": ["shared", "worktree"]}}),
+            &["name", "brief"],
+        ),
+        make(
+            "swarm_post_message",
+            "Post to this swarm. @name, @all and @coordinator wake the addressed members.",
+            json!({"thread_id": uuid, "text": string}),
+            &["text"],
+        ),
+        make(
+            "swarm_read_board",
+            "Read board messages after the given sequence number.",
+            json!({"thread_id": uuid, "since": {"type": "integer", "minimum": 0}, "limit": limit}),
+            &[],
+        ),
+        make(
+            "swarm_kill_worker",
+            "Stop a worker and cancel its queued follow-ups.",
+            json!({"thread_id": uuid, "name": string}),
+            &["name"],
         ),
         make(
             "delegate_task",

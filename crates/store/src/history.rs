@@ -94,8 +94,9 @@ fn import_projects(
     } else {
         "id"
     };
-    let projects = query_all(
+    let projects = legacy_query_all(
         source,
+        PROJECTS,
         &format!(
             "SELECT {id_column}, title, workspace_root, created_at, updated_at
          FROM {PROJECTS} WHERE deleted_at IS NULL ORDER BY {id_column}"
@@ -158,15 +159,16 @@ fn read_sessions(source: &Connection) -> CoreResult<Sessions> {
         let id = if has_column(source, SESSIONS, "provider_thread_id")? {
             "provider_thread_id"
         } else {
-            "json_extract(payload_json, '$.id')"
+            "CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.id') END"
         };
         let updated = if has_column(source, SESSIONS, "updated_at")? {
             "updated_at"
         } else {
-            "json_extract(payload_json, '$.updatedAt')"
+            "CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.updatedAt') END"
         };
-        for (id, thread_id, payload) in query_all(
+        for (id, thread_id, payload) in legacy_query_all(
             source,
+            SESSIONS,
             &format!(
                 "SELECT {id}, thread_id, payload_json FROM {SESSIONS}
              ORDER BY {updated} DESC, 1"
@@ -215,8 +217,9 @@ fn import_threads(
         } else {
             "thread_id"
         };
-        query_all(
+        legacy_query_all(
             source,
+            SUBAGENTS,
             &format!(
                 "SELECT child_thread_id, {parent} FROM {SUBAGENTS}
              WHERE child_thread_id IS NOT NULL AND {parent} IS NOT NULL
@@ -244,71 +247,77 @@ fn import_threads(
     let mut threads = HashMap::new();
     let mut lineage = Vec::new();
     while let Some(row) = rows.next().map_err(storage_error)? {
-        let project: String = field(row, 1)?;
+        let Some((id, project)) = legacy_row(THREADS, row, |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            continue;
+        };
         let Some(&project_id) = projects.get(&project) else {
             continue;
         };
-        let id: String = field(row, 0)?;
-        let payload: Value = decode(row, 10).map_err(storage_error)?;
-        let active_provider_thread: Option<String> = field(row, 6)?;
-        let run_status: Option<String> = field(row, 11)?;
-        let status = match str_field(&payload, "status").or(run_status.as_deref()) {
-            Some("failed") => ThreadStatus::Failed,
-            Some("interrupted") => ThreadStatus::Interrupted,
-            _ if field::<bool>(row, 12)? => ThreadStatus::Completed,
-            _ => ThreadStatus::Idle,
-        };
-        let parent = str_field(&payload["lineage"], "parentThreadId");
-        let fallback = parents.get(&id).map(String::as_str);
-        let relationship = str_field(&payload["lineage"], "relationshipToParent");
-        let thread = Thread {
-            id: legacy_uuid(&id),
-            project_id,
-            parent_thread_id: None,
-            relationship: None,
-            title: field(row, 2)?,
-            model_selection: model_selection(
-                &payload["modelSelection"],
-                provider(&field::<String>(row, 3)?),
-                None,
-            ),
-            runtime_mode: match field::<String>(row, 4)?.as_str() {
-                "full-access" => RuntimeMode::FullAccess,
-                "auto" | "auto-accept-edits" => RuntimeMode::AutoAcceptEdits,
-                _ => RuntimeMode::ApprovalRequired,
-            },
-            interaction_mode: if field::<String>(row, 5)? == "plan" {
-                InteractionMode::Plan
-            } else {
-                InteractionMode::Default
-            },
-            status,
-            worktree_path: str_field(&payload, "worktreePath").map(PathBuf::from),
-            branch: str_field(&payload, "branch").map(str::to_owned),
-            provider_session_id: active_provider_thread
-                .as_ref()
-                .and_then(|id| sessions.by_provider_thread.get(id))
-                .or_else(|| sessions.by_thread.get(&id))
-                .cloned(),
-            archived: str_field(&payload, "archivedAt").is_some()
-                || field::<Option<String>>(row, 9)?.is_some(),
-            pinned: str_field(&payload, "pinnedAt").is_some(),
-            created_at: date_field(&payload, "createdAt")
-                .map_or_else(|| parse(row, 7).map_err(storage_error), Ok)?,
-            updated_at: date_field(&payload, "updatedAt")
-                .map_or_else(|| parse(row, 8).map_err(storage_error), Ok)?,
+        let Some((thread, parent, fallback, relationship)) = legacy_row(THREADS, row, |row| {
+            let payload: Value = decode(row, 10)?;
+            let active_provider_thread: Option<String> = row.get(6)?;
+            let run_status: Option<String> = row.get(11)?;
+            let status = match str_field(&payload, "status").or(run_status.as_deref()) {
+                Some("failed") => ThreadStatus::Failed,
+                Some("interrupted") => ThreadStatus::Interrupted,
+                _ if row.get::<_, bool>(12)? => ThreadStatus::Completed,
+                _ => ThreadStatus::Idle,
+            };
+            let parent = str_field(&payload["lineage"], "parentThreadId");
+            let fallback = parents.get(&id).map(String::as_str);
+            let relationship = str_field(&payload["lineage"], "relationshipToParent");
+            let thread = Thread {
+                id: legacy_uuid(&id),
+                project_id,
+                parent_thread_id: None,
+                relationship: None,
+                title: row.get(2)?,
+                model_selection: model_selection(
+                    &payload["modelSelection"],
+                    provider(&row.get::<_, String>(3)?),
+                    None,
+                ),
+                runtime_mode: match row.get::<_, String>(4)?.as_str() {
+                    "full-access" => RuntimeMode::FullAccess,
+                    "auto" | "auto-accept-edits" => RuntimeMode::AutoAcceptEdits,
+                    _ => RuntimeMode::ApprovalRequired,
+                },
+                interaction_mode: if row.get::<_, String>(5)? == "plan" {
+                    InteractionMode::Plan
+                } else {
+                    InteractionMode::Default
+                },
+                status,
+                worktree_path: str_field(&payload, "worktreePath").map(PathBuf::from),
+                branch: str_field(&payload, "branch").map(str::to_owned),
+                provider_session_id: active_provider_thread
+                    .as_ref()
+                    .and_then(|id| sessions.by_provider_thread.get(id))
+                    .or_else(|| sessions.by_thread.get(&id))
+                    .cloned(),
+                archived: str_field(&payload, "archivedAt").is_some()
+                    || row.get::<_, Option<String>>(9)?.is_some(),
+                pinned: str_field(&payload, "pinnedAt").is_some(),
+                created_at: date_field(&payload, "createdAt").map_or_else(|| parse(row, 7), Ok)?,
+                updated_at: date_field(&payload, "updatedAt").map_or_else(|| parse(row, 8), Ok)?,
+            };
+            Ok((
+                thread,
+                parent.map(str::to_owned),
+                fallback.map(str::to_owned),
+                relationship.map(str::to_owned),
+            ))
+        }) else {
+            continue;
         };
         if !destination_exists(destination, "threads", thread.id)? {
             insert_thread(destination, &thread)?;
             report.threads_imported += 1;
-            if parent.is_some() || fallback.is_some() {
-                lineage.push((
-                    thread.id,
-                    parent.map(str::to_owned),
-                    fallback.map(str::to_owned),
-                    relationship.map(str::to_owned),
-                ));
-            }
+        }
+        if parent.is_some() || fallback.is_some() {
+            lineage.push((thread.id, parent, fallback, relationship));
         }
         threads.insert(id, thread);
     }
@@ -327,7 +336,8 @@ fn import_threads(
         if let Some((parent, relationship)) = linked.filter(|(parent, _)| parent.id != child) {
             destination
                 .execute(
-                    "UPDATE threads SET parent_thread_id = ?2, relationship = ?3 WHERE id = ?1",
+                    "UPDATE threads SET parent_thread_id = ?2, relationship = ?3
+                     WHERE id = ?1 AND parent_thread_id IS NULL",
                     params![child.to_string(), parent.id.to_string(), relationship],
                 )
                 .map_err(storage_error)?;
@@ -342,12 +352,13 @@ fn import_runs(
     threads: &HashMap<String, Thread>,
     sessions: &Sessions,
     report: &mut ImportHistoryReport,
-) -> CoreResult<HashMap<String, Uuid>> {
+) -> CoreResult<HashMap<String, (Uuid, Uuid)>> {
     let mut by_id = HashMap::new();
     let mut find_prompt = source
         .prepare(&format!(
             "SELECT json_extract(payload_json, '$.text') FROM {ITEMS}
          WHERE run_id = ?1 AND thread_id = ?2 AND type = 'user_message'
+            AND CASE WHEN json_valid(payload_json) THEN json_type(payload_json, '$.text') = 'text' END
          ORDER BY (json_extract(payload_json, '$.messageId') IS ?3) DESC, ordinal LIMIT 1"
         ))
         .map_err(storage_error)?;
@@ -360,27 +371,54 @@ fn import_runs(
         .map_err(storage_error)?;
     let mut rows = query.query([]).map_err(storage_error)?;
     while let Some(row) = rows.next().map_err(storage_error)? {
-        let thread_id: String = field(row, 1)?;
+        let Some((legacy_id, thread_id)) = legacy_row(RUNS, row, |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            continue;
+        };
         let Some(thread) = threads.get(&thread_id) else {
             continue;
         };
-        let legacy_id: String = field(row, 0)?;
         let id = uuid_v5(legacy_id.as_bytes());
-        by_id.insert(legacy_id.clone(), id);
-        if destination_exists(destination, "runs", id)? {
+        if let Some(owner) = run_owner(destination, id)? {
+            if owner == thread.id {
+                by_id.insert(legacy_id, (id, owner));
+            }
             continue;
         }
-        let payload: Value = decode(row, 8).map_err(storage_error)?;
+        let Some((
+            payload,
+            provider,
+            started_at,
+            completed_at,
+            provider_thread_id,
+            ordinal,
+            status,
+        )) = legacy_row(RUNS, row, |row| {
+            let payload = decode(row, 8)?;
+            let started_at = date_field(&payload, "startedAt").map_or_else(|| parse(row, 6), Ok)?;
+            let completed_at = match date_field(&payload, "completedAt") {
+                Some(date) => Some(date),
+                None => parse_optional(row, 7)?,
+            };
+            Ok((
+                payload,
+                provider(&row.get::<_, String>(3)?),
+                started_at,
+                completed_at,
+                row.get::<_, Option<String>>(4)?,
+                row.get(2)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        else {
+            continue;
+        };
         let model = model_selection(
             &payload["modelSelection"],
-            provider(&field::<String>(row, 3)?),
+            provider,
             Some(&thread.model_selection),
         );
-        let started_at = date_field(&payload, "startedAt")
-            .map_or_else(|| parse(row, 6).map_err(storage_error), Ok)?;
-        let completed_at =
-            date_field(&payload, "completedAt").or(parse_optional(row, 7).map_err(storage_error)?);
-        let provider_thread_id: Option<String> = field(row, 4)?;
         let prompt: Option<String> = find_prompt
             .query_row(
                 params![legacy_id, thread_id, str_field(&payload, "userMessageId")],
@@ -392,11 +430,11 @@ fn import_runs(
         let run = Run {
             id,
             thread_id: thread.id,
-            ordinal: field(row, 2)?,
+            ordinal,
             provider: model.provider,
             model: model.model,
             effort: model.effort,
-            status: match field::<String>(row, 5)?.as_str() {
+            status: match status.as_str() {
                 "completed" => RunStatus::Completed,
                 "failed" => RunStatus::Failed,
                 _ => RunStatus::Cancelled,
@@ -426,7 +464,16 @@ fn import_runs(
             started_at,
             completed_at,
         };
+        if [run.input_tokens, run.output_tokens, run.duration_ms]
+            .into_iter()
+            .flatten()
+            .any(|value| i64::try_from(value).is_err())
+        {
+            tracing::warn!(table = RUNS, "Skipping malformed legacy history row");
+            continue;
+        }
         insert_run(destination, &run)?;
+        by_id.insert(legacy_id, (id, thread.id));
         report.runs_imported += 1;
     }
     Ok(by_id)
@@ -436,7 +483,7 @@ fn import_items(
     source: &Connection,
     destination: &Connection,
     threads: &HashMap<String, Thread>,
-    runs: &HashMap<String, Uuid>,
+    runs: &HashMap<String, (Uuid, Uuid)>,
     cfg: &StorageConfig,
     report: &mut ImportHistoryReport,
 ) -> CoreResult<()> {
@@ -453,21 +500,70 @@ fn import_items(
         .map_err(storage_error)?;
     let mut last_ordinal = HashMap::new();
     while let Some(row) = rows.next().map_err(storage_error)? {
-        let thread_id: String = field(row, 1)?;
+        let Some((legacy_id, thread_id, kind)) = legacy_row(ITEMS, row, |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(4)?,
+            ))
+        }) else {
+            continue;
+        };
         let Some(thread) = threads.get(&thread_id) else {
             continue;
         };
-        let id = uuid_v5(field::<String>(row, 0)?.as_bytes());
+        let id = uuid_v5(legacy_id.as_bytes());
+        let has_child_link = matches!(kind.as_str(), "subagent" | "notification");
         if destination_exists(destination, "turn_items", id)? {
+            if has_child_link {
+                repair_child_link(destination, id, thread.id, cfg)?;
+            }
             continue;
         }
-        let payload: Value = decode(row, 6).map_err(storage_error)?;
-        let created_at = date_field(&payload, "createdAt")
-            .or_else(|| date_field(&payload, "startedAt"))
-            .map_or_else(|| parse(row, 5).map_err(storage_error), Ok)?;
-        let legacy_run_id: Option<String> = field(row, 2)?;
-        let run_id = match legacy_run_id.as_ref().and_then(|id| runs.get(id)) {
-            Some(id) => *id,
+        let Some((mut payload, created_at, legacy_run_id, legacy_ordinal)) =
+            legacy_row(ITEMS, row, |row| {
+                let payload = decode(row, 6)?;
+                let created_at = date_field(&payload, "createdAt")
+                    .or_else(|| date_field(&payload, "startedAt"))
+                    .map_or_else(|| parse(row, 5), Ok)?;
+                Ok((
+                    payload,
+                    created_at,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+        else {
+            continue;
+        };
+        if has_child_link {
+            rewrite_child_links(&mut payload);
+        }
+        let ordinal = match last_ordinal.entry(thread.id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                existing_ordinals
+                    .query_row([thread.id.to_string()], |row| row.get::<_, i64>(0))
+                    .map_err(storage_error)?,
+            ),
+        };
+        let Some(next) = ordinal
+            .checked_add(1)
+            .map(|next| next.max(legacy_ordinal))
+            .filter(|&next| next < i64::MAX)
+        else {
+            tracing::warn!(
+                table = ITEMS,
+                "Skipping legacy history item with out-of-range ordinal"
+            );
+            continue;
+        };
+        let run_id = match legacy_run_id
+            .as_ref()
+            .and_then(|id| runs.get(id))
+            .filter(|(_, owner)| *owner == thread.id)
+        {
+            Some((id, _)) => *id,
             None => match synthetic.entry(thread.id) {
                 std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
@@ -477,16 +573,8 @@ fn import_items(
                 }
             },
         };
-        let ordinal = match last_ordinal.entry(thread.id) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
-                existing_ordinals
-                    .query_row([thread.id.to_string()], |row| row.get::<_, i64>(0))
-                    .map_err(storage_error)?,
-            ),
-        };
-        *ordinal = (*ordinal + 1).max(field(row, 3)?);
-        let item = turn_item(thread.id, run_id, &field::<String>(row, 4)?, payload);
+        *ordinal = next;
+        let item = turn_item(thread.id, run_id, &kind, payload);
         insert_item(
             destination,
             item,
@@ -503,6 +591,75 @@ fn import_items(
     Ok(())
 }
 
+fn run_owner(connection: &Connection, run_id: Uuid) -> CoreResult<Option<Uuid>> {
+    connection
+        .prepare_cached("SELECT thread_id FROM runs WHERE id = ?1")
+        .map_err(storage_error)?
+        .query_row([run_id.to_string()], |row| parse(row, 0))
+        .optional()
+        .map_err(storage_error)
+}
+
+fn rewrite_child_links(payload: &mut Value) -> bool {
+    let mut changed = false;
+    for pointer in ["/childThreadId", "/source/childThreadId"] {
+        if let Some(field) = payload.pointer_mut(pointer)
+            && let Some(old) = field.as_str().filter(|id| !id.is_empty())
+        {
+            let id = legacy_uuid(old).to_string();
+            if id != old {
+                *field = Value::String(id);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn repair_child_link(
+    destination: &Connection,
+    id: Uuid,
+    thread_id: Uuid,
+    cfg: &StorageConfig,
+) -> CoreResult<()> {
+    let item = destination
+        .prepare_cached(
+            "SELECT item.id, item.thread_id, item.run_id, item.ordinal, item.kind, item.summary,
+                item.raw_bytes, item.compressed_bytes, item.created_at, item.payload_text,
+                blob.raw_bytes, blob.zstd_data
+             FROM turn_items AS item LEFT JOIN blob_store AS blob ON blob.hash = item.blob_hash
+             WHERE item.id = ?1 AND item.thread_id = ?2",
+        )
+        .map_err(storage_error)?
+        .query_row(params![id.to_string(), thread_id.to_string()], item_row)
+        .optional()
+        .map_err(storage_error)?;
+    if let Some(mut item) = item
+        && rewrite_child_links(&mut item.payload)
+    {
+        let mut text = encode(&item.payload)?;
+        let raw_bytes = text.len();
+        if raw_bytes > cfg.max_payload_bytes {
+            (_, text) = prune::prune_payload(item.payload, text, cfg.max_payload_bytes)?;
+        }
+        let (blob_hash, compressed_bytes) = store_item_blob(destination, &text, raw_bytes, cfg)?;
+        destination
+            .execute(
+                "UPDATE turn_items SET payload_text = ?2, blob_hash = ?3, raw_bytes = ?4,
+                    compressed_bytes = ?5 WHERE id = ?1",
+                params![
+                    id.to_string(),
+                    blob_hash.is_none().then_some(&text),
+                    blob_hash,
+                    raw_bytes,
+                    compressed_bytes
+                ],
+            )
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
 fn synthetic_run(
     destination: &Connection,
     legacy_thread_id: &str,
@@ -510,37 +667,43 @@ fn synthetic_run(
     created_at: DateTime<Utc>,
     report: &mut ImportHistoryReport,
 ) -> CoreResult<Uuid> {
-    let id = uuid_v5(format!("legacy-run:{legacy_thread_id}").as_bytes());
-    if !destination_exists(destination, "runs", id)? {
-        let ordinal = destination
-            .query_row(
-                "SELECT coalesce(max(ordinal), 0) + 1 FROM runs WHERE thread_id = ?1",
-                [thread.id.to_string()],
-                |row| row.get(0),
-            )
-            .map_err(storage_error)?;
-        insert_run(
-            destination,
-            &Run {
-                id,
-                thread_id: thread.id,
-                ordinal,
-                provider: thread.model_selection.provider,
-                model: thread.model_selection.model.clone(),
-                effort: thread.model_selection.effort.clone(),
-                status: RunStatus::Completed,
-                prompt: String::new(),
-                provider_session_id: thread.provider_session_id.clone(),
-                input_tokens: None,
-                output_tokens: None,
-                duration_ms: None,
-                error_message: None,
-                started_at: created_at,
-                completed_at: Some(created_at),
-            },
-        )?;
-        report.runs_imported += 1;
+    let name = format!("legacy-run:{legacy_thread_id}");
+    let mut id = uuid_v5(name.as_bytes());
+    for suffix in 1.. {
+        match run_owner(destination, id)? {
+            Some(owner) if owner == thread.id => return Ok(id),
+            Some(_) => id = uuid_v5(format!("{name}:{suffix}").as_bytes()),
+            None => break,
+        }
     }
+    let last_ordinal: i64 = destination
+        .query_row(
+            "SELECT coalesce(max(ordinal), 0) FROM runs WHERE thread_id = ?1",
+            [thread.id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(storage_error)?;
+    insert_run(
+        destination,
+        &Run {
+            id,
+            thread_id: thread.id,
+            ordinal: last_ordinal.saturating_add(1),
+            provider: thread.model_selection.provider,
+            model: thread.model_selection.model.clone(),
+            effort: thread.model_selection.effort.clone(),
+            status: RunStatus::Completed,
+            prompt: String::new(),
+            provider_session_id: thread.provider_session_id.clone(),
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: None,
+            error_message: None,
+            started_at: created_at,
+            completed_at: Some(created_at),
+        },
+    )?;
+    report.runs_imported += 1;
     Ok(id)
 }
 
@@ -704,8 +867,34 @@ fn date_field(value: &Value, key: &str) -> Option<DateTime<Utc>> {
     str_field(value, key)?.parse().ok()
 }
 
-fn field<T: rusqlite::types::FromSql>(row: &Row<'_>, index: usize) -> CoreResult<T> {
-    row.get(index).map_err(storage_error)
+fn legacy_row<T>(
+    table: &str,
+    row: &Row<'_>,
+    read: impl FnOnce(&Row<'_>) -> rusqlite::Result<T>,
+) -> Option<T> {
+    match read(row) {
+        Ok(parsed) => Some(parsed),
+        Err(_) => {
+            tracing::warn!(table, "Skipping malformed legacy history row");
+            None
+        }
+    }
+}
+
+fn legacy_query_all<T>(
+    source: &Connection,
+    table: &str,
+    sql: &str,
+    params: impl Params,
+    read: impl Fn(&Row<'_>) -> rusqlite::Result<T>,
+) -> CoreResult<Vec<T>> {
+    let mut statement = source.prepare(sql).map_err(storage_error)?;
+    let mut rows = statement.query(params).map_err(storage_error)?;
+    let mut result = Vec::new();
+    while let Some(row) = rows.next().map_err(storage_error)? {
+        result.extend(legacy_row(table, row, &read));
+    }
+    Ok(result)
 }
 
 fn has_table(connection: &Connection, table: &str) -> CoreResult<bool> {

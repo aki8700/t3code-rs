@@ -32,6 +32,7 @@ use tokio::{
 use uuid::Uuid;
 
 const STDERR_LIMIT: usize = 16 * 1024;
+const STDOUT_LINE_LIMIT: usize = 4 * 1024 * 1024;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct ActiveProcess {
@@ -349,7 +350,7 @@ pub(crate) async fn run_turn(
     let stderr = child.stderr.take().expect("piped stderr");
     let stdin = child.stdin.take();
     let (close_tx, close_rx) = oneshot::channel();
-    let (watchdog_tx, watchdog_rx) = oneshot::channel();
+    let (reader_stop_tx, reader_stop_rx) = oneshot::channel();
     let collect = async {
         let wait = async {
             #[cfg(not(unix))]
@@ -359,7 +360,7 @@ pub(crate) async fn run_turn(
                     child.start_kill()?;
                     child.wait().await
                 }
-                Ok(()) = watchdog_rx => {
+                Ok(()) = reader_stop_rx => {
                     child.start_kill()?;
                     child.wait().await
                 }
@@ -369,7 +370,7 @@ pub(crate) async fn run_turn(
                 let pid = child.id().expect("unreaped child");
                 let result = tokio::select! {
                     result = wait_for_exit(pid) => result,
-                    Ok(()) = watchdog_rx => {
+                    Ok(()) = reader_stop_rx => {
                         GroupCleanup(Some(pid)).kill();
                         wait_for_exit(pid).await
                     }
@@ -389,7 +390,7 @@ pub(crate) async fn run_turn(
         };
         tokio::try_join!(
             wait,
-            read_events(stdout, provider, secret, &tx, close_tx, watchdog_tx),
+            read_events(stdout, provider, secret, &tx, close_tx, reader_stop_tx),
             read_tail(stderr),
             write_input(stdin, input, steer_rx, close_rx),
         )
@@ -399,11 +400,14 @@ pub(crate) async fn run_turn(
         result = collect => result.map_err(process_error)?,
     };
 
-    let ReadOutcome::Terminal(terminal) = terminal else {
-        let _ = tx.send(StreamEvent::Failed {
-            message: "repetition loop detected — terminated runaway provider process to save tokens/battery".into(),
-        });
-        return Ok(());
+    let terminal = match terminal {
+        ReadOutcome::Terminal(terminal) => terminal,
+        ReadOutcome::Stopped(message) => {
+            let _ = tx.send(StreamEvent::Failed {
+                message: message.into(),
+            });
+            return Ok(());
+        }
     };
     let event = if interrupted.load(Ordering::Acquire) {
         StreamEvent::Failed {
@@ -480,7 +484,7 @@ fn redact_value(value: &mut serde_json::Value, secret: &str) {
 
 enum ReadOutcome {
     Terminal(Option<StreamEvent>),
-    Repetition,
+    Stopped(&'static str),
 }
 
 async fn read_events(
@@ -489,7 +493,7 @@ async fn read_events(
     secret: Option<&str>,
     tx: &mpsc::UnboundedSender<StreamEvent>,
     close_stdin: oneshot::Sender<()>,
-    watchdog_stop: oneshot::Sender<()>,
+    stop_process: oneshot::Sender<()>,
 ) -> io::Result<ReadOutcome> {
     let mut lines = BufReader::new(stdout);
     let mut line = Vec::new();
@@ -498,23 +502,35 @@ async fn read_events(
     let mut close_stdin = Some(close_stdin);
     let mut assistant = RepetitionWatchdog::default();
     let mut reasoning = RepetitionWatchdog::default();
-    while lines.read_until(b'\n', &mut line).await? != 0 {
+    // Stop reading after one extra byte, even when the producer never sends a newline.
+    while (&mut lines)
+        .take((STDOUT_LINE_LIMIT + 1) as u64)
+        .read_until(b'\n', &mut line)
+        .await?
+        != 0
+    {
+        if line.len() > STDOUT_LINE_LIMIT && line.last() != Some(&b'\n') {
+            let _ = stop_process.send(());
+            return Ok(ReadOutcome::Stopped(
+                "provider stdout line exceeds the 4 MiB limit",
+            ));
+        }
         if let Ok(mut value) = serde_json::from_slice(&line) {
             if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
                 redact_value(&mut value, secret);
             }
             for event in parser.parse(&value) {
-                let repeated = match &event {
-                    StreamEvent::AssistantDelta { text } => assistant.push(text),
-                    StreamEvent::ReasoningDelta { text } => reasoning.push(text),
-                    StreamEvent::Completed {
-                        final_text: Some(text),
-                    } => RepetitionWatchdog::default().push(text),
-                    _ => false,
-                };
+                let repeated = !matches!(terminal, Some(StreamEvent::Completed { .. }))
+                    && match &event {
+                        StreamEvent::AssistantDelta { text } => assistant.push(text),
+                        StreamEvent::ReasoningDelta { text } => reasoning.push(text),
+                        _ => false,
+                    };
                 if repeated {
-                    let _ = watchdog_stop.send(());
-                    return Ok(ReadOutcome::Repetition);
+                    let _ = stop_process.send(());
+                    return Ok(ReadOutcome::Stopped(
+                        "repetition loop detected — terminated runaway provider process to save tokens/battery",
+                    ));
                 }
                 match event {
                     StreamEvent::Completed { .. }
@@ -941,18 +957,17 @@ exit 0
 
     #[tokio::test]
     async fn repetitive_stream_terminates_the_provider_group() {
-        let line = "Repeating this exact line!\n";
-        let phrase = "We need to inspect the exact same file again. ";
+        let line = "The model repeats the same line indefinitely.\n";
+        let phrase = "We still need to inspect the exact same file again. ";
         for event in [
             json!({
                 "type": "stream_event", "event": {"type": "content_block_delta",
-                    "delta": {"type": "text_delta", "text": line.repeat(6)}}
+                    "delta": {"type": "text_delta", "text": line.repeat(8)}}
             }),
             json!({
                 "type": "stream_event", "event": {"type": "content_block_delta",
-                    "delta": {"type": "thinking_delta", "thinking": phrase.repeat(5)}}
+                    "delta": {"type": "thinking_delta", "thinking": phrase.repeat(6)}}
             }),
-            json!({"type": "result", "subtype": "success", "result": phrase.repeat(5)}),
         ] {
             let fixture = Fixture::new(&format!(
                 r#"
@@ -985,5 +1000,67 @@ wait
             assert!(receive(&mut rx).await.is_none());
             assert!(!driver.send_steer(id, "late".into()).await.unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn completed_response_is_not_tested_for_repetition() {
+        let answer = "The final answer intentionally repeats this same example.\n".repeat(10);
+        let event = json!({"type": "result", "subtype": "success", "result": answer});
+        let fixture = Fixture::new(&format!("printf '%s\\n' '{event}'"));
+        let driver = ClaudeDriver::new(fixture.binary());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        driver
+            .run_turn(test_request(ProviderId::Claude), tx)
+            .await
+            .unwrap();
+        assert!(matches!(
+            receive(&mut rx).await,
+            Some(StreamEvent::Completed { final_text: Some(text) }) if text == answer
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_unterminated_stdout_line_fails_the_turn() {
+        let fixture = Fixture::new(
+            r#"
+/usr/bin/head -c 4194305 /dev/zero
+/bin/sleep 60
+"#,
+        );
+        let driver = ClaudeDriver::new(fixture.binary());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            driver.run_turn(test_request(ProviderId::Claude), tx),
+        )
+        .await
+        .expect("stdout must be capped before the line ends")
+        .unwrap();
+        assert!(matches!(
+            receive(&mut rx).await,
+            Some(StreamEvent::Failed { message }) if message.contains("4 MiB")
+        ));
+    }
+
+    #[tokio::test]
+    async fn stdout_accepts_a_line_at_the_limit_and_an_unterminated_final_line() {
+        let mut input = br#"{"type":"system","session_id":"boundary"}"#.to_vec();
+        input.resize(4 * 1024 * 1024, b' ');
+        input.push(b'\n');
+        input.extend_from_slice(br#"{"type":"result","subtype":"success","result":"ok"}"#);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (close, _) = oneshot::channel();
+        let (stop, _) = oneshot::channel();
+        let outcome = read_events(input.as_slice(), ProviderId::Claude, None, &tx, close, stop)
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ReadOutcome::Terminal(Some(StreamEvent::Completed { .. }))
+        ));
+        assert!(matches!(
+            receive(&mut rx).await,
+            Some(StreamEvent::SessionStarted { provider_session_id }) if provider_session_id == "boundary"
+        ));
     }
 }

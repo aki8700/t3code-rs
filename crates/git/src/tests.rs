@@ -1,6 +1,55 @@
 use super::*;
 use std::fs;
 
+#[tokio::test]
+async fn worktree_checkout_preserves_raw_content_with_configured_filters() {
+    let fixture = TempRepo::new().await;
+    fixture.write(
+        ".gitattributes",
+        "lfs.txt filter=lfs\ncustom.txt filter=fixture\n",
+    );
+    fixture.write("lfs.txt", "stored lfs text\n");
+    fixture.write("custom.txt", "stored custom text\n");
+    fixture.commit().await;
+
+    for filter in ["lfs", "fixture"] {
+        git_output(
+            &fixture.repo,
+            &["config", &format!("filter.{filter}.required"), "true"],
+        )
+        .await
+        .unwrap();
+        for setting in ["smudge", "clean", "process"] {
+            git_output(
+                &fixture.repo,
+                &["config", &format!("filter.{filter}.{setting}"), "/dev/null"],
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let manager = GitManager::new(fixture.root.join("worktrees"));
+    let (worktree, _) = manager
+        .create_worktree(&fixture.repo, "filters", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(worktree.join("lfs.txt")).unwrap(),
+        "stored lfs text\n"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("custom.txt")).unwrap(),
+        "stored custom text\n"
+    );
+    fs::write(worktree.join("custom.txt"), "changed\n").unwrap();
+    assert!(
+        !GitManager::diff_summary(&worktree, false)
+            .await
+            .unwrap()
+            .clean
+    );
+}
+
 struct TempRepo {
     root: PathBuf,
     repo: PathBuf,

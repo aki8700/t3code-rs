@@ -22,9 +22,9 @@ use rusqlite::{
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use t3_core::{
-    Attachment, ContextHandoff, CoreError, CoreResult, DbStats, ModelSelection, NewTurnItem,
-    OrchModelStat, Project, Run, RunStatus, SearchHit, StorageConfig, Store, Thread, ThreadStatus,
-    TurnItem,
+    Attachment, ContextHandoff, CoreError, CoreResult, DbStats, InteractionMode, ModelSelection,
+    NewTurnItem, OrchModelStat, Project, Run, RunStatus, RuntimeMode, SearchHit, StorageConfig,
+    Store, Thread, ThreadStatus, TurnItem,
 };
 use uuid::Uuid;
 
@@ -35,6 +35,9 @@ const ORPHAN_BLOBS: &str = "NOT EXISTS (
     SELECT 1 FROM turn_items WHERE blob_hash = blob_store.hash
 )";
 
+mod queue;
+mod swarm;
+pub use queue::{QueuedRun, QueuedRunInput};
 mod history;
 mod prune;
 
@@ -49,6 +52,59 @@ pub struct GcReport {
     pub orphan_attachments_bytes: u64,
     pub db_bytes_before: u64,
     pub db_bytes_after: u64,
+}
+
+/// An exclusive lease on the daemon's data directory.
+#[derive(Debug)]
+pub struct DaemonLock(File);
+
+impl Drop for DaemonLock {
+    fn drop(&mut self) {
+        // Closing alone leaves the lock held while a child process that is being
+        // spawned still shares this descriptor (between fork and exec).
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "failed to release the daemon lock");
+        }
+    }
+}
+
+pub fn acquire_daemon_lock(data_dir: &Path) -> CoreResult<DaemonLock> {
+    let mut options = File::options();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let path = data_dir.join("t3d.lock");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(storage_error("daemon lock must be a regular file"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(storage_error(error)),
+    }
+    let file = options.open(path).map_err(storage_error)?;
+    let metadata = file.metadata().map_err(storage_error)?;
+    if !metadata.is_file() {
+        return Err(storage_error("daemon lock must be a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(storage_error("daemon lock must be private to its owner"));
+        }
+    }
+    // File::try_lock uses flock(LOCK_EX | LOCK_NB) on Unix.
+    match file.try_lock() {
+        Ok(()) => Ok(DaemonLock(file)),
+        Err(fs::TryLockError::WouldBlock) => {
+            Err(storage_error("another daemon is using this data directory"))
+        }
+        Err(fs::TryLockError::Error(error)) => Err(storage_error(error)),
+    }
 }
 
 #[derive(Clone)]
@@ -301,6 +357,10 @@ impl SqliteStore {
                 ],
             )
             .map_err(storage_error)?;
+        transaction.execute(
+            "UPDATE swarm_members SET state = 'waiting' WHERE role = 'worker' AND state = 'working'",
+            [],
+        ).map_err(storage_error)?;
         transaction.commit().map_err(storage_error)
     }
 
@@ -610,6 +670,31 @@ impl Store for SqliteStore {
         .await
     }
 
+    async fn update_thread_modes(
+        &self,
+        id: Uuid,
+        runtime_mode: RuntimeMode,
+        interaction_mode: InteractionMode,
+    ) -> CoreResult<()> {
+        self.with_writer(move |connection| {
+            require_change(
+                connection.execute(
+                    "UPDATE threads SET runtime_mode = ?2, interaction_mode = ?3, updated_at = ?4
+                     WHERE id = ?1",
+                    params![
+                        id.to_string(),
+                        encode(&runtime_mode)?,
+                        encode(&interaction_mode)?,
+                        timestamp(Utc::now())
+                    ],
+                ),
+                "thread",
+                id,
+            )
+        })
+        .await
+    }
+
     async fn update_thread_title(&self, id: Uuid, title: String) -> CoreResult<()> {
         self.with_writer(move |connection| {
             let transaction = connection.transaction().map_err(storage_error)?;
@@ -675,8 +760,9 @@ impl Store for SqliteStore {
         error_message: Option<String>,
     ) -> CoreResult<()> {
         self.with_writer(move |connection| {
+            let transaction = connection.transaction().map_err(storage_error)?;
             require_change(
-                connection.execute(
+                transaction.execute(
                     "UPDATE runs SET status = ?2, provider_session_id = COALESCE(?3, provider_session_id),
                         input_tokens = ?4, output_tokens = ?5, duration_ms = ?6, error_message = ?7,
                         completed_at = ?8 WHERE id = ?1",
@@ -687,7 +773,10 @@ impl Store for SqliteStore {
                 ),
                 "run",
                 run_id,
-            )
+            )?;
+            transaction.execute("DELETE FROM queued_run_inputs WHERE run_id = ?1", [run_id.to_string()])
+                .map_err(storage_error)?;
+            transaction.commit().map_err(storage_error)
         })
         .await
     }
@@ -715,6 +804,57 @@ impl Store for SqliteStore {
                 params![thread_id.to_string(), sql_limit(limit), sql_limit(offset)],
                 item_row,
             )
+        })
+        .await
+    }
+
+    async fn list_turn_items_page(
+        &self,
+        thread_id: Uuid,
+        limit: usize,
+        before_ordinal: Option<i64>,
+    ) -> CoreResult<(Vec<TurnItem>, bool, usize)> {
+        self.with_reader(move |connection| {
+            let snapshot = connection.unchecked_transaction().map_err(storage_error)?;
+            let thread_id = thread_id.to_string();
+            let total = snapshot
+                .query_row(
+                    "SELECT count(*) FROM turn_items WHERE thread_id = ?1",
+                    [&thread_id],
+                    |row| row.get(0),
+                )
+                .map_err(storage_error)?;
+            let last = before_ordinal.map_or(Some(i64::MAX), |ordinal| ordinal.checked_sub(1));
+            let mut items = query_all(
+                &snapshot,
+                "SELECT item.id, item.thread_id, item.run_id, item.ordinal, item.kind, item.summary,
+                    item.raw_bytes, item.compressed_bytes, item.created_at, item.payload_text,
+                    blob.raw_bytes, blob.zstd_data
+                 FROM turn_items AS item LEFT JOIN blob_store AS blob ON blob.hash = item.blob_hash
+                 WHERE item.thread_id = ?1 AND item.ordinal <= ?2
+                 ORDER BY item.ordinal DESC LIMIT ?3",
+                params![thread_id, last, sql_limit(limit)],
+                item_row,
+            )?;
+            let has_more = if items.len() == limit {
+                let older_than_page = items
+                    .last()
+                    .map_or(last, |item| item.ordinal.checked_sub(1));
+                snapshot
+                    .query_row(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM turn_items WHERE thread_id = ?1 AND ordinal <= ?2
+                        )",
+                        params![thread_id, older_than_page],
+                        |row| row.get(0),
+                    )
+                    .map_err(storage_error)?
+            } else {
+                false
+            };
+            items.reverse();
+            snapshot.commit().map_err(storage_error)?;
+            Ok((items, has_more, total))
         })
         .await
     }
@@ -959,10 +1099,14 @@ fn orphan_attachment_files(connection: &Connection, dir: &Path) -> CoreResult<Ve
     let mut orphans = Vec::new();
     for entry in fs::read_dir(dir).map_err(storage_error)? {
         let entry = entry.map_err(storage_error)?;
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|hash| references.contains(hash))
+        let name = entry.file_name();
+        let bytes = name.as_encoded_bytes();
+        let is_hash = bytes.len() == 64
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte));
+        if !(is_hash || bytes.starts_with(b".tmp-"))
+            || name.to_str().is_some_and(|name| references.contains(name))
         {
             continue;
         }
@@ -1119,43 +1263,14 @@ fn insert_item(
             if !index_payload {
                 return None;
             }
-            payload
-                .as_str()
-                .or_else(|| {
-                    ["text", "content", "message", "summary", "output", "preview"]
-                        .into_iter()
-                        .find_map(|field| payload.get(field).and_then(Value::as_str))
-                })
-                .map(|text| &text[..text.floor_char_boundary(PREVIEW_BYTES)])
-        });
-    let (blob_hash, compressed_bytes) = if raw_bytes > cfg.zstd_threshold_bytes {
-        let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
-        // A matching blob may have been compressed with a previous configuration.
-        let stored_bytes = connection
-            .prepare_cached("SELECT compressed_bytes FROM blob_store WHERE hash = ?1")
-            .map_err(storage_error)?
-            .query_row([&hash], |row| row.get::<_, usize>(0))
-            .optional()
-            .map_err(storage_error)?;
-        let compressed_bytes = if let Some(stored_bytes) = stored_bytes {
-            stored_bytes
-        } else {
-            let data =
-                zstd::bulk::compress(text.as_bytes(), cfg.zstd_level).map_err(storage_error)?;
-            connection
-                .prepare_cached(
-                    "INSERT INTO blob_store (hash, raw_bytes, compressed_bytes, zstd_data)
-                 VALUES (?1, ?2, ?3, ?4)",
-                )
-                .map_err(storage_error)?
-                .execute(params![hash, text.len(), data.len(), data])
-                .map_err(storage_error)?;
-            data.len()
-        };
-        (Some(hash), Some(compressed_bytes))
-    } else {
-        (None, None)
-    };
+            payload.as_str().or_else(|| {
+                ["text", "content", "message", "summary", "output", "preview"]
+                    .into_iter()
+                    .find_map(|field| payload.get(field).and_then(Value::as_str))
+            })
+        })
+        .map(|text| &text[..text.floor_char_boundary(PREVIEW_BYTES)]);
+    let (blob_hash, compressed_bytes) = store_item_blob(connection, &text, raw_bytes, cfg)?;
 
     let thread_key = thread_id.to_string();
     let ordinal = connection
@@ -1204,6 +1319,42 @@ fn insert_item(
         compressed_bytes,
         created_at,
     })
+}
+
+fn store_item_blob(
+    connection: &Connection,
+    text: &str,
+    raw_bytes: usize,
+    cfg: &StorageConfig,
+) -> CoreResult<(Option<String>, Option<usize>)> {
+    if raw_bytes > cfg.zstd_threshold_bytes {
+        let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+        // A matching blob may have been compressed with a previous configuration.
+        let stored_bytes = connection
+            .prepare_cached("SELECT compressed_bytes FROM blob_store WHERE hash = ?1")
+            .map_err(storage_error)?
+            .query_row([&hash], |row| row.get::<_, usize>(0))
+            .optional()
+            .map_err(storage_error)?;
+        let compressed_bytes = if let Some(stored_bytes) = stored_bytes {
+            stored_bytes
+        } else {
+            let data =
+                zstd::bulk::compress(text.as_bytes(), cfg.zstd_level).map_err(storage_error)?;
+            connection
+                .prepare_cached(
+                    "INSERT INTO blob_store (hash, raw_bytes, compressed_bytes, zstd_data)
+                 VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(storage_error)?
+                .execute(params![hash, text.len(), data.len(), data])
+                .map_err(storage_error)?;
+            data.len()
+        };
+        Ok((Some(hash), Some(compressed_bytes)))
+    } else {
+        Ok((None, None))
+    }
 }
 
 const THREAD_SELECT: &str =

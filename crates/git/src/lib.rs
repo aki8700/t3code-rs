@@ -66,7 +66,8 @@ impl GitManager {
         let name = format!("{stem}-{}", &suffix[..12]);
         let branch = format!("t3rs/{name}");
         let path = root.join(name);
-        let mut command = git(repo_root);
+        let filters = disabled_filters(repo_root).await?;
+        let mut command = git_with_filters(repo_root, &filters);
         command
             .args(["worktree", "add", "-b", &branch, "--"])
             .arg(&path);
@@ -102,11 +103,10 @@ impl GitManager {
         let root = git_output(dir, &["rev-parse", "--show-toplevel"]).await?;
         let root = git_path(root.strip_suffix(b"\n").unwrap_or(&root));
         let branch = Self::current_branch(&root).await?;
-        let status = git_output(
-            &root,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-        )
-        .await?;
+        let filters = disabled_filters(&root).await?;
+        let mut status = git_with_filters(&root, &filters);
+        status.args(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+        let status = checked_output(status, false).await?;
         let entries = status_entries(&status)?;
         let base = diff_base(&root, &entries).await?;
 
@@ -115,6 +115,7 @@ impl GitManager {
             let path = git_path(entry.path);
             let diff = FileDiff {
                 root: &root,
+                filters: &filters,
                 path: &path,
                 base: base.as_deref(),
                 rename_from: entry.rename_from.map(git_path),
@@ -211,6 +212,7 @@ fn status_entries(status: &[u8]) -> CoreResult<Vec<StatusEntry<'_>>> {
 
 struct FileDiff<'a> {
     root: &'a Path,
+    filters: &'a [String],
     path: &'a Path,
     base: Option<&'a str>,
     rename_from: Option<PathBuf>,
@@ -220,7 +222,7 @@ struct FileDiff<'a> {
 
 impl FileDiff<'_> {
     async fn output(&self, format: &str) -> CoreResult<Vec<u8>> {
-        let mut command = git(self.root);
+        let mut command = git_with_filters(self.root, self.filters);
         command.args([
             "--literal-pathspecs",
             "diff",
@@ -302,13 +304,57 @@ fn git(dir: &Path) -> Command {
         .stdin(Stdio::null())
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
         .args([
             "-c",
             "core.fsmonitor=false",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "filter.lfs.smudge=",
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.clean=",
+            "-c",
+            "filter.lfs.required=false",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "protocol.file.allow=user",
         ])
         .kill_on_drop(true);
+    command
+}
+
+async fn disabled_filters(dir: &Path) -> CoreResult<Vec<String>> {
+    let keys = git_output(dir, &["config", "--null", "--name-only", "--list"]).await?;
+    let mut overrides = Vec::new();
+    // Attributes can select any configured driver, including repository-specific drivers.
+    for key in nul_fields(&keys) {
+        if !key.starts_with(b"filter.") {
+            continue;
+        }
+        let key = std::str::from_utf8(key).map_err(git_error)?;
+        let Some((_, setting)) = key.rsplit_once('.') else {
+            continue;
+        };
+        match setting {
+            "clean" | "smudge" | "process" => overrides.push(format!("{key}=")),
+            "required" => overrides.push(format!("{key}=false")),
+            _ => {}
+        }
+    }
+    overrides.sort_unstable();
+    overrides.dedup();
+    Ok(overrides)
+}
+
+fn git_with_filters(dir: &Path, overrides: &[String]) -> Command {
+    let mut command = git(dir);
+    for key in overrides {
+        command.args(["-c", key]);
+    }
     command
 }
 

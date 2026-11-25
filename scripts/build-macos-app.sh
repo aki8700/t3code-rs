@@ -11,8 +11,23 @@ repo="$PWD"
 dist="$repo/dist"
 destination="$dist/T3 Code RS.app"
 mkdir -p "$dist"
+lock="$dist/.build.lock"
+if ! mkdir "$lock"; then
+    echo "Could not acquire build lock at $lock" >&2
+    exit 1
+fi
+staging=
+cleanup() {
+    if [[ -n "$staging" ]]; then
+        rm -rf -- "$staging" || :
+    fi
+    rmdir -- "$lock"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 staging="$(mktemp -d "$dist/.t3-macos.XXXXXX")"
-trap 'rm -rf -- "$staging"' EXIT
 
 bundle="$staging/T3 Code RS.app"
 contents="$bundle/Contents"
@@ -204,13 +219,23 @@ iconutil -c icns "$iconset" -o "$contents/Resources/AppIcon.icns"
 /usr/bin/codesign --force --deep --sign - "$bundle"
 /usr/bin/codesign --verify --deep --strict "$bundle"
 
-if [[ -e "$destination" || -L "$destination" ]]; then
-    mv -- "$destination" "$staging/previous.app"
-fi
-if ! mv -- "$bundle" "$destination"; then
-    if [[ -e "$staging/previous.app" || -L "$staging/previous.app" ]]; then
-        mv -- "$staging/previous.app" "$destination"
-    fi
-    exit 1
-fi
+python3 - "$bundle" "$destination" <<'PYTHON'
+import ctypes
+import os
+import sys
+
+source, destination = sys.argv[1:]
+rename = ctypes.CDLL(None, use_errno=True).renamex_np
+rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+rename.restype = ctypes.c_int
+
+# macOS <sys/stdio.h>. An atomic exchange keeps the previous app installed
+# if the swap fails and moves it into staging for cleanup on success.
+RENAME_SWAP = 0x00000002
+RENAME_EXCL = 0x00000004
+flags = RENAME_SWAP if os.path.lexists(destination) else RENAME_EXCL
+if rename(os.fsencode(source), os.fsencode(destination), flags) != 0:
+    errno = ctypes.get_errno()
+    raise SystemExit(f"Could not install {destination}: {os.strerror(errno)}")
+PYTHON
 echo "$destination"

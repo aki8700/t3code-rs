@@ -7,6 +7,7 @@ pub mod coordinator;
 mod database;
 pub mod privacy;
 pub mod routes;
+mod swarm;
 mod threads;
 mod usage;
 mod ws;
@@ -20,7 +21,7 @@ use std::{
 };
 use t3_core::{CoreError, CoreResult, McpInjectionSpec, ServerConfig, create_private_dir};
 use t3_mcp::McpServer;
-use t3_store::SqliteStore;
+use t3_store::{DaemonLock, SqliteStore, acquire_daemon_lock};
 use tokio::{net::TcpListener, sync::watch};
 use uuid::Uuid;
 
@@ -41,27 +42,29 @@ pub struct ServerState {
     usage_home: Option<PathBuf>,
     usage_cache: Arc<Mutex<usage::UsageScanCache>>,
     mcp: Arc<McpServer<RunCoordinator>>,
+    daemon_lock: Arc<DaemonLock>,
 }
 
 impl ServerState {
     pub fn new(config: ServerConfig, server_url: String) -> CoreResult<Self> {
-        let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).map_err(|error| CoreError::Internal(error.to_string()))?;
-        let token = blake3::Hash::from_bytes(bytes).to_hex().to_string();
-        let auth = AuthLayer::new(&config, Arc::from(token.as_str()))?;
+        let tokens = auth::McpTokens::default();
+        let auth = AuthLayer::new(&config, tokens.clone())?;
         create_private_dir(&config.data_dir).map_err(storage_io)?;
+        let daemon_lock = Arc::new(acquire_daemon_lock(&config.data_dir)?);
         let store = SqliteStore::open(config.db_path(), config.storage.clone())?;
         store.recover_interrupted_runs()?;
         let injection = McpInjectionSpec {
             binary_path: std::env::current_exe().map_err(internal_io)?,
             server_url,
-            internal_token: token,
+            internal_token: String::new(),
             thread_id: Uuid::nil(),
         };
-        let coordinator = RunCoordinator::new(config.clone(), store.clone(), injection);
+        let coordinator =
+            RunCoordinator::with_tokens(config.clone(), store.clone(), injection, tokens);
         Ok(Self {
             mcp: Arc::new(McpServer::new(coordinator.clone())),
             coordinator,
+            daemon_lock,
             store,
             auth,
             config: Arc::new(config),
@@ -110,6 +113,8 @@ pub async fn serve(config: ServerConfig) -> CoreResult<()> {
         .unwrap_or(public_address);
     let state = ServerState::new(config, format!("http://{mcp_address}"))?;
     let coordinator = state.coordinator.clone();
+    let _daemon_lock = state.daemon_lock.clone();
+    coordinator.resume_queued_runs().await?;
     let (shutdown, stop) = watch::channel(false);
     let public = axum::serve(
         listener,

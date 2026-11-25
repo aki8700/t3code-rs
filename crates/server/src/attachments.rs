@@ -154,10 +154,11 @@ pub(crate) async fn download(
     let bytes = tokio::fs::read(path).await.map_err(storage_io)?;
     let mime =
         valid_mime(&attachment.mime_type).unwrap_or_else(|| "application/octet-stream".into());
+    let disposition = content_disposition(&attachment.filename);
     Ok((
         [
             (header::CONTENT_TYPE, mime.as_str()),
-            (header::CONTENT_DISPOSITION, "attachment"),
+            (header::CONTENT_DISPOSITION, disposition.as_str()),
             (
                 header::CONTENT_SECURITY_POLICY,
                 "default-src 'none'; sandbox; frame-ancestors 'none'",
@@ -166,6 +167,44 @@ pub(crate) async fn download(
         Body::from(bytes),
     )
         .into_response())
+}
+
+fn content_disposition(name: &str) -> String {
+    use std::fmt::Write;
+    let clean: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '/' | '\\' | '"') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let clean = if matches!(clean.as_str(), "" | "." | "..") {
+        "download"
+    } else {
+        &clean
+    };
+    let ascii: String = clean
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ' ') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut value = format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''");
+    for byte in clean.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') {
+            value.push(char::from(byte));
+        } else {
+            write!(&mut value, "%{byte:02X}").expect("write to String");
+        }
+    }
+    value
 }
 
 fn valid_filename(name: &str) -> bool {

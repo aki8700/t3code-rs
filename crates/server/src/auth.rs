@@ -7,24 +7,79 @@ use http::{HeaderMap, Method, StatusCode, Uri, header, uri::Authority};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
 use reqwest::Url;
 use serde::Deserialize;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
-use t3_core::{AuthConfig, AuthIdentity, CoreError, CoreResult, ServerConfig, parse_jwks_override};
+use t3_core::{
+    AuthConfig, AuthIdentity, CoreError, CoreResult, InteractionMode, RuntimeMode, ServerConfig,
+    parse_jwks_override,
+};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 use uuid::Uuid;
 
 const MCP_TOKEN_PREFIX: &str = "t3mcp_";
 
+#[derive(Clone, Copy)]
+pub(crate) struct ActiveMcpToken {
+    pub(crate) thread_id: Uuid,
+    pub(crate) run_id: Uuid,
+    pub(crate) runtime_mode: RuntimeMode,
+    pub(crate) interaction_mode: InteractionMode,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct McpTokens(Arc<std::sync::RwLock<HashMap<String, ActiveMcpToken>>>);
+
+impl McpTokens {
+    pub(crate) fn register(&self, run: ActiveMcpToken) -> CoreResult<RunMcpToken> {
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).map_err(|error| CoreError::Internal(error.to_string()))?;
+        let token = format!(
+            "{MCP_TOKEN_PREFIX}{}",
+            blake3::Hash::from_bytes(bytes).to_hex()
+        );
+        self.0
+            .write()
+            .expect("MCP token lock")
+            .insert(token.clone(), run);
+        Ok(RunMcpToken {
+            registry: self.clone(),
+            token,
+        })
+    }
+
+    pub(crate) fn revoke_run(&self, id: Uuid) {
+        self.0
+            .write()
+            .expect("MCP token lock")
+            .retain(|_, run| run.run_id != id);
+    }
+}
+
+pub(crate) struct RunMcpToken {
+    registry: McpTokens,
+    pub(crate) token: String,
+}
+
+impl Drop for RunMcpToken {
+    fn drop(&mut self) {
+        self.registry
+            .0
+            .write()
+            .expect("MCP token lock")
+            .remove(&self.token);
+    }
+}
+
 #[derive(Clone)]
 pub struct AuthLayer {
     mode: AuthConfig,
     cloudflare: Option<Arc<Cloudflare>>,
-    internal_token: Arc<str>,
+    tokens: McpTokens,
 }
 
 impl AuthLayer {
-    pub fn new(config: &ServerConfig, internal_token: Arc<str>) -> CoreResult<Self> {
+    pub(crate) fn new(config: &ServerConfig, tokens: McpTokens) -> CoreResult<Self> {
         config
             .validate()
             .map_err(|error| CoreError::InvalidArgument(error.to_string()))?;
@@ -57,8 +112,21 @@ impl AuthLayer {
         Ok(Self {
             mode: config.auth.clone(),
             cloudflare,
-            internal_token,
+            tokens,
         })
+    }
+
+    pub(crate) fn active_run(&self, headers: &HeaderMap) -> Option<ActiveMcpToken> {
+        let thread_id = header_text(headers, "x-t3-thread-id")?
+            .parse::<Uuid>()
+            .ok()?;
+        self.tokens
+            .0
+            .read()
+            .ok()?
+            .get(bearer(headers)?)
+            .copied()
+            .filter(|run| run.thread_id == thread_id)
     }
 
     async fn identity(
@@ -76,22 +144,16 @@ impl AuthLayer {
         if !same_origin(headers, authority.as_ref()) {
             return None;
         }
-        if method == Method::POST
-            && uri.path() == "/mcp"
-            && let Some(token) = bearer(headers)
+        if let Some(token) = bearer(headers)
             && token.starts_with(MCP_TOKEN_PREFIX)
             && !matches!(&self.mode, AuthConfig::Bearer { token: public }
                 if matches_token(Some(token), public))
         {
-            let thread_id = header_text(headers, "x-t3-thread-id")?
-                .parse::<Uuid>()
-                .ok()?;
-            return (loopback
-                && matches_token(
-                    Some(token),
-                    &mcp_thread_token(&self.internal_token, thread_id),
-                ))
-            .then(|| identity(&thread_id.to_string(), "internal-mcp", None));
+            if !loopback || method != Method::POST || uri.path() != "/mcp" {
+                return None;
+            }
+            let run = self.active_run(headers)?;
+            return Some(identity(&run.thread_id.to_string(), "internal-mcp", None));
         }
 
         match &self.mode {
@@ -179,14 +241,6 @@ fn matches_token(value: Option<&str>, expected: &str) -> bool {
         let expected = blake3::hash(expected.as_bytes());
         bool::from(actual.as_bytes().ct_eq(expected.as_bytes()))
     })
-}
-
-pub(crate) fn mcp_thread_token(secret: &str, thread_id: Uuid) -> String {
-    let key = blake3::derive_key("t3code-rs internal MCP thread bearer", secret.as_bytes());
-    format!(
-        "{MCP_TOKEN_PREFIX}{}",
-        blake3::keyed_hash(&key, thread_id.as_bytes()).to_hex()
-    )
 }
 
 fn same_origin(headers: &HeaderMap, authority: Option<&Authority>) -> bool {
@@ -428,6 +482,18 @@ mod tests {
     use t3_mcp::{DelegateMode, OrchestratorBackend};
     use tower::ServiceExt;
 
+    fn fixture_token(layer: &AuthLayer, thread_id: Uuid) -> RunMcpToken {
+        layer
+            .tokens
+            .register(ActiveMcpToken {
+                thread_id,
+                run_id: Uuid::new_v4(),
+                runtime_mode: RuntimeMode::ApprovalRequired,
+                interaction_mode: InteractionMode::Plan,
+            })
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn internal_token_only_opens_mcp_for_loopback_peers() {
         let config = ServerConfig {
@@ -439,11 +505,12 @@ mod tests {
             },
             ..Default::default()
         };
-        let layer = AuthLayer::new(&config, "test-internal-token".into()).unwrap();
+        let layer = AuthLayer::new(&config, McpTokens::default()).unwrap();
         let id = Uuid::from_u128(1);
-        let token = mcp_thread_token("test-internal-token", id);
+        let token = fixture_token(&layer, id);
+        let bearer = &token.token;
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        headers.insert("authorization", format!("Bearer {bearer}").parse().unwrap());
         headers.insert("x-t3-thread-id", id.to_string().parse().unwrap());
         let loopback = Some("127.0.0.1".parse().unwrap());
         let external = Some("192.0.2.1".parse().unwrap());
@@ -484,7 +551,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let layer = AuthLayer::new(&config, "internal-fixture".into()).unwrap();
+        let layer = AuthLayer::new(&config, McpTokens::default()).unwrap();
         for (path, authorized) in [
             ("/ws?token=test-bearer-token%20%2B!%25", true),
             ("/ws?token=invalid", false),
@@ -590,7 +657,8 @@ mod tests {
             .await
             .unwrap()
             .task_id;
-        let token = mcp_thread_token(&state.auth.internal_token, caller.id);
+        let token = fixture_token(&state.auth, caller.id);
+        let bearer = &token.token;
         let app = crate::router(state);
         let call = |name, arguments: Value, header_id: Option<Uuid>| {
             let mut request = Request::builder()
@@ -599,7 +667,7 @@ mod tests {
                 .extension(ConnectInfo(
                     "127.0.0.1:49300".parse::<SocketAddr>().unwrap(),
                 ))
-                .header(header::AUTHORIZATION, format!("Bearer {token}"));
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
             if let Some(id) = header_id {
                 request = request.header("x-t3-thread-id", id.to_string());
             }

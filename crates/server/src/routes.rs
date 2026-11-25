@@ -37,6 +37,12 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/threads/{id}/respond", post(respond))
         .route("/api/threads/{id}/diff", get(diff))
         .route("/api/threads/{id}/delegate", post(delegate))
+        .route("/api/threads/{id}/swarm", get(swarm_board))
+        .route("/api/threads/{id}/swarm/messages", post(swarm_message))
+        .route(
+            "/api/threads/{id}/swarm/workers/{name}/kill",
+            post(swarm_kill),
+        )
         .route(
             "/api/attachments",
             post(attachments::upload)
@@ -198,15 +204,26 @@ async fn create_thread(
     Ok(Json(state.coordinator.create_thread(input).await?))
 }
 
+#[derive(Deserialize)]
+struct ThreadPage {
+    limit: Option<usize>,
+    before_ordinal: Option<i64>,
+}
+
 async fn thread_detail(
     State(state): State<ServerState>,
     Path(id): Path<Uuid>,
+    Query(page): Query<ThreadPage>,
 ) -> ApiResult<Json<Value>> {
     let store = &state.store;
     let thread = store.get_thread(id).await?;
-    let (runs, items, children, handoffs, mut attachments) = tokio::try_join!(
+    let (runs, (items, has_more, total_items), children, handoffs, mut attachments) = tokio::try_join!(
         store.list_runs(id),
-        store.list_turn_items(id, usize::MAX, 0),
+        store.list_turn_items_page(
+            id,
+            page.limit.unwrap_or(200).clamp(1, 1000),
+            page.before_ordinal
+        ),
         store.list_child_threads(id),
         store.list_handoffs(id),
         store.list_attachments(id),
@@ -233,8 +250,41 @@ async fn thread_detail(
     }
     Ok(Json(json!({
         "thread": thread, "runs": runs, "items": items, "children": children,
+        "has_more": has_more, "total_items": total_items,
         "handoffs": handoffs, "attachments": attachments,
     })))
+}
+
+async fn swarm_board(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Option<SwarmBoardSnapshot>>> {
+    Ok(Json(state.coordinator.get_board(id).await?))
+}
+
+#[derive(Deserialize)]
+struct SwarmPost {
+    text: String,
+}
+
+async fn swarm_message(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<SwarmPost>,
+) -> ApiResult<Json<SwarmBoardSnapshot>> {
+    Ok(Json(
+        state
+            .coordinator
+            .post_message(id, Some("user"), input.text)
+            .await?,
+    ))
+}
+
+async fn swarm_kill(
+    State(state): State<ServerState>,
+    Path((id, name)): Path<(Uuid, String)>,
+) -> ApiResult<Json<SwarmBoardSnapshot>> {
+    Ok(Json(state.coordinator.kill_worker(id, &name, false).await?))
 }
 
 async fn patch_thread(
@@ -344,11 +394,15 @@ async fn mcp(
     body: Bytes,
 ) -> ApiResult<Response> {
     let response = if identity.method == "internal-mcp" {
-        let id = identity
-            .subject
-            .parse()
-            .map_err(|_| CoreError::Auth("invalid MCP thread".into()))?;
-        let caller = state.store.get_thread(id).await?;
+        let run = state
+            .auth
+            .active_run(&headers)
+            .ok_or_else(|| CoreError::Auth("inactive MCP token".into()))?;
+        let mut caller = state.store.get_thread(run.thread_id).await?;
+        caller.runtime_mode = caller.runtime_mode.min(run.runtime_mode);
+        if run.interaction_mode == InteractionMode::Plan {
+            caller.interaction_mode = InteractionMode::Plan;
+        }
         state.mcp.handle_scoped_bytes(&body, &caller).await
     } else {
         let thread_id = headers

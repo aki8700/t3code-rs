@@ -1,8 +1,10 @@
+use crate::auth::{ActiveMcpToken, McpTokens, RunMcpToken};
+use crate::swarm::{SwarmTurn, is_swarm_command};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -12,7 +14,7 @@ use std::{
 use t3_core::*;
 use t3_git::GitManager;
 use t3_providers::{ProviderRegistry, run_turn_with_retry};
-use t3_store::SqliteStore;
+use t3_store::{QueuedRun, QueuedRunInput, SqliteStore};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use uuid::Uuid;
 
@@ -28,6 +30,7 @@ pub(crate) struct Coordinator {
     pub(crate) active: Mutex<HashMap<Uuid, ActiveRun>>,
     shutting_down: AtomicBool,
     injection: McpInjectionSpec,
+    tokens: McpTokens,
 }
 
 pub(crate) struct ActiveRun {
@@ -37,7 +40,9 @@ pub(crate) struct ActiveRun {
     driver: Arc<dyn ProviderDriver>,
     cancel: watch::Sender<bool>,
     done: watch::Receiver<bool>,
-    queue: VecDeque<Submission>,
+    pub(crate) wake_depth: u8,
+    pub(crate) runtime_mode: RuntimeMode,
+    pub(crate) interaction_mode: InteractionMode,
     pending: HashMap<Uuid, PendingRequest>,
 }
 
@@ -48,13 +53,6 @@ pub struct Message {
     #[serde(default)]
     pub attachment_ids: Vec<Uuid>,
     pub model_selection: Option<ModelSelection>,
-}
-
-struct Submission {
-    id: Uuid,
-    message: Message,
-    attachments: Vec<Attachment>,
-    notify_parent: bool,
 }
 
 pub(crate) struct RunTicket {
@@ -74,6 +72,15 @@ struct Outcome {
 
 impl RunCoordinator {
     pub fn new(cfg: ServerConfig, store: SqliteStore, injection: McpInjectionSpec) -> Self {
+        Self::with_tokens(cfg, store, injection, McpTokens::default())
+    }
+
+    pub(crate) fn with_tokens(
+        cfg: ServerConfig,
+        store: SqliteStore,
+        injection: McpInjectionSpec,
+        tokens: McpTokens,
+    ) -> Self {
         let (events, _) = broadcast::channel(512);
         Self(Arc::new(Coordinator {
             git: GitManager::new(cfg.worktrees_dir()),
@@ -81,6 +88,7 @@ impl RunCoordinator {
             cfg,
             store,
             injection,
+            tokens,
             events,
             active: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
@@ -107,34 +115,50 @@ impl RunCoordinator {
 
     pub async fn send(&self, id: Uuid, message: Message) -> CoreResult<Uuid> {
         let mut active = self.0.active.lock().await;
-        self.ensure_accepting_runs()?;
         let thread = self.0.store.get_thread(id).await?;
-        let mut submission = self.submission(&thread, message, false).await?;
-        if let Some(run) = active.get_mut(&id) {
-            let message = &submission.message;
-            if message.behavior.unwrap_or(self.0.cfg.follow_up_behavior) == FollowUpBehavior::Steer
-                && submission.attachments.is_empty()
-                && message
-                    .model_selection
-                    .as_ref()
-                    .is_none_or(|model| *model == run.model)
-                && !*run.cancel.borrow()
-                && run
-                    .driver
-                    .send_steer(run.id, message.prompt.clone())
-                    .await?
-            {
-                submission.id = run.id;
-                self.persist_prompt(id, &submission).await?;
-                return Ok(run.id);
-            }
-            let run_id = submission.id;
-            run.queue.push_back(submission);
-            return Ok(run_id);
+        self.send_locked(&mut active, thread, message, 0).await
+    }
+
+    pub(crate) async fn send_locked(
+        &self,
+        active: &mut HashMap<Uuid, ActiveRun>,
+        thread: Thread,
+        message: Message,
+        wake_depth: u8,
+    ) -> CoreResult<Uuid> {
+        self.ensure_accepting_runs()?;
+        self.validate_message(&thread, &message).await?;
+        let id = thread.id;
+        let swarm_command = is_swarm_command(&message.prompt);
+        if swarm_command {
+            self.ensure_board(&thread).await?;
         }
-        let (ticket, turn) = self.start(&mut active, thread, submission).await?;
-        self.spawn(turn);
-        Ok(ticket.id)
+        if !swarm_command
+            && let Some(run) = active.get(&id)
+            && message.behavior.unwrap_or(self.0.cfg.follow_up_behavior) == FollowUpBehavior::Steer
+            && message.attachment_ids.is_empty()
+            && message
+                .model_selection
+                .as_ref()
+                .is_none_or(|model| *model == run.model)
+            && !*run.cancel.borrow()
+            && run
+                .driver
+                .send_steer(run.id, message.prompt.clone())
+                .await?
+        {
+            self.append(prompt_item(id, run.id, &message)).await?;
+            return Ok(run.id);
+        }
+
+        let busy = active.contains_key(&id);
+        let run_id = self
+            .enqueue(&thread, message, false, wake_depth, busy)
+            .await?;
+        if !busy && let Some((_, turn)) = self.start_next(active, &thread, Some(run_id)).await? {
+            self.spawn(turn);
+        }
+        Ok(run_id)
     }
 
     pub(crate) async fn start_delegated(
@@ -143,18 +167,18 @@ impl RunCoordinator {
         thread: Thread,
         message: Message,
     ) -> CoreResult<RunTicket> {
-        let submission = self.submission(&thread, message, true).await?;
-        let (ticket, turn) = self.start(active, thread, submission).await?;
+        self.ensure_accepting_runs()?;
+        self.validate_message(&thread, &message).await?;
+        let id = self.enqueue(&thread, message, true, 0, false).await?;
+        let (ticket, turn) = self
+            .start_next(active, &thread, Some(id))
+            .await?
+            .ok_or_else(|| CoreError::Internal("delegated run was not queued".into()))?;
         self.spawn(turn);
         Ok(ticket)
     }
 
-    async fn submission(
-        &self,
-        thread: &Thread,
-        message: Message,
-        notify_parent: bool,
-    ) -> CoreResult<Submission> {
+    async fn validate_message(&self, thread: &Thread, message: &Message) -> CoreResult<()> {
         if thread.archived {
             return Err(CoreError::InvalidArgument("thread is archived".into()));
         }
@@ -163,25 +187,143 @@ impl RunCoordinator {
                 "prompt or attachment is required".into(),
             ));
         }
-        if let Some(model) = &message.model_selection {
-            self.driver(model)?;
-        }
+        self.driver(
+            message
+                .model_selection
+                .as_ref()
+                .unwrap_or(&thread.model_selection),
+        )?;
+        self.attachments(thread.id, &message.attachment_ids).await?;
+        Ok(())
+    }
+
+    async fn attachments(&self, thread_id: Uuid, ids: &[Uuid]) -> CoreResult<Vec<Attachment>> {
         let mut attachments = Vec::new();
-        for &id in &message.attachment_ids {
+        for &id in ids {
             let attachment = self.0.store.get_attachment(id).await?;
-            if attachment.thread_id.is_some_and(|owner| owner != thread.id) {
+            if attachment.thread_id.is_some_and(|owner| owner != thread_id) {
                 return Err(CoreError::InvalidArgument(
                     "attachment belongs to another thread".into(),
                 ));
             }
             attachments.push(attachment);
         }
-        Ok(Submission {
-            id: Uuid::new_v4(),
-            message,
-            attachments,
-            notify_parent,
-        })
+        Ok(attachments)
+    }
+
+    async fn enqueue(
+        &self,
+        thread: &Thread,
+        message: Message,
+        notify_parent: bool,
+        wake_depth: u8,
+        busy: bool,
+    ) -> CoreResult<Uuid> {
+        let id = Uuid::new_v4();
+        let item = prompt_item(thread.id, id, &message);
+        let selection = message
+            .model_selection
+            .unwrap_or_else(|| thread.model_selection.clone());
+        let (run, item) = self
+            .0
+            .store
+            .enqueue_run(
+                Run {
+                    id,
+                    thread_id: thread.id,
+                    ordinal: 0,
+                    provider: selection.provider,
+                    model: selection.model.clone(),
+                    effort: selection.effort.clone(),
+                    status: RunStatus::Queued,
+                    prompt: message.prompt,
+                    provider_session_id: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    duration_ms: None,
+                    error_message: None,
+                    started_at: Utc::now(),
+                    completed_at: None,
+                },
+                item,
+                QueuedRunInput {
+                    model_selection: selection,
+                    attachment_ids: message.attachment_ids,
+                    notify_parent,
+                    wake_depth,
+                    mode_ceiling: (wake_depth != 0)
+                        .then_some((thread.runtime_mode, thread.interaction_mode)),
+                },
+            )
+            .await?;
+        if busy {
+            self.emit(WsServerMessage::RunStatusChanged {
+                thread_id: thread.id,
+                run_id: run.id,
+                status: RunStatus::Queued,
+                error: None,
+            });
+        }
+        self.emit(WsServerMessage::TurnItemAdded {
+            thread_id: thread.id,
+            item,
+        });
+        Ok(id)
+    }
+
+    pub async fn resume_queued_runs(&self) -> CoreResult<()> {
+        let mut active = self.0.active.lock().await;
+        self.ensure_accepting_runs()?;
+        for id in self.0.store.queued_threads().await? {
+            if !active.contains_key(&id) {
+                let thread = self.0.store.get_thread(id).await?;
+                if let Some((_, turn)) = self.start_next(&mut active, &thread, None).await? {
+                    self.spawn(turn);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn start_next(
+        &self,
+        active: &mut HashMap<Uuid, ActiveRun>,
+        thread: &Thread,
+        submitted_id: Option<Uuid>,
+    ) -> CoreResult<Option<(RunTicket, RunningTurn)>> {
+        if self.0.shutting_down.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let store = &self.0.store;
+        while let Some(queued) = store.next_queued_run(thread.id).await? {
+            let run_id = queued.id;
+            match self.start(active, thread.clone(), queued).await {
+                Ok(started) => return Ok(Some(started)),
+                Err(error) => {
+                    store
+                        .finish_run(
+                            run_id,
+                            RunStatus::Failed,
+                            None,
+                            None,
+                            None,
+                            0,
+                            Some(error.to_string()),
+                        )
+                        .await?;
+                    self.emit(WsServerMessage::RunStatusChanged {
+                        thread_id: thread.id,
+                        run_id,
+                        status: RunStatus::Failed,
+                        error: Some(error.to_string()),
+                    });
+                    if submitted_id == Some(run_id) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn driver(&self, model: &ModelSelection) -> CoreResult<Arc<dyn ProviderDriver>> {
@@ -196,23 +338,29 @@ impl RunCoordinator {
     async fn start(
         &self,
         active: &mut HashMap<Uuid, ActiveRun>,
-        thread: Thread,
-        submission: Submission,
+        mut thread: Thread,
+        queued: QueuedRun,
     ) -> CoreResult<(RunTicket, RunningTurn)> {
         self.ensure_accepting_runs()?;
+        if thread.archived {
+            return Err(CoreError::InvalidArgument("thread is archived".into()));
+        }
+        if let Some((runtime, interaction)) = queued.input.mode_ceiling {
+            thread.runtime_mode = thread.runtime_mode.min(runtime);
+            if interaction == InteractionMode::Plan {
+                thread.interaction_mode = InteractionMode::Plan;
+            }
+        }
         let store = &self.0.store;
-        let selection = submission
-            .message
-            .model_selection
-            .as_ref()
-            .unwrap_or(&thread.model_selection);
-        let driver = self.driver(selection)?;
-        let runs = store.list_runs(thread.id).await?;
-        let previous_run = runs.iter().rev().find(|run| run.ordinal > 0);
+        let run_id = queued.id;
+        let selection = queued.input.model_selection;
+        let driver = self.driver(&selection)?;
+        let previous_run = store.previous_run(thread.id, run_id).await?;
         let resume_session_id = previous_run
+            .as_ref()
             .filter(|run| run.provider == selection.provider && run.model == selection.model)
             .and_then(|run| run.provider_session_id.clone());
-        let mut prompt = submission.message.prompt.clone();
+        let mut prompt = queued.prompt;
         if previous_run.is_none()
             && let Some(handoff) = store
                 .list_handoffs(thread.id)
@@ -225,76 +373,39 @@ impl RunCoordinator {
                 handoff.summary
             );
         }
-        let workspace_dir = match &thread.worktree_path {
-            Some(path) => path.clone(),
-            None => store.get_project(thread.project_id).await?.workspace_root,
-        };
+        let workspace_dir = self.workspace(&thread).await?;
+        let attachments = self
+            .attachments(thread.id, &queued.input.attachment_ids)
+            .await?;
+        let swarm = self
+            .get_board(thread.id)
+            .await?
+            .map(|board| SwarmTurn::prepare(&board, thread.id, selection.provider, &mut prompt))
+            .transpose()?;
+        let mcp_token = self.0.tokens.register(ActiveMcpToken {
+            thread_id: thread.id,
+            run_id,
+            runtime_mode: thread.runtime_mode,
+            interaction_mode: thread.interaction_mode,
+        })?;
         let mut injection = self.0.injection.clone();
         injection.thread_id = thread.id;
-        injection.internal_token =
-            crate::auth::mcp_thread_token(&injection.internal_token, thread.id);
+        injection.internal_token = mcp_token.token.clone();
         let request = TurnRequest {
             thread_id: thread.id,
-            run_id: submission.id,
+            run_id,
             workspace_dir,
             prompt,
             model_selection: selection.clone(),
             runtime_mode: thread.runtime_mode,
             interaction_mode: thread.interaction_mode,
             resume_session_id: resume_session_id.clone(),
-            attachments: submission.attachments.clone(),
+            attachments,
             mcp_injection: Some(injection),
         };
         let run = store
-            .create_run(Run {
-                id: submission.id,
-                thread_id: thread.id,
-                ordinal: previous_run.map_or(1, |previous| previous.ordinal + 1),
-                provider: selection.provider,
-                model: selection.model.clone(),
-                effort: selection.effort.clone(),
-                status: RunStatus::Running,
-                prompt: submission.message.prompt.clone(),
-                provider_session_id: resume_session_id,
-                input_tokens: None,
-                output_tokens: None,
-                duration_ms: None,
-                error_message: None,
-                started_at: Utc::now(),
-                completed_at: None,
-            })
+            .start_queued_run(run_id, selection.clone(), resume_session_id)
             .await?;
-        let setup = async {
-            if *selection != thread.model_selection {
-                self.select_model(&thread, selection).await?;
-            }
-            let item = store
-                .append_turn_item(prompt_item(thread.id, &submission))
-                .await?;
-            store
-                .update_thread_status(thread.id, ThreadStatus::Running)
-                .await?;
-            Ok(item)
-        }
-        .await;
-        let item = match setup {
-            Ok(item) => item,
-            Err(error) => {
-                let _ = store
-                    .finish_run(
-                        run.id,
-                        RunStatus::Failed,
-                        None,
-                        None,
-                        None,
-                        0,
-                        Some("run setup failed".into()),
-                    )
-                    .await;
-                return Err(error);
-            }
-        };
-
         let (cancel, cancellation) = watch::channel(false);
         let (done, completion) = watch::channel(false);
         active.insert(
@@ -306,7 +417,9 @@ impl RunCoordinator {
                 driver: driver.clone(),
                 cancel,
                 done: completion.clone(),
-                queue: VecDeque::new(),
+                wake_depth: queued.input.wake_depth,
+                runtime_mode: thread.runtime_mode,
+                interaction_mode: thread.interaction_mode,
                 pending: HashMap::new(),
             },
         );
@@ -314,16 +427,17 @@ impl RunCoordinator {
             thread_id: thread.id,
             run,
         });
-        self.emit(WsServerMessage::TurnItemAdded {
-            thread_id: thread.id,
-            item,
-        });
         self.emit(WsServerMessage::ThreadStatusChanged {
             thread_id: thread.id,
             status: ThreadStatus::Running,
         });
+        if swarm.is_some()
+            && let Err(error) = self.swarm_state(thread.id, "working").await
+        {
+            tracing::error!(%error, %run_id, "Could not persist swarm member state");
+        }
         let ticket = RunTicket {
-            id: submission.id,
+            id: run_id,
             done: completion,
         };
         let turn = RunningTurn {
@@ -332,7 +446,9 @@ impl RunCoordinator {
             cancellation,
             done,
             driver,
-            notify_parent: submission.notify_parent,
+            notify_parent: queued.input.notify_parent,
+            mcp_token,
+            swarm,
         };
         Ok((ticket, turn))
     }
@@ -347,32 +463,39 @@ impl RunCoordinator {
         });
     }
 
-    async fn persist_prompt(&self, id: Uuid, submission: &Submission) -> CoreResult<()> {
-        let item = self
-            .0
-            .store
-            .append_turn_item(prompt_item(id, submission))
-            .await?;
-        self.emit(WsServerMessage::TurnItemAdded {
-            thread_id: id,
-            item,
-        });
+    pub async fn interrupt(&self, id: Uuid) -> CoreResult<()> {
+        let done = {
+            let mut active = self.0.active.lock().await;
+            self.0.store.get_thread(id).await?;
+            self.interrupt_locked(&mut active, id).await?
+        };
+        if let Some(mut done) = done {
+            let _ = done.wait_for(|completed| *completed).await;
+        }
         Ok(())
     }
 
-    pub async fn interrupt(&self, id: Uuid) -> CoreResult<()> {
-        self.0.store.get_thread(id).await?;
-        let mut done = {
-            let mut active = self.0.active.lock().await;
-            let Some(run) = active.get_mut(&id) else {
-                return Ok(());
-            };
-            run.queue.clear();
-            run.cancel.send_replace(true);
-            run.done.clone()
-        };
-        let _ = done.wait_for(|completed| *completed).await;
-        Ok(())
+    pub(crate) async fn interrupt_locked(
+        &self,
+        active: &mut HashMap<Uuid, ActiveRun>,
+        id: Uuid,
+    ) -> CoreResult<Option<watch::Receiver<bool>>> {
+        let done = active.get_mut(&id).map(|run| self.cancel(run));
+        for run_id in self.0.store.cancel_queued_runs(id).await? {
+            self.emit(WsServerMessage::RunStatusChanged {
+                thread_id: id,
+                run_id,
+                status: RunStatus::Cancelled,
+                error: Some("Interrupted".into()),
+            });
+        }
+        Ok(done)
+    }
+
+    fn cancel(&self, run: &mut ActiveRun) -> watch::Receiver<bool> {
+        self.0.tokens.revoke_run(run.id);
+        run.cancel.send_replace(true);
+        run.done.clone()
     }
 
     pub(crate) fn ensure_accepting_runs(&self) -> CoreResult<()> {
@@ -388,11 +511,7 @@ impl RunCoordinator {
             self.0.shutting_down.store(true, Ordering::Relaxed);
             active
                 .values_mut()
-                .map(|run| {
-                    run.queue.clear();
-                    run.cancel.send_replace(true);
-                    run.done.clone()
-                })
+                .map(|run| self.cancel(run))
                 .collect::<Vec<_>>()
         };
         for mut done in completions {
@@ -424,6 +543,8 @@ impl RunCoordinator {
             done,
             driver,
             notify_parent,
+            mcp_token,
+            swarm,
         } = turn;
         let started = Instant::now();
         let thread_id = thread.id;
@@ -477,6 +598,7 @@ impl RunCoordinator {
                 }
             }
         };
+        drop(mcp_token);
 
         let mut active = self.0.active.lock().await;
         let cancelled = *cancellation.borrow();
@@ -494,6 +616,15 @@ impl RunCoordinator {
                 ),
             }
         };
+        if status == RunStatus::Completed
+            && let Some(swarm) = &swarm
+            && let Err(failure) = self
+                .apply_swarm_actions(&mut active, thread_id, swarm.actions(&outcome.assistant))
+                .await
+        {
+            status = RunStatus::Failed;
+            error = Some(failure.to_string());
+        }
         let flush = async {
             self.flush_text(
                 thread_id,
@@ -545,6 +676,11 @@ impl RunCoordinator {
         if let Err(error) = store.update_thread_status(thread_id, thread_status).await {
             tracing::error!(%error, %run_id, "Could not persist thread status");
         }
+        if (swarm.is_some() || thread.relationship.as_deref() == Some("swarm-worker"))
+            && let Err(error) = self.swarm_state(thread_id, "waiting").await
+        {
+            tracing::error!(%error, %run_id, "Could not persist swarm member state");
+        }
         self.emit(WsServerMessage::RunStatusChanged {
             thread_id,
             run_id,
@@ -562,35 +698,23 @@ impl RunCoordinator {
                 status: thread_status,
             });
         }
-        let mut queue = active
-            .remove(&thread_id)
-            .map(|run| run.queue)
-            .unwrap_or_default();
+        active.remove(&thread_id);
         done.send_replace(true);
-        while let Some(submission) = queue.pop_front() {
-            let submission_id = submission.id;
-            match store.get_thread(thread_id).await {
-                Ok(thread) => match self.start(&mut active, thread, submission).await {
-                    Ok((_, turn)) => {
-                        active.get_mut(&thread_id).expect("new active run").queue = queue;
-                        return Some(turn);
-                    }
-                    Err(error) => self.emit(WsServerMessage::RunStatusChanged {
-                        thread_id,
-                        run_id: submission_id,
-                        status: RunStatus::Failed,
-                        error: Some(error.to_string()),
-                    }),
-                },
-                Err(error) => {
-                    self.emit(WsServerMessage::Error {
-                        message: error.to_string(),
-                    });
-                    break;
-                }
+        let next = async {
+            let thread = store.get_thread(thread_id).await?;
+            self.start_next(&mut active, &thread, None).await
+        }
+        .await;
+        match next {
+            Ok(next) => next.map(|(_, turn)| turn),
+            Err(error) => {
+                tracing::error!(%error, %thread_id, "Could not start next queued run");
+                self.emit(WsServerMessage::Error {
+                    message: error.to_string(),
+                });
+                None
             }
         }
-        None
     }
 
     async fn event(
@@ -625,7 +749,7 @@ impl RunCoordinator {
                 out.session = Some(provider_session_id);
             }
             StreamEvent::AssistantDelta { text } => {
-                out.assistant.push_str(&text);
+                push_capped(&mut out.assistant, &text, out.reasoning.len());
                 self.emit(WsServerMessage::Delta {
                     thread_id,
                     run_id,
@@ -634,7 +758,7 @@ impl RunCoordinator {
                 });
             }
             StreamEvent::ReasoningDelta { text } => {
-                out.reasoning.push_str(&text);
+                push_capped(&mut out.reasoning, &text, out.assistant.len());
                 self.emit(WsServerMessage::Delta {
                     thread_id,
                     run_id,
@@ -731,7 +855,7 @@ impl RunCoordinator {
                             && item.kind == TurnItemKind::AssistantMessage
                             && text_value(&item.payload) == Some(&text)
                     }) {
-                        out.assistant = text;
+                        push_capped(&mut out.assistant, &text, out.reasoning.len());
                     }
                 }
                 out.terminal = Some((RunStatus::Completed, None));
@@ -788,16 +912,24 @@ struct RunningTurn {
     done: watch::Sender<bool>,
     driver: Arc<dyn ProviderDriver>,
     notify_parent: bool,
+    mcp_token: RunMcpToken,
+    swarm: Option<SwarmTurn>,
 }
 
-fn prompt_item(thread_id: Uuid, submission: &Submission) -> NewTurnItem {
-    let prompt = &submission.message.prompt;
+fn push_capped(buffer: &mut String, text: &str, other_len: usize) {
+    const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
+    let remaining = MAX_TEXT_BYTES.saturating_sub(buffer.len() + other_len);
+    buffer.push_str(&text[..text.floor_char_boundary(remaining)]);
+}
+
+fn prompt_item(thread_id: Uuid, run_id: Uuid, message: &Message) -> NewTurnItem {
+    let prompt = &message.prompt;
     NewTurnItem {
         thread_id,
-        run_id: submission.id,
+        run_id,
         kind: TurnItemKind::UserMessage,
         summary: Some(compact(prompt, 240)),
-        payload: json!({"text": prompt, "attachment_ids": submission.message.attachment_ids}),
+        payload: json!({"text": prompt, "attachment_ids": message.attachment_ids}),
         searchable_text: Some(prompt.clone()),
     }
 }

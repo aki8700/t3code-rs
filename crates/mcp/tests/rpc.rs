@@ -187,8 +187,13 @@ async fn handshake_discovery_batches_and_protocol_errors() {
         .await
         .unwrap();
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 19);
     for name in [
+        "swarm_status",
+        "swarm_add_worker",
+        "swarm_post_message",
+        "swarm_read_board",
+        "swarm_kill_worker",
         "code_index",
         "code_slice",
         "code_grep",
@@ -206,7 +211,13 @@ async fn handshake_discovery_batches_and_protocol_errors() {
 #[tokio::test]
 async fn dispatches_tools_with_thread_context_and_validates_arguments() {
     let id = server_id();
-    let server = McpServer::new(Backend::new(id));
+    let mut parent = caller(None);
+    parent.id = id;
+    let server = McpServer::new(Backend {
+        id,
+        caller: Some(parent),
+        project_root: None,
+    });
     assert_eq!(
         payload(call(&server, "orchestrator_capabilities", json!({})).await)["model_tiers"],
         json!([])
@@ -456,4 +467,117 @@ async fn scoped_diff_blocks_git_discovery_above_the_workspace() {
     let at_root = caller(Some(repo.path()));
     let diff = payload(scoped_call(&server, &at_root, "code_diff", json!({"cwd": "."})).await);
     assert_eq!(diff["skipped_generated"], 0);
+}
+
+#[tokio::test]
+async fn plan_thread_cannot_delegate_to_a_worktree() {
+    let mut parent = caller(None);
+    parent.interaction_mode = InteractionMode::Plan;
+    let server = McpServer::new(Backend {
+        id: parent.id,
+        caller: Some(parent.clone()),
+        project_root: None,
+    });
+    let args = json!({
+        "title":"child","task":"task","provider":"opencode","model":"local/model",
+        "isolation":"worktree","base_ref":"HEAD","mode":"wait","interaction_mode":"plan"
+    });
+    for result in [
+        scoped_call(&server, &parent, "delegate_task", args.clone()).await,
+        call(&server, "delegate_task", args).await,
+    ] {
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("plan")
+        );
+    }
+}
+
+fn run_git(cwd: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn scoped_diff_rejects_external_checkout_metadata() {
+    let workspace = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let external_git = external.path().join("metadata");
+    run_git(
+        workspace.path(),
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            external_git.to_str().unwrap(),
+        ],
+    );
+    let thread = caller(Some(workspace.path()));
+    let server = McpServer::new(Backend::new(thread.id));
+    let result = scoped_call(&server, &thread, "code_diff", json!({"cwd":"."})).await;
+    assert_eq!(result["isError"], true);
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("metadata")
+    );
+}
+
+#[tokio::test]
+async fn scoped_diff_accepts_linked_worktree_metadata_from_its_project() {
+    let project = tempfile::tempdir().unwrap();
+    let worktrees = tempfile::tempdir().unwrap();
+    let worktree = worktrees.path().join("task");
+    run_git(project.path(), &["init", "-q"]);
+    fs::create_dir(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/source.txt"), "original\n").unwrap();
+    run_git(project.path(), &["add", "src/source.txt"]);
+    run_git(
+        project.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+    );
+    run_git(
+        project.path(),
+        &["worktree", "add", "--detach", worktree.to_str().unwrap()],
+    );
+    fs::write(worktree.join("src/source.txt"), "modified\n").unwrap();
+    let thread = caller(Some(&worktree));
+    let server = McpServer::new(Backend {
+        id: thread.id,
+        caller: Some(thread.clone()),
+        project_root: Some(project.path().to_owned()),
+    });
+    let diff = payload(
+        scoped_call(
+            &server,
+            &thread,
+            "code_diff",
+            json!({"cwd":"src","rev":"HEAD"}),
+        )
+        .await,
+    );
+    assert_eq!(diff["name_status"], "M\tsource.txt");
+    assert!(diff["hunks"].as_str().unwrap().contains("+modified"));
 }

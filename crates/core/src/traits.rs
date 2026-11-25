@@ -104,6 +104,12 @@ pub trait Store: Send + Sync {
     async fn update_thread_status(&self, id: Uuid, status: ThreadStatus) -> CoreResult<()>;
     async fn update_thread_session_id(&self, id: Uuid, session_id: String) -> CoreResult<()>;
     async fn update_thread_model(&self, id: Uuid, selection: ModelSelection) -> CoreResult<()>;
+    async fn update_thread_modes(
+        &self,
+        id: Uuid,
+        runtime_mode: RuntimeMode,
+        interaction_mode: InteractionMode,
+    ) -> CoreResult<()>;
     async fn update_thread_title(&self, id: Uuid, title: String) -> CoreResult<()>;
     async fn archive_thread(&self, id: Uuid, archived: bool) -> CoreResult<()>;
 
@@ -127,6 +133,15 @@ pub trait Store: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> CoreResult<Vec<TurnItem>>;
+
+    /// Return the newest items before the exclusive cursor, in ascending ordinal order.
+    /// The boolean indicates whether older items exist. The count covers the whole thread.
+    async fn list_turn_items_page(
+        &self,
+        thread_id: Uuid,
+        limit: usize,
+        before_ordinal: Option<i64>,
+    ) -> CoreResult<(Vec<TurnItem>, bool, usize)>;
 
     async fn record_handoff(&self, handoff: ContextHandoff) -> CoreResult<ContextHandoff>;
     async fn list_handoffs(&self, thread_id: Uuid) -> CoreResult<Vec<ContextHandoff>>;

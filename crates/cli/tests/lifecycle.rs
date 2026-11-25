@@ -116,8 +116,12 @@ async fn gc_dry_run_leaves_the_data_directory_untouched() {
     assert!(!cfg.data_dir.exists());
 
     fs::create_dir_all(cfg.attachments_dir()).unwrap();
-    let orphan = cfg.attachments_dir().join("orphan");
+    let orphan = cfg
+        .attachments_dir()
+        .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let unrelated = cfg.attachments_dir().join("keep-me.txt");
     fs::write(&orphan, b"unused").unwrap();
+    fs::write(&unrelated, b"user note").unwrap();
     let store = SqliteStore::open(cfg.db_path(), cfg.storage.clone()).unwrap();
     drop(store);
     let original = fs::read(cfg.db_path()).unwrap();
@@ -150,6 +154,7 @@ async fn gc_dry_run_leaves_the_data_directory_untouched() {
         }
     }
     assert!(!orphan.exists());
+    assert!(unrelated.exists());
 }
 
 #[tokio::test]
