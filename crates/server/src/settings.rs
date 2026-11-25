@@ -14,8 +14,13 @@ use uuid::Uuid;
 /// overwriting or stripping comments from the user's `config.toml`.
 #[derive(Clone)]
 pub(crate) struct SettingsStore {
-    inner: Arc<RwLock<RuntimeSettings>>,
+    inner: Arc<RwLock<SettingsState>>,
     persist_path: Option<PathBuf>,
+}
+
+struct SettingsState {
+    snapshot: RuntimeSettings,
+    explicit_overrides: RuntimeSettingsPatch,
 }
 
 impl SettingsStore {
@@ -25,9 +30,10 @@ impl SettingsStore {
     pub(crate) fn load_or_init(cfg: &ServerConfig) -> Self {
         let persist_path = cfg.runtime_settings_path();
         let mut settings = cfg.runtime_settings();
+        let mut explicit_overrides = RuntimeSettingsPatch::default();
         if let Some(patch) = read_persisted_patch(&persist_path) {
             let mut candidate = settings.clone();
-            if let Err(err) = candidate.apply_patch(patch) {
+            if let Err(err) = candidate.apply_patch(patch.clone()) {
                 warn!(
                     path = %persist_path.display(),
                     error = %err,
@@ -42,10 +48,14 @@ impl SettingsStore {
                 );
             } else {
                 settings = candidate;
+                explicit_overrides = patch;
             }
         }
         Self {
-            inner: Arc::new(RwLock::new(settings)),
+            inner: Arc::new(RwLock::new(SettingsState {
+                snapshot: settings,
+                explicit_overrides,
+            })),
             persist_path: Some(persist_path),
         }
     }
@@ -54,7 +64,10 @@ impl SettingsStore {
     #[allow(dead_code)]
     pub(crate) fn in_memory(initial: RuntimeSettings) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(initial)),
+            inner: Arc::new(RwLock::new(SettingsState {
+                snapshot: initial,
+                explicit_overrides: RuntimeSettingsPatch::default(),
+            })),
             persist_path: None,
         }
     }
@@ -63,6 +76,7 @@ impl SettingsStore {
         self.inner
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot
             .clone()
     }
 
@@ -79,14 +93,47 @@ impl SettingsStore {
             .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut next = guard.clone();
-        next.apply_patch(patch)
+        let mut next = guard.snapshot.clone();
+        next.apply_patch(patch.clone())
             .map_err(|err| CoreError::InvalidArgument(err.to_string()))?;
+        let mut next_overrides = guard.explicit_overrides.clone();
+        merge_patch(&mut next_overrides, patch);
         if let Some(path) = &self.persist_path {
-            persist_atomic(path, &next)?;
+            persist_atomic(path, &next_overrides)?;
         }
-        *guard = next.clone();
+        guard.snapshot = next.clone();
+        guard.explicit_overrides = next_overrides;
         Ok(next)
+    }
+}
+
+fn merge_patch(target: &mut RuntimeSettingsPatch, update: RuntimeSettingsPatch) {
+    if update.default_model.is_some() {
+        target.default_model = update.default_model;
+    }
+    if update.follow_up_behavior.is_some() {
+        target.follow_up_behavior = update.follow_up_behavior;
+    }
+    if update.auto_resume_limited_threads.is_some() {
+        target.auto_resume_limited_threads = update.auto_resume_limited_threads;
+    }
+    if update.rate_limit_max_retries.is_some() {
+        target.rate_limit_max_retries = update.rate_limit_max_retries;
+    }
+    if update.rate_limit_initial_backoff_secs.is_some() {
+        target.rate_limit_initial_backoff_secs = update.rate_limit_initial_backoff_secs;
+    }
+    if update.fallback_models.is_some() {
+        target.fallback_models = update.fallback_models;
+    }
+    if update.verify_max_auto_fixes.is_some() {
+        target.verify_max_auto_fixes = update.verify_max_auto_fixes;
+    }
+    if update.antigravity_mcp_enabled.is_some() {
+        target.antigravity_mcp_enabled = update.antigravity_mcp_enabled;
+    }
+    if update.antigravity_quota_probe.is_some() {
+        target.antigravity_quota_probe = update.antigravity_quota_probe;
     }
 }
 
@@ -168,7 +215,7 @@ fn read_persisted_patch(path: &Path) -> Option<RuntimeSettingsPatch> {
     }
 }
 
-fn persist_atomic(path: &Path, settings: &RuntimeSettings) -> CoreResult<()> {
+fn persist_atomic(path: &Path, overrides: &RuntimeSettingsPatch) -> CoreResult<()> {
     let parent = path
         .parent()
         .ok_or_else(|| CoreError::Storage("runtime_settings path has no parent".into()))?;
@@ -183,7 +230,7 @@ fn persist_atomic(path: &Path, settings: &RuntimeSettings) -> CoreResult<()> {
     }
 
     let mut payload =
-        serde_json::to_vec_pretty(settings).map_err(|err| CoreError::Internal(err.to_string()))?;
+        serde_json::to_vec_pretty(overrides).map_err(|err| CoreError::Internal(err.to_string()))?;
     payload.push(b'\n');
 
     let tmp_name = format!(".runtime_settings.{}.tmp", Uuid::new_v4());
@@ -262,6 +309,144 @@ mod tests {
         assert_eq!(current.verify_max_auto_fixes, 4);
         assert!(current.antigravity_quota_probe);
         assert!(!cfg.runtime_settings_path().exists());
+    }
+
+    #[test]
+    fn patch_does_not_persist_unrelated_config_defaults() {
+        let dir = TempDir::new("unrelated-default");
+        let cfg = test_config(dir.path().to_path_buf());
+        let store = SettingsStore::load_or_init(&cfg);
+        store
+            .patch(
+                RuntimeSettingsPatch {
+                    verify_max_auto_fixes: Some(4),
+                    ..Default::default()
+                },
+                &cfg.enabled_providers,
+            )
+            .unwrap();
+
+        let mut edited_cfg = cfg.clone();
+        edited_cfg.rate_limit_max_retries = 9;
+        let reloaded = SettingsStore::load_or_init(&edited_cfg);
+
+        assert_eq!(reloaded.get().verify_max_auto_fixes, 4);
+        assert_eq!(reloaded.get().rate_limit_max_retries, 9);
+    }
+
+    #[test]
+    fn explicit_default_values_and_empty_lists_survive_config_changes() {
+        let dir = TempDir::new("explicit-defaults");
+        let cfg = test_config(dir.path().to_path_buf());
+        let store = SettingsStore::load_or_init(&cfg);
+        store
+            .patch(
+                RuntimeSettingsPatch {
+                    fallback_models: Some(Vec::new()),
+                    antigravity_mcp_enabled: Some(false),
+                    ..Default::default()
+                },
+                &cfg.enabled_providers,
+            )
+            .unwrap();
+
+        let mut edited_cfg = cfg.clone();
+        edited_cfg.fallback_models = vec![ModelSelection {
+            provider: ProviderId::Mock,
+            model: "new-config-fallback".into(),
+            effort: None,
+            agent: None,
+        }];
+        edited_cfg.antigravity_mcp_enabled = true;
+        let reloaded = SettingsStore::load_or_init(&edited_cfg);
+
+        assert!(reloaded.get().fallback_models.is_empty());
+        assert!(!reloaded.get().antigravity_mcp_enabled);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_persist_does_not_leak_overrides_into_later_patch() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new("failed-persist-overlay");
+        let cfg = test_config(dir.path().to_path_buf());
+        let target = dir.path().join("outside.json");
+        fs::write(&target, "{}").unwrap();
+        symlink(&target, cfg.runtime_settings_path()).unwrap();
+        let store = SettingsStore::load_or_init(&cfg);
+
+        let err = store
+            .patch(
+                RuntimeSettingsPatch {
+                    verify_max_auto_fixes: Some(3),
+                    ..Default::default()
+                },
+                &cfg.enabled_providers,
+            )
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Storage(_)));
+        assert_eq!(store.get().verify_max_auto_fixes, 2);
+
+        fs::remove_file(cfg.runtime_settings_path()).unwrap();
+        store
+            .patch(
+                RuntimeSettingsPatch {
+                    antigravity_quota_probe: Some(true),
+                    ..Default::default()
+                },
+                &cfg.enabled_providers,
+            )
+            .unwrap();
+
+        let mut edited_cfg = cfg.clone();
+        edited_cfg.verify_max_auto_fixes = 6;
+        let reloaded = SettingsStore::load_or_init(&edited_cfg);
+        assert_eq!(reloaded.get().verify_max_auto_fixes, 6);
+        assert!(reloaded.get().antigravity_quota_probe);
+    }
+
+    #[test]
+    fn parallel_patches_keep_snapshot_and_persisted_overrides_in_sync() {
+        let dir = TempDir::new("parallel-patches");
+        let cfg = test_config(dir.path().to_path_buf());
+        let store = SettingsStore::load_or_init(&cfg);
+
+        let first = store.clone();
+        let first_providers = cfg.enabled_providers.clone();
+        let a = std::thread::spawn(move || {
+            first
+                .patch(
+                    RuntimeSettingsPatch {
+                        verify_max_auto_fixes: Some(4),
+                        ..Default::default()
+                    },
+                    &first_providers,
+                )
+                .unwrap();
+        });
+        let second = store.clone();
+        let second_providers = cfg.enabled_providers.clone();
+        let b = std::thread::spawn(move || {
+            second
+                .patch(
+                    RuntimeSettingsPatch {
+                        rate_limit_max_retries: Some(8),
+                        ..Default::default()
+                    },
+                    &second_providers,
+                )
+                .unwrap();
+        });
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let current = store.get();
+        assert_eq!(current.verify_max_auto_fixes, 4);
+        assert_eq!(current.rate_limit_max_retries, 8);
+        let reloaded = SettingsStore::load_or_init(&cfg).get();
+        assert_eq!(reloaded.verify_max_auto_fixes, 4);
+        assert_eq!(reloaded.rate_limit_max_retries, 8);
     }
 
     #[test]
@@ -439,6 +624,33 @@ mod tests {
         let current = store.get();
         assert!(current.antigravity_mcp_enabled);
         assert_eq!(current.rate_limit_max_retries, 6);
+    }
+
+    #[test]
+    fn load_or_init_preserves_legacy_full_persisted_json_meaning() {
+        let dir = TempDir::new("legacy-full");
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.rate_limit_max_retries = 9;
+        cfg.fallback_models = vec![ModelSelection {
+            provider: ProviderId::Mock,
+            model: "config-fallback".into(),
+            effort: None,
+            agent: None,
+        }];
+        let legacy_full = RuntimeSettings {
+            rate_limit_max_retries: 5,
+            fallback_models: Vec::new(),
+            ..cfg.runtime_settings()
+        };
+        fs::write(
+            cfg.runtime_settings_path(),
+            serde_json::to_vec_pretty(&legacy_full).unwrap(),
+        )
+        .unwrap();
+
+        let current = SettingsStore::load_or_init(&cfg).get();
+        assert_eq!(current.rate_limit_max_retries, 5);
+        assert!(current.fallback_models.is_empty());
     }
 
     #[test]

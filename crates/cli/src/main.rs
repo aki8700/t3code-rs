@@ -6,6 +6,7 @@ use std::{
     fmt::Write as _,
     fs,
     io::ErrorKind,
+    io::Write as _,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -1177,23 +1178,66 @@ fn format_monitor_table(value: &Value) -> String {
 }
 
 fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
+    write_private_file_with(path, contents, |file, bytes| file.write_all(bytes))
+}
 
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+fn write_private_file_with(
+    path: &Path,
+    contents: &[u8],
+    write: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "export destination {} is not a regular file",
+                    path.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("export destination {} has no file name", path.display()),
+        )
+    })?;
+
+    let (temp_path, mut file) = loop {
+        let temp_name = format!(".t3d-export-{}.tmp", Uuid::new_v4());
+        let temp_path = parent.join(temp_name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp_path) {
+            Ok(file) => break (temp_path, file),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    let write_result = write(&mut file, contents)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    let result = write_result.and_then(|()| fs::rename(&temp_path, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
     }
-    file.write_all(contents)?;
-    file.flush()
+    result
 }
 
 #[cfg(test)]
@@ -1883,6 +1927,71 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_write_failure_preserves_existing_destination() {
+        use std::io::Write as _;
+
+        let dir = std::env::temp_dir().join(format!("t3-cli-export-failure-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("transcript.md");
+        fs::write(&path, b"previous complete export\n").unwrap();
+
+        let error = write_private_file_with(&path, b"replacement export\n", |file, bytes| {
+            file.write_all(&bytes[..5])?;
+            Err(std::io::Error::other("injected write failure"))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "injected write failure");
+        assert_eq!(fs::read(&path).unwrap(), b"previous complete export\n");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_write_private_file_accepts_bare_relative_filename() {
+        let name = format!("t3-cli-export-{}.md", Uuid::new_v4());
+        let path = PathBuf::from(&name);
+        write_private_file(&path, b"relative export\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"relative export\n");
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_write_private_file_accepts_long_valid_basename() {
+        let dir = std::env::temp_dir().join(format!("t3-cli-export-long-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x".repeat(250));
+
+        write_private_file(&path, b"long filename export\n").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"long filename export\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn export_write_private_file_rejects_nonregular_destinations() {
+        let dir = std::env::temp_dir().join(format!("t3-cli-export-kind-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let error = write_private_file(&dir, b"contents").unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let target = dir.join("target");
+            let link = dir.join("link");
+            fs::write(&target, b"target stays intact").unwrap();
+            symlink(&target, &link).unwrap();
+            let error = write_private_file(&link, b"replacement").unwrap_err();
+            assert!(error.to_string().contains("not a regular file"));
+            assert_eq!(fs::read(&target).unwrap(), b"target stays intact");
         }
 
         let _ = fs::remove_dir_all(&dir);
