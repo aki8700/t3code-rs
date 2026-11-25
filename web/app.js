@@ -15,6 +15,10 @@ import { wireRailResizer } from './js/rail.js';
 import {
   CTX_SOURCE_LABEL, CTX_KIND_META, fallbackContextWindow, contextRingSvg, setContextRing, ctxSection,
 } from './js/context-ui.js';
+import {
+  allCommands, GROUP_LABEL, parseShellInput, parseSlashInput, findCommand,
+  getPaletteSuggestions, loadShellHistory, pushShellHistory,
+} from './js/commands.js';
 
 // ───────────────────────── state ─────────────────────────
 const S = {
@@ -63,6 +67,7 @@ const S = {
   ws: null, wsOk: false,
   token: ls.get('t3.token', ''),
   theme: ls.get('t3.theme', 'system'),
+  shellHistory: loadShellHistory(ls),
 };
 
 const threadById = (id) => S.threads.find((t) => t.id === id) || (S.detail?.thread?.id === id ? S.detail.thread : null)
@@ -425,10 +430,14 @@ function setComposeSel(sel) {
   renderComposer();
   if (shownRail() === 'context') renderContextPanel();
 }
-function openModelPopover(anchor) {
+function openModelPopover(anchor, initialQuery = '') {
   const panel = modelPanel({ value: S.compose.sel, onChange: setComposeSel });
   const el = openPopover(anchor, h('div', { class: 'pop-stack' }, panel.el, composerPerm()), { cls: 'model-pop' });
   if (!el) return;
+  if (initialQuery) {
+    panel.search.value = initialQuery;
+    panel.search.dispatchEvent(new Event('input'));
+  }
   popover.place();
   if (!isCoarse()) panel.search.focus({ preventScroll: true });
 }
@@ -660,7 +669,7 @@ function setHash(hash) {
 
 /** Draft state for a new thread: hero + composer. The thread is created on first send. */
 function goHome(projectId) {
-  closePopover(); closeDrawer();
+  closePopover(); closeDrawer(); hideCommandPalette();
   stashDraft();
   if (S.threadId) clearBlobCache();
   S.threadId = null; S.detail = null; S.diffStat = null; S.diffData = null; S.diffError = null;
@@ -677,7 +686,7 @@ function goHome(projectId) {
 
 async function openThread(id, { push = true } = {}) {
   if (!id) return;
-  closePopover(); closeDrawer();
+  closePopover(); closeDrawer(); hideCommandPalette();
   if (push) setHash(`#/t/${id}`);
   if (id !== S.threadId) {
     stashDraft();
@@ -897,7 +906,9 @@ function renderHeroRecent() {
   box.replaceChildren(...[
     recent.length ? h('div', { class: 'recent' }, h('span', { class: 'recent-lab', text: '最近のスレッド' }), recent.map((t) => h('button', { type: 'button', class: 'recent-chip', title: cleanTitle(t.title), onclick: () => openThread(t.id) },
       provDot(t.model_selection?.provider, `s-${t.status}`), h('span', { class: 't', text: cleanTitle(t.title) }), h('small', { text: fmtAgo(t.updated_at) })))) : null,
-    h('div', { class: 'hero-keys' }, [['K', '検索'], ['N', '新規'], ['B', 'サイドバー'], ['I', 'コンテキスト'], ['D', '差分'], ['U', '使用量']].map(([k, l]) => h('span', {}, h('kbd', { text: kbd(k) }), l))),
+    h('div', { class: 'hero-keys' },
+      [['/', 'コマンド'], ['!', 'シェル実行']].map(([k, l]) => h('span', {}, h('kbd', { text: k }), l)),
+      [['K', '検索'], ['N', '新規'], ['B', 'サイドバー'], ['I', 'コンテキスト'], ['D', '差分'], ['U', '使用量']].map(([k, l]) => h('span', {}, h('kbd', { text: kbd(k) }), l))),
   ].filter(Boolean));
 }
 
@@ -976,16 +987,17 @@ function outputBlock(text) {
 const section = (label, node) => h('div', { class: 's-sec' }, h('div', { class: 's-lab', text: label }), node);
 
 /** One single-line expandable row. The body is built lazily on first expand (outputs can be huge). */
-function stepRow({ item, icon, verb, target, targetTitle, badges = [], sections = [], cls = '', trailing }) {
+function stepRow({ item, icon, verb, target, targetTitle, badges = [], sections = [], cls = '', trailing, open = false }) {
   const body = h('div', { class: 's-body' });
   const bytes = h('span', { class: 'sbytes' });
   const badgeBox = h('span', { class: 's-badges' }, badges, bytes);
-  const el = h('details', { class: `step ${cls}`, dataset: { item: item.id } },
+  const el = h('details', { class: `step ${cls}`, dataset: { item: item.id }, open },
     h('summary', {}, iconEl(icon, 's-ic'), h('span', { class: 's-verb', text: verb }), h('span', { class: 's-target', text: target, title: targetTitle || target }), badgeBox, trailing, iconEl('chevron', 's-chev')),
     body);
   const queue = [...sections];
   const flush = () => { if (el.open) while (queue.length) body.append(queue.shift()()); };
   el.addEventListener('toggle', flush);
+  if (open) flush();
   let raw = 0; let stored = 0;
   el.addBytes = (it) => {
     raw += Number(it.raw_bytes) || 0;
@@ -1059,13 +1071,26 @@ function buildStep(item) {
     }
     case 'command_execution': {
       const cmd = pstr(p, 'command', 'cmd', 'title') || (Array.isArray(p?.command) ? p.command.join(' ') : '') || sum || pstr(p, 'step_type');
-      const out = [textOf(p?.output ?? p?.stdout ?? p?.aggregated_output ?? p?.state?.output), textOf(p?.stderr)].filter(Boolean).join('\n');
+      const userShell = p?.source === 'user_shell';
+      const out = userShell
+        ? pstr(p, 'output') || [textOf(p?.stdout), textOf(p?.stderr)].filter(Boolean).join('\n')
+        : [textOf(p?.output ?? p?.stdout ?? p?.aggregated_output ?? p?.state?.output), textOf(p?.stderr)].filter(Boolean).join('\n');
       const code = p?.exit_code ?? p?.exitCode ?? p?.code;
-      const bad = code != null && Number(code) !== 0;
+      const timedOut = p?.timed_out === true;
+      const bad = timedOut || (code != null && Number(code) !== 0);
+      const dur = Number(p?.duration_ms);
+      const badges = [
+        timedOut ? badge('timeout', 'bad') : code == null ? null : badge(`exit ${code}`, bad ? 'bad' : 'good'),
+        userShell && Number.isFinite(dur) ? badge(fmtDur(dur)) : null,
+      ].filter(Boolean);
       return stepRow({
-        item, icon: 'terminal', verb: 'コマンド実行', target: oneLine(cmd, 260), cls: bad ? 'cmd bad' : 'cmd',
-        badges: code == null ? [] : [badge(`exit ${code}`, bad ? 'bad' : 'good')],
-        sections: [() => section('コマンド', pre(cmd)), () => section('出力', out ? outputBlock(out) : h('div', { class: 'muted', text: '出力はありません' }))],
+        item, icon: 'terminal', verb: userShell ? 'シェル実行' : 'コマンド実行', target: oneLine(cmd, 260),
+        cls: `cmd${userShell ? ' user-shell' : ''}${bad ? ' bad' : ''}`,
+        badges, open: userShell,
+        sections: [
+          () => section(p?.cwd ? `コマンド (${compactPath(p.cwd)})` : 'コマンド', pre(cmd)),
+          () => section('出力', out ? outputBlock(out) : h('div', { class: 'muted', text: '出力はありません' })),
+        ],
       });
     }
     case 'file_change': {
@@ -1513,35 +1538,472 @@ function renderComposer() {
     sel?.effort ? h('span', { class: `effort e-${sel.effort}` }, h('i'), h('span', { text: sel.effort })) : null,
     iconEl('chevDown', 'mchev'),
   ].filter(Boolean));
-  ta().placeholder = isNarrow() ? (busy ? '追加の指示…' : t ? '追加の指示を入力…' : '依頼内容を入力…')
-    : busy ? (S.behavior === 'steer' ? '実行中のターンに指示を割り込ませる…' : '次のターンに予約する指示…')
-      : t ? '追加の指示を入力（Shift+Enter で改行）' : 'やりたいことを入力（Enter で送信 / Shift+Enter で改行）';
+  ta().placeholder = isNarrow() ? (busy ? '追加の指示…' : t ? '追加の指示（/ コマンド · ! シェル）' : '依頼内容（/ コマンド · ! シェル）')
+    : busy ? (S.behavior === 'steer' ? '実行中のターンに指示を割り込ませる（/ コマンド · ! シェル）…' : '次のターンに予約する指示（/ コマンド · ! シェル）…')
+      : t ? '追加の指示を入力（/ コマンド · ! シェル実行 · Shift+Enter で改行）' : 'やりたいことを入力（/ コマンド · ! シェル実行 · Enter で送信）';
   const send = $('#btn-send');
-  const label = !busy ? '送信' : S.behavior === 'steer' ? '割り込み送信 (Steer)' : '予約送信 (Queue)';
+  const shellOn = isShellModeInput(ta().value);
+  const label = shellOn ? 'シェルコマンドを実行' : !busy ? '送信' : S.behavior === 'steer' ? '割り込み送信 (Steer)' : '予約送信 (Queue)';
   send.title = label; send.setAttribute('aria-label', label);
   send.disabled = sending || (!ta().value.trim() && !S.atts.length);
   $('#btn-stop').disabled = !t || !busy;
+  syncComposerHints();
   syncLimitAlert();
   renderContextMeters();
 }
-const syncSendEnabled = () => { $('#btn-send').disabled = sending || (!ta().value.trim() && !S.atts.length); syncSwarmHint(); };
+const syncSendEnabled = () => {
+  $('#btn-send').disabled = sending || (!ta().value.trim() && !S.atts.length);
+  syncComposerHints();
+  updateCommandPalette();
+};
 
-const SWARM_COMMAND = /^\s*\/swarm(\s|$)/;
-const LIMITS_COMMAND = /^\/(usage-limits|limits)$/i; // answered locally, never sent to a provider
-/** Pill above the textarea while the message is a /swarm command. Touches the DOM only on a change (it is a live region). */
-function syncSwarmHint() {
+const SWARM_COMMAND = /^\s*\/swarm(\s|$)/i;
+const isShellModeInput = (val) => !!parseShellInput(val) || /^\s*\/(sh|shell|bash|run)(\s|$)/i.test(val || '');
+/** Pill above the textarea for /swarm or ! shell command mode. Touches the DOM only on a change. */
+function syncComposerHints() {
   const box = $('#swarm-hint');
-  const on = SWARM_COMMAND.test(ta().value);
-  if (on === !!box.firstChild) return;
-  box.replaceChildren(...(on ? [h('span', { class: 'swarm-pill' }, iconEl('swarm'), h('span', { text: 'Swarm モード · マルチエージェント協調ボードを起動' }))] : []));
+  const val = ta().value;
+  const shellOn = isShellModeInput(val);
+  const swarmOn = !shellOn && SWARM_COMMAND.test(val);
+  $('#composer').classList.toggle('shell-mode', shellOn);
+  const sendBtn = $('#btn-send');
+  if (shellOn) {
+    sendBtn.title = 'シェルコマンドを実行';
+    sendBtn.setAttribute('aria-label', 'シェルコマンドを実行');
+  }
+  const t = curThread();
+  const proj = projectById(t?.project_id || S.projectId);
+  const where = t?.worktree_path ? compactPath(t.worktree_path) : proj?.title || '作業ディレクトリ';
+  const key = shellOn ? `shell:${where}` : swarmOn ? 'swarm' : '';
+  if ((box.dataset.key || '') === key) return;
+  box.dataset.key = key;
+  if (shellOn) {
+    box.replaceChildren(h('span', { class: 'shell-pill' }, iconEl('terminal'), h('span', { text: `シェル実行 · ${where} · Enter で実行` })));
+  } else if (swarmOn) {
+    box.replaceChildren(h('span', { class: 'swarm-pill' }, iconEl('swarm'), h('span', { text: 'Swarm モード · マルチエージェント協調ボードを起動' })));
+  } else {
+    box.replaceChildren();
+  }
 }
 function insertSwarmCommand() {
   const input = ta();
   if (!SWARM_COMMAND.test(input.value)) input.value = `/swarm ${input.value}`;
   else if (input.value.trim() === '/swarm') input.value = '/swarm ';
+  cmdDismissed = false;
   autosize(); syncSendEnabled();
   input.focus();
   input.setSelectionRange(input.value.length, input.value.length);
+}
+
+// ───────────────────────── slash & shell command palette ─────────────────────────
+let cmdMenu = null; // { mode, items, index }
+let cmdDismissed = false;
+
+function hideCommandPalette() {
+  cmdMenu = null;
+  const el = $('#cmd-palette');
+  if (el) { el.hidden = true; el.replaceChildren(); }
+  ta()?.setAttribute('aria-expanded', 'false');
+}
+
+function commandPaletteContext() {
+  const models = [];
+  for (const p of S.providers) {
+    const providerLabel = provLabel(p.provider);
+    for (const m of p.models || []) models.push({ provider: p.provider, providerLabel, id: m.id, label: m.label || m.id });
+  }
+  return {
+    provider: S.compose.sel?.provider || curThread()?.model_selection?.provider,
+    hasThread: !!curThread(),
+    isBusy: isBusy(curThread()?.status),
+    effortLevels: effortLevels(S.compose.sel),
+    models,
+    themes: THEMES,
+    shellHistory: S.shellHistory,
+  };
+}
+
+function updateCommandPalette() {
+  if (cmdDismissed || sending) { hideCommandPalette(); return; }
+  const res = getPaletteSuggestions(ta().value, commandPaletteContext());
+  if (!res || !res.items.length) { hideCommandPalette(); return; }
+  // Shell history starts unselected (-1) so Enter always runs what the user typed unless they navigate with arrows.
+  const defIdx = res.mode === 'shell' ? -1 : 0;
+  const prevIdx = cmdMenu && cmdMenu.mode === res.mode
+    ? (cmdMenu.index < 0 ? defIdx : Math.min(cmdMenu.index, res.items.length - 1))
+    : defIdx;
+  cmdMenu = { ...res, index: prevIdx };
+  renderCommandPalette();
+}
+
+function renderCommandPalette() {
+  const box = $('#cmd-palette');
+  if (!box || !cmdMenu || !cmdMenu.items.length) { hideCommandPalette(); return; }
+  const headerText = cmdMenu.mode === 'shell' ? '最近のシェルコマンド（↑↓ 選択 · Tab 補完 · Enter 実行）'
+    : cmdMenu.mode === 'arg' ? `/${cmdMenu.command.name} の引数候補（↑↓ 選択 · Tab 補完 · Enter 実行）`
+      : 'スラッシュコマンド（↑↓ 選択 · Tab 補完 · Enter 実行 · Esc 閉じる）';
+  const list = h('div', { class: 'cmd-list' }, cmdMenu.items.map((item, i) => {
+    const sel = i === cmdMenu.index;
+    return h('button', {
+      type: 'button',
+      role: 'option',
+      class: `cmd-opt${sel ? ' sel' : ''}`,
+      'aria-selected': String(sel),
+      onmousedown: (e) => { e.preventDefault(); },
+      onmousemove: () => { if (cmdMenu && cmdMenu.index !== i) moveCommandSelection(i); },
+      onclick: () => applyCommandChoice(item, { execute: item.execute }),
+    },
+    item.provider ? provDot(item.provider) : iconEl(item.icon || 'terminal', 'cmd-ic'),
+    h('span', { class: 'cmd-name' }, h('b', { text: item.label }), item.args ? h('em', { text: item.args }) : null),
+    h('span', { class: 'cmd-desc', text: item.desc }),
+    item.fuzzy ? h('span', { class: 'cmd-tag warn', text: '候補' })
+      : item.group ? h('span', { class: 'cmd-tag', text: item.provider ? provLabel(item.provider) : item.group }) : null);
+  }));
+  box.replaceChildren(h('div', { class: 'cmd-head', text: headerText }), list);
+  box.hidden = false;
+  ta().setAttribute('aria-expanded', 'true');
+  $('.cmd-opt.sel', box)?.scrollIntoView({ block: 'nearest' });
+}
+
+function moveCommandSelection(nextIdx) {
+  if (!cmdMenu || !cmdMenu.items.length) return;
+  const n = cmdMenu.items.length;
+  cmdMenu.index = ((nextIdx % n) + n) % n;
+  const opts = $$('#cmd-palette .cmd-opt');
+  opts.forEach((el, i) => {
+    const on = i === cmdMenu.index;
+    el.classList.toggle('sel', on);
+    el.setAttribute('aria-selected', String(on));
+    if (on) el.scrollIntoView({ block: 'nearest' });
+  });
+}
+
+function applyCommandChoice(item, { execute = false } = {}) {
+  if (!item) return;
+  const input = ta();
+  if (execute) {
+    input.value = item.insert.trim();
+    hideCommandPalette();
+    autosize();
+    send();
+    return;
+  }
+  input.value = item.insert;
+  cmdDismissed = false;
+  autosize();
+  syncSendEnabled();
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
+async function runShellCommand(command) {
+  const cmd = String(command || '').trim();
+  if (!cmd) { toast('実行するコマンドを入力してください（例: !git status）', 'warn'); return; }
+  const t = curThread();
+  const project = projectById(t?.project_id || S.projectId);
+  if (!t && !project) { toast('先にプロジェクトを追加してください', 'err'); projectDialog(); return; }
+  S.shellHistory = pushShellHistory(ls, cmd);
+  const input = ta();
+  input.value = '';
+  hideCommandPalette();
+  autosize();
+  sending = true;
+  syncSendEnabled();
+  const label = oneLine(cmd, 56);
+  toast(`$ ${label} を実行中…`, 'info', 2500);
+  try {
+    if (t) {
+      const res = await api(`/api/threads/${t.id}/exec`, { method: 'POST', json: { command: cmd } });
+      loadDetailSoon();
+      refreshDiffSoon();
+      if (res.timed_out) toast(`タイムアウトしました: $ ${label}`, 'warn', 5000);
+      else if (res.exit_code !== 0) toast(`exit ${res.exit_code}: $ ${label}`, 'warn', 4000);
+      else toast(`完了 (${fmtDur(res.duration_ms)}): $ ${label}`, 'ok', 2200);
+    } else {
+      const res = await api(`/api/projects/${project.id}/exec`, { method: 'POST', json: { command: cmd } });
+      shellResultDialog(res);
+    }
+  } catch (e) {
+    input.value = `!${cmd}`;
+    autosize();
+    toast(`コマンド実行に失敗: ${e.message}`, 'err', 6000);
+  } finally {
+    sending = false;
+    renderComposer();
+    if (!isCoarse() && !$('dialog[open]')) ta().focus();
+  }
+}
+
+function shellResultDialog(res) {
+  const out = [res.stdout, res.stderr].filter(Boolean).join(res.stdout && !res.stdout.endsWith('\n') ? '\n' : '');
+  const bad = res.timed_out || (res.exit_code != null && res.exit_code !== 0);
+  openModal('シェル実行結果', (body, close) => {
+    const badges = [
+      res.timed_out ? badge('timeout', 'bad') : badge(`exit ${res.exit_code ?? '?'}`, bad ? 'bad' : 'good'),
+      badge(fmtDur(res.duration_ms)),
+      res.truncated ? badge('一部省略', 'warn') : null,
+    ].filter(Boolean);
+    body.append(
+      h('div', { class: 'shell-res' },
+        h('div', { class: 'shell-res-meta' },
+          h('code', { class: 'shell-res-cmd', text: `$ ${res.command}` }),
+          h('div', { class: 'shell-res-badges' }, badges)),
+        h('div', { class: 'muted mono shell-res-cwd', text: res.cwd }),
+        out ? outputBlock(out) : h('div', { class: 'muted', text: '出力はありません' }),
+        h('div', { class: 'actions' },
+          h('button', { type: 'button', class: 'btn sm', text: '出力をコピー', onclick: () => copyText(out || `$ ${res.command}`, 'コピーしました') }),
+          h('button', {
+            type: 'button', class: 'btn sm primary', text: 'この出力を AI に渡す',
+            onclick: () => {
+              close();
+              const snippet = `コマンド実行結果:\n\`\`\`sh\n$ ${res.command}\n${(out || '(出力なし)').slice(0, 6000)}\n\`\`\`\n\n`;
+              ta().value = snippet;
+              autosize(); syncSendEnabled(); ta().focus();
+            },
+          }))));
+  }, { cls: 'wide' });
+}
+
+function commandHelpDialog() {
+  const provider = S.compose.sel?.provider || curThread()?.model_selection?.provider;
+  const cmds = allCommands(provider);
+  const groups = new Map();
+  for (const c of cmds) {
+    const label = c.provider ? `${provLabel(c.provider)} コマンド` : (GROUP_LABEL[c.group] || c.group);
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(c);
+  }
+  openModal('コマンド一覧（入力欄）', (body, close) => {
+    const runOrInsert = (c) => {
+      close();
+      applyCommandChoice({
+        insert: c.needsArg || c.args ? `/${c.name} ` : `/${c.name}`,
+        execute: !c.needsArg && !c.args && (!c.requiresThread || !!curThread()),
+      }, { execute: !c.needsArg && !c.args && (!c.requiresThread || !!curThread()) });
+    };
+    body.append(
+      h('div', { class: 'help-banner' },
+        iconEl('terminal'),
+        h('div', {},
+          h('b', { text: '直接シェル実行: !<コマンド>' }),
+          h('p', { class: 'muted', text: '先頭に ! を付けて入力すると（例: !git status / !cargo test）、現在の作業ディレクトリで直接実行し、結果をタイムラインに記録します。' }))),
+      ...[...groups.entries()].map(([title, list]) => h('section', { class: 'help-sec' },
+        h('h3', { class: 'sec-h', text: title }),
+        h('div', { class: 'help-cmds' }, list.map((c) => h('button', {
+          type: 'button', class: 'help-row',
+          onclick: () => runOrInsert(c),
+        },
+        h('code', { class: 'help-cmd', text: `/${c.name}${c.args ? ` ${c.args}` : ''}` }),
+        h('span', { class: 'help-desc', text: c.desc })))))));
+  }, { cls: 'wide' });
+}
+
+/**
+ * Executes built-in local slash commands.
+ * Returns `{ handled: true }` if consumed locally, or `{ handled: false, overrideText? }` to send to the provider CLI.
+ */
+async function executeSlashCommand(parsed) {
+  const provider = S.compose.sel?.provider || curThread()?.model_selection?.provider;
+  const cmd = findCommand(parsed.name, provider);
+  if (!cmd || cmd.sendToProvider) return { handled: false };
+
+  const t = curThread();
+  const arg = parsed.arg;
+  const clearInput = () => { ta().value = ''; hideCommandPalette(); autosize(); syncSendEnabled(); };
+
+  if (cmd.requiresThread && !t) {
+    clearInput();
+    toast(`/${cmd.name} はスレッドを開いた状態で実行してください`, 'warn');
+    return { handled: true };
+  }
+
+  switch (cmd.name) {
+    case 'help':
+      clearInput();
+      commandHelpDialog();
+      return { handled: true };
+    case 'new':
+      clearInput();
+      goHome(S.projectId);
+      toast('新規スレッドを開きました', 'ok', 1800);
+      return { handled: true };
+    case 'sh':
+      if (!arg) {
+        ta().value = '/sh ';
+        autosize(); syncSendEnabled(); ta().focus();
+        toast('実行するシェルコマンドを入力してください（例: /sh git status）', 'info');
+        return { handled: true };
+      }
+      await runShellCommand(arg);
+      return { handled: true };
+    case 'compact': {
+      // Claude Code and Antigravity support native in-place /compact on the active CLI session.
+      const p = t.model_selection?.provider;
+      if (p === 'antigravity' || p === 'claude') {
+        return { handled: false, overrideText: arg ? `/compact ${arg}` : '/compact' };
+      }
+      // Other providers (Codex, OpenCode, Mock): compact by forking with an automatic handoff summary.
+      clearInput();
+      sending = true; syncSendEnabled();
+      try {
+        const req = {
+          title: `${cleanTitle(t.title)} (圧縮)`,
+          target_model: S.compose.sel || t.model_selection,
+        };
+        if (arg) req.handoff_summary = arg;
+        const r = await api(`/api/threads/${t.id}/fork`, { method: 'POST', json: req });
+        const nt = r.thread || r;
+        toast('会話を要約して新しいスレッドに圧縮しました', 'ok');
+        await loadThreads();
+        await openThread(nt.id);
+      } catch (e) {
+        toast(`圧縮に失敗: ${e.message}`, 'err');
+      } finally {
+        sending = false; renderComposer();
+      }
+      return { handled: true };
+    }
+    case 'model': {
+      clearInput();
+      if (!arg) { openModelPopover($('#btn-model')); return { handled: true }; }
+      const q = arg.toLowerCase();
+      const all = [];
+      for (const p of S.providers) {
+        for (const m of p.models || []) all.push({ provider: p.provider, id: m.id, label: m.label || m.id });
+      }
+      const exact = all.find((m) => `${m.provider}/${m.id}`.toLowerCase() === q || m.id.toLowerCase() === q || m.label.toLowerCase() === q);
+      const matches = exact ? [exact] : all.filter((m) => `${m.provider}/${m.id} ${m.label}`.toLowerCase().includes(q));
+      if (matches.length === 1) {
+        const m = matches[0];
+        setComposeSel(withEffort({ provider: m.provider, model: m.id }, S.compose.sel?.effort));
+        toast(`モデルを ${m.label} (${provLabel(m.provider)}) に変更しました`, 'ok', 2200);
+      } else {
+        openModelPopover($('#btn-model'), arg);
+      }
+      return { handled: true };
+    }
+    case 'effort': {
+      clearInput();
+      const levels = effortLevels(S.compose.sel);
+      if (!levels.length) { toast('現在のモデルでは Effort を変更できません', 'warn'); return { handled: true }; }
+      const v = arg.toLowerCase();
+      if (!v || !levels.includes(v)) {
+        toast(`Effort を指定してください: ${levels.join(' / ')}（現在: ${S.compose.sel?.effort || 'default'}）`, 'info', 4000);
+        return { handled: true };
+      }
+      setComposeSel({ ...S.compose.sel, effort: v });
+      toast(`Effort を ${v} に変更しました`, 'ok', 2000);
+      return { handled: true };
+    }
+    case 'plan': {
+      clearInput();
+      const cur = t ? t.interaction_mode === 'plan' : S.compose.plan;
+      const v = arg.toLowerCase();
+      const next = v === 'on' || v === 'true' || v === '1' ? true : v === 'off' || v === 'false' || v === '0' ? false : !cur;
+      if (t) await patchPerm(t.id, { interaction_mode: next ? 'plan' : 'default' });
+      else { S.compose.plan = next; renderComposer(); toast(`Plan モードを${next ? '有効' : '無効'}にしました`, 'ok', 2000); }
+      return { handled: true };
+    }
+    case 'mode': {
+      clearInput();
+      if (!arg) { openPopover($('#btn-perm'), composerPerm(), { cls: 'perm-pop', align: 'start' }); return { handled: true }; }
+      const map = {
+        approval: 'approval-required', 'approval-required': 'approval-required', default: 'approval-required',
+        auto: 'auto-accept-edits', edit: 'auto-accept-edits', edits: 'auto-accept-edits', 'auto-accept-edits': 'auto-accept-edits',
+        full: 'full-access', 'full-access': 'full-access',
+      };
+      const next = map[arg.toLowerCase()];
+      if (!next) { toast('権限モード: approval-required / auto-accept-edits / full-access', 'warn', 4000); return { handled: true }; }
+      if (t) await patchPerm(t.id, { runtime_mode: next });
+      else { S.compose.mode = next; renderComposer(); toast(`実行権限を「${MODE_LABEL[next]}」に変更しました`, 'ok', 2000); }
+      return { handled: true };
+    }
+    case 'diff': {
+      clearInput();
+      const v = arg.toLowerCase();
+      if (v === 'latest' || v === 'all') {
+        S.diffScope = v;
+        ls.set('t3.diffScope', v);
+        setRail('diff');
+        loadDiff();
+      } else {
+        toggleDiff();
+      }
+      return { handled: true };
+    }
+    case 'context':
+      clearInput();
+      toggleContext();
+      return { handled: true };
+    case 'stop':
+      clearInput();
+      if (isBusy(t.status)) await interrupt();
+      else toast('実行中のターンはありません', 'info', 2000);
+      return { handled: true };
+    case 'fork':
+      clearInput();
+      if (arg) {
+        try {
+          const r = await api(`/api/threads/${t.id}/fork`, { method: 'POST', json: { title: arg, target_model: S.compose.sel || t.model_selection } });
+          const nt = r.thread || r;
+          toast('分岐しました', 'ok');
+          await loadThreads();
+          await openThread(nt.id);
+        } catch (e) { toast(`分岐に失敗: ${e.message}`, 'err'); }
+      } else {
+        forkDialog();
+      }
+      return { handled: true };
+    case 'delegate':
+      clearInput();
+      delegateDialog(arg);
+      return { handled: true };
+    case 'title':
+      if (!arg) {
+        ta().value = '/title ';
+        autosize(); syncSendEnabled(); ta().focus();
+        toast('新しいタイトルを入力してください', 'info');
+        return { handled: true };
+      }
+      clearInput();
+      await patchThread(t.id, { title: arg });
+      toast('タイトルを変更しました', 'ok', 2000);
+      return { handled: true };
+    case 'pin':
+      clearInput();
+      await patchThread(t.id, { pinned: !t.pinned });
+      toast(t.pinned ? 'ピン留めを解除しました' : 'ピン留めしました', 'ok', 1800);
+      return { handled: true };
+    case 'archive':
+      clearInput();
+      await patchThread(t.id, { archived: !t.archived });
+      toast(t.archived ? 'アーカイブを解除しました' : 'アーカイブしました', 'ok', 1800);
+      return { handled: true };
+    case 'search':
+      clearInput();
+      searchDialog(arg);
+      return { handled: true };
+    case 'usage':
+      clearInput();
+      usageDialog();
+      return { handled: true };
+    case 'limits':
+      clearInput();
+      usageDialog({ metric: 'limits' });
+      return { handled: true };
+    case 'theme': {
+      clearInput();
+      if (!arg) { themeMenu($('#btn-theme')); return { handled: true }; }
+      const q = arg.toLowerCase();
+      const found = THEMES.find(([id, label]) => id.toLowerCase() === q || label.toLowerCase().includes(q));
+      if (!found) { toast(`テーマ: ${THEMES.map(([id]) => id).join(' / ')}`, 'warn', 4000); return { handled: true }; }
+      setTheme(found[0]);
+      toast(`テーマを「${found[1]}」に変更しました`, 'ok', 2000);
+      return { handled: true };
+    }
+    default:
+      return { handled: false };
+  }
 }
 
 function autosize() { const el = ta(); el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight, Math.max(120, window.innerHeight * 0.36))}px`; }
@@ -1583,13 +2045,25 @@ async function addFiles(files) {
 async function send() {
   if (sending) return;
   const input = ta();
-  const text = input.value.trim();
+  let text = input.value.trim();
   if (!text && !S.atts.length) return;
-  if (LIMITS_COMMAND.test(text)) { // attachments stay in the composer
-    input.value = ''; autosize(); syncSendEnabled();
-    usageDialog({ metric: 'limits' });
+  hideCommandPalette();
+
+  // Direct shell command: `!<command>`
+  const shell = parseShellInput(text);
+  if (shell) {
+    await runShellCommand(shell.command);
     return;
   }
+
+  // Local slash commands: `/compact`, `/new`, `/diff`, `/model`, `/sh`, `/help`, etc.
+  const slash = parseSlashInput(text);
+  if (slash) {
+    const res = await executeSlashCommand(slash);
+    if (res.handled) return;
+    if (res.overrideText) text = res.overrideText;
+  }
+
   if (S.atts.some((a) => a.uploading)) { toast('添付のアップロード完了を待っています…'); return; }
   let t = curThread();
   if (S.threadId && !t) return; // still loading
@@ -1754,10 +2228,11 @@ function forkDialog() {
   }, { cls: 'form-modal' });
 }
 
-function delegateDialog() {
+function delegateDialog(initialTask = '') {
   const t = curThread(); if (!t) return;
+  const taskText = typeof initialTask === 'string' ? initialTask : '';
   openModal('並列委譲（子スレッド）', (body, close) => {
-    const draft = ta().value.trim();
+    const draft = taskText || ta().value.trim();
     const title = h('input', { class: 'inp', placeholder: '例: テストを書く', 'aria-label': 'タイトル' });
     const task = h('textarea', { class: 'inp', rows: 4, required: true, placeholder: '子エージェントへの指示（背景・完了条件を含める）', value: draft, 'aria-label': 'タスク' });
     const picker = modelPanel({ value: S.compose.sel || t.model_selection });
@@ -1832,12 +2307,13 @@ function groupHits(rows, terms) {
   return [...groups.values()];
 }
 
-function searchDialog() {
+function searchDialog(initialQuery = '') {
   const open = $('dialog.search');
   if (open) { open.close(); return; }
+  const query = typeof initialQuery === 'string' ? initialQuery : '';
   closeDrawer();
   openModal('全文検索', (body, close) => {
-    const inp = h('input', { class: 'srch-input', type: 'text', enterKeyHint: 'search', placeholder: '会話・コマンド出力を検索（日本語対応）', autocomplete: 'off', spellcheck: false, 'aria-label': '検索語' });
+    const inp = h('input', { class: 'srch-input', type: 'text', enterKeyHint: 'search', placeholder: '会話・コマンド出力を検索（日本語対応）', autocomplete: 'off', spellcheck: false, 'aria-label': '検索語', value: query });
     const list = h('ul', { class: 'hits', role: 'listbox' });
     const note = h('div', { class: 'srch-note', role: 'status' });
     let options = []; let sel = 0; let seq = 0;
@@ -1897,7 +2373,7 @@ function searchDialog() {
       } else if (e.key === 'Enter' && options[sel]) { e.preventDefault(); go(options[sel].target); }
     });
     body.append(h('div', { class: 'srch-row' }, iconEl('search'), inp, h('kbd', { text: 'esc' })), note, list);
-    recent();
+    if (query.trim()) run(); else recent();
     setTimeout(() => inp.focus(), 0);
   }, { cls: 'search' });
 }
@@ -3922,13 +4398,46 @@ function wire() {
   // composer
   $('#swarm-hint').after(h('div', { id: 'limit-alert', class: 'limit-alert', role: 'status' }));
   const input = ta();
-  input.addEventListener('input', () => { autosize(); syncSendEnabled(); });
+  input.addEventListener('input', () => { cmdDismissed = false; autosize(); syncSendEnabled(); });
   input.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return; // never send while IME is composing
+    if (e.isComposing || e.keyCode === 229) return; // never act while IME is composing
+    if (cmdMenu && cmdMenu.items.length) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const next = cmdMenu.index < 0
+          ? (e.key === 'ArrowDown' ? 0 : cmdMenu.items.length - 1)
+          : cmdMenu.index + (e.key === 'ArrowDown' ? 1 : -1);
+        moveCommandSelection(next);
+        return;
+      }
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        const idx = cmdMenu.index < 0 ? 0 : cmdMenu.index;
+        applyCommandChoice(cmdMenu.items[idx], { execute: false });
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        cmdDismissed = true;
+        hideCommandPalette();
+        return;
+      }
+      if (e.key === 'Enter' && !e.shiftKey && !e.altKey && cmdMenu.index >= 0) {
+        if (isCoarse() && !(e.metaKey || e.ctrlKey)) return;
+        e.preventDefault();
+        const choice = cmdMenu.items[cmdMenu.index];
+        applyCommandChoice(choice, { execute: choice.execute });
+        return;
+      }
+    }
+    if (e.key !== 'Enter') return;
     if (e.shiftKey || e.altKey) return;
     if (isCoarse() && !(e.metaKey || e.ctrlKey)) return; // phones: Enter = newline, use the send button
     e.preventDefault(); send();
   });
+  document.addEventListener('pointerdown', (e) => {
+    if (cmdMenu && !$('#composer').contains(e.target)) hideCommandPalette();
+  }, true);
   input.addEventListener('paste', (e) => {
     const files = [...(e.clipboardData?.files || [])];
     if (files.length) { e.preventDefault(); addFiles(files); }
@@ -4008,7 +4517,18 @@ function wire() {
       } else if (!typing && !$('dialog[open]')) { e.preventDefault(); ta().focus(); }
       return;
     }
-    if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey && !typing && !popover && !$('dialog[open]')) { e.preventDefault(); ta().focus(); return; }
+    if (e.key === '/' && !e.metaKey && !e.ctrlKey && !e.altKey && !typing && !popover && !$('dialog[open]')) {
+      e.preventDefault();
+      const inp = ta();
+      inp.focus();
+      if (!inp.value) {
+        inp.value = '/';
+        cmdDismissed = false;
+        autosize(); syncSendEnabled();
+        inp.setSelectionRange(1, 1);
+      }
+      return;
+    }
     // Alt+S (⌥S types "ß" on macOS, so match the physical key)
     if (e.code === 'KeyS' && e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) { e.preventDefault(); if (!$('dialog[open]')) toggleSwarm(); return; }
     const mod = IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;

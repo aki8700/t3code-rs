@@ -8,6 +8,7 @@ mod database;
 mod limits;
 pub mod privacy;
 pub mod routes;
+mod shell;
 mod swarm;
 mod threads;
 mod usage;

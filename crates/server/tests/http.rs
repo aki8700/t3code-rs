@@ -1636,3 +1636,106 @@ async fn thread_detail_returns_context_and_items_breakdown() {
     let js_non = request(&app2, Request::get("/js/util.txt").body(Body::empty()).unwrap()).await;
     assert_eq!(js_non.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn shell_exec_runs_in_thread_and_project_and_records_history() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let app = router(state);
+    let project = json_req(
+        &app,
+        Method::POST,
+        "/api/projects",
+        Some(json!({"title": "Shell Test", "workspace_root": tmp.0})),
+    )
+    .await;
+    let project_id = project["id"].as_str().unwrap();
+
+    // Project-level exec runs in workspace and disables telemetry.
+    let proj_res = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/projects/{project_id}/exec"),
+        Some(json!({"command": "printf '%s:%s' \"$DO_NOT_TRACK\" \"$T3CODE_TELEMETRY_ENABLED\""})),
+    )
+    .await;
+    assert_eq!(proj_res["exit_code"], 0);
+    assert_eq!(proj_res["stdout"], "1:false");
+    assert_eq!(proj_res["timed_out"], false);
+
+    // Empty command returns 400.
+    let bad = request(
+        &app,
+        Request::post(format!("/api/projects/{project_id}/exec"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"command":"   "}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+    // Thread-level exec persists a CommandExecution item in the thread timeline.
+    let thread = json_req(
+        &app,
+        Method::POST,
+        "/api/threads",
+        Some(json!({
+            "project_id": project_id,
+            "title": "Shell Thread",
+            "model_selection": {"provider": "mock", "model": "mock"}
+        })),
+    )
+    .await;
+    let thread_id = thread["id"].as_str().unwrap();
+    let thr_res = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{thread_id}/exec"),
+        Some(json!({"command": "echo hello-shell && echo err-line >&2"})),
+    )
+    .await;
+    assert_eq!(thr_res["exit_code"], 0);
+    assert!(thr_res["stdout"].as_str().unwrap().contains("hello-shell"));
+    assert!(thr_res["stderr"].as_str().unwrap().contains("err-line"));
+    assert!(thr_res["item_id"].is_string());
+
+    let detail = json_req(&app, Method::GET, &format!("/api/threads/{thread_id}"), None).await;
+    let items = detail["items"].as_array().unwrap();
+    assert!(items.iter().any(|it| {
+        it["kind"] == "command_execution"
+            && it["payload"]["source"] == "user_shell"
+            && it["payload"]["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("hello-shell")
+    }));
+
+    // Timeout and backgrounded descendants must terminate cleanly without hanging.
+    let to_res = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/projects/{project_id}/exec"),
+        Some(json!({"command": "sleep 10 & sleep 10", "timeout_secs": 1})),
+    )
+    .await;
+    assert_eq!(to_res["timed_out"], true);
+    assert!(to_res["exit_code"].is_null());
+
+    // Shell exec in a thread must not disrupt subsequent AI run session continuity.
+    let _ = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{thread_id}/messages"),
+        Some(json!({"prompt": "after shell"})),
+    )
+    .await;
+    let mut after = Value::Null;
+    for _ in 0..40 {
+        after = json_req(&app, Method::GET, &format!("/api/threads/{thread_id}"), None).await;
+        if after["thread"]["status"] == "completed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(after["thread"]["status"], "completed");
+}

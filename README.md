@@ -18,6 +18,9 @@ A zero-telemetry, privacy-hardened Rust rewrite of [T3 Code](https://github.com/
   - Supports **Claude Code**, **Codex**, **Antigravity (Gemini)**, **OpenCode** (free cloud & local LLMs), plus a deterministic **Mock** provider for testing.
   - Built-in JSON-RPC 2.0 MCP server (`POST /mcp` + `t3d mcp` stdio bridge) for cross-provider `delegate_task` (`shared` / `git worktree` isolation), `thread_fork` (with automatic redacted handoff summaries), and `/swarm` shared message board coordination.
   - Per-run internal MCP tokens bound to caller project scope and enforcing child permission ceilings (`child <= parent`).
+- **Composer Command Palette (`/`) & Direct Shell Execution (`!`)**
+  - Type `/` in the composer for an interactive, typo-tolerant slash command palette with keyboard navigation (`↑`/`↓`, `Tab`, `Enter`, `Esc`) and argument completion (`/compact`, `/new`, `/model`, `/effort`, `/plan`, `/mode`, `/diff`, `/context`, `/swarm`, `/fork`, `/delegate`, `/title`, `/pin`, `/archive`, `/search`, `/usage`, `/limits`, `/theme`, `/sh`, `/help`, plus provider-native commands).
+  - Type `!<command>` (or `/sh <command>`) to run shell commands directly in the active project or git worktree with zero-telemetry env isolation, bounded output, process-group timeout cleanup, and persistent timeline recording.
 - **Usage & Quota Limits Dashboard (`⌘U`)**
   - Interactive daily/hourly cost & token charts, cache hit rates, model rankings, DB compression stats, and pooled provider quota limits (Claude, Codex with reset-credit redemption, and Antigravity).
 - **Ultra-Low Memory & Storage Footprint**

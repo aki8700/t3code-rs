@@ -1237,6 +1237,55 @@ body.resizing-rail { cursor: col-resize !important; user-select: none; -webkit-u
 .swarm-hint:empty { display: none; }
 .swarm-pill { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; padding: 3px 10px; border-radius: 99px; border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent); background: color-mix(in srgb, var(--accent) 13%, transparent); color: color-mix(in srgb, var(--accent) 55%, var(--text)); font-size: 11.5px; font-weight: 600; }
 .swarm-pill .ic { width: 13px; height: 13px; flex: none; }
+.shell-pill { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; padding: 3px 10px; border-radius: 99px; border: 1px solid color-mix(in srgb, var(--success) 48%, transparent); background: color-mix(in srgb, var(--success) 13%, transparent); color: var(--success); font: 600 11.5px/1.3 var(--mono); }
+.shell-pill .ic { width: 13px; height: 13px; flex: none; }
+.composer.shell-mode { border-color: color-mix(in srgb, var(--success) 55%, var(--border)); }
+.composer.shell-mode:focus-within { border-color: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 18%, transparent), var(--shadow); }
+.composer.shell-mode #prompt { font-family: var(--mono); font-size: 13.2px; }
+.composer.shell-mode .round-btn.send { background: var(--success); color: #041308; }
+.composer.shell-mode .round-btn.send:hover:not(:disabled) { filter: brightness(1.08); }
+
+/* ───────────────────────── slash & shell command palette ───────────────────────── */
+.cmd-palette { position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); z-index: 40; display: flex; flex-direction: column; max-height: min(340px, 46vh); overflow: hidden; border-radius: 13px; border: 1px solid var(--input); background: color-mix(in srgb, var(--surface-overlay) 92%, transparent); -webkit-backdrop-filter: blur(24px) saturate(1.4); backdrop-filter: blur(24px) saturate(1.4); box-shadow: 0 4px 12px rgb(0 0 0 / .24), 0 18px 46px rgb(0 0 0 / .36); animation: pop .1s ease-out; }
+.cmd-head { flex: none; padding: 7px 12px 6px; border-bottom: 1px solid var(--border); font-size: 11px; color: var(--text-muted); }
+.cmd-list { flex: 1; min-height: 0; overflow-y: auto; padding: 4px; }
+.cmd-opt { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 34px; padding: 5px 9px; border-radius: 8px; text-align: left; }
+.cmd-opt:hover, .cmd-opt.sel { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.cmd-opt .cmd-ic { color: var(--text-muted); }
+.cmd-opt.sel .cmd-ic { color: var(--accent); }
+.cmd-opt .cmd-ic .ic { width: 14px; height: 14px; }
+.cmd-name { display: inline-flex; align-items: baseline; gap: 6px; flex: none; font-family: var(--mono); font-size: 12.5px; }
+.cmd-name b { font-weight: 650; color: var(--text); }
+.cmd-name em { font-style: normal; font-size: 11px; color: var(--text-muted); }
+.cmd-desc { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; color: var(--text-muted); }
+.cmd-tag { flex: none; padding: 2px 6px; border-radius: 5px; font-size: 10px; font-weight: 600; color: var(--text-muted); background: color-mix(in srgb, var(--text) 7%, transparent); }
+.cmd-tag.warn { color: var(--warning); background: var(--warning-surface); }
+
+.step.user-shell > summary { background: color-mix(in srgb, var(--success) 6%, transparent); }
+.step.user-shell > summary .s-ic { color: var(--success); }
+.step.user-shell.bad > summary .s-ic { color: var(--error); }
+
+.shell-res { display: flex; flex-direction: column; gap: 10px; }
+.shell-res-meta { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.shell-res-cmd { font: 600 13px/1.4 var(--mono); padding: 4px 9px; border-radius: 7px; background: var(--code-bg); border: 1px solid var(--border); overflow-wrap: anywhere; }
+.shell-res-badges { display: flex; align-items: center; gap: 6px; }
+.shell-res-cwd { font-size: 11.5px; overflow-wrap: anywhere; }
+
+.help-banner { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; margin-bottom: 14px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--success) 40%, var(--border)); background: color-mix(in srgb, var(--success) 8%, var(--canvas)); }
+.help-banner .iw { margin-top: 2px; color: var(--success); }
+.help-banner b { font-size: 13px; }
+.help-banner p { margin: 3px 0 0; font-size: 12px; }
+.help-sec + .help-sec { margin-top: 12px; }
+.help-cmds { display: flex; flex-direction: column; gap: 2px; }
+.help-row { display: flex; align-items: baseline; gap: 12px; width: 100%; padding: 6px 9px; border-radius: 8px; text-align: left; }
+.help-row:hover { background: color-mix(in srgb, var(--text) 6%, transparent); }
+.help-cmd { flex: 0 0 180px; font: 600 12px/1.4 var(--mono); color: var(--text); }
+.help-desc { flex: 1; min-width: 0; font-size: 12px; color: var(--text-muted); }
+@media (max-width: 640px) {
+  .cmd-desc { display: none; }
+  .help-row { flex-direction: column; gap: 2px; }
+  .help-cmd { flex: none; }
+}
 .limit-alert { display: flex; padding: 8px 4px 0; }
 .limit-alert:empty { display: none; }
 .limit-pill { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; min-height: 24px; padding: 3px 10px; border-radius: 12px; border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent); background: var(--warning-surface); color: var(--warning); font-size: 11.5px; font-weight: 600; text-align: left; font-variant-numeric: tabular-nums; }

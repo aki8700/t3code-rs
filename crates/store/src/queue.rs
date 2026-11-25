@@ -98,6 +98,7 @@ impl SqliteStore {
             "SELECT id, thread_id, ordinal, provider, model, effort, status, prompt, provider_session_id,
                 input_tokens, output_tokens, duration_ms, error_message, started_at, completed_at
              FROM runs WHERE thread_id = ?1 AND ordinal > 0
+                AND model != 'shell'
                 AND ordinal < (SELECT ordinal FROM runs WHERE id = ?2)
                 AND (status = ?3 OR provider_session_id IS NOT NULL)
              ORDER BY ordinal DESC LIMIT 1",

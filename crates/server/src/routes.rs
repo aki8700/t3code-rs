@@ -29,9 +29,11 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/providers", get(providers))
         .route("/api/projects", get(projects).post(create_project))
         .route("/api/projects/{id}", axum::routing::delete(delete_project))
+        .route("/api/projects/{id}/exec", post(project_exec))
         .route("/api/threads", get(threads).post(create_thread))
         .route("/api/threads/{id}", get(thread_detail).patch(patch_thread))
         .route("/api/threads/{id}/messages", post(send_message))
+        .route("/api/threads/{id}/exec", post(thread_exec))
         .route("/api/threads/{id}/interrupt", post(interrupt))
         .route("/api/threads/{id}/fork", post(fork_thread))
         .route("/api/threads/{id}/respond", post(respond))
@@ -428,6 +430,22 @@ async fn send_message(
 ) -> ApiResult<Json<Value>> {
     let run_id = state.coordinator.send(id, message).await?;
     Ok(Json(json!({"run_id": run_id})))
+}
+
+async fn thread_exec(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<crate::shell::ShellExecRequest>,
+) -> ApiResult<Json<crate::shell::ShellExecOutput>> {
+    Ok(Json(crate::shell::exec_in_thread(&state, id, req).await?))
+}
+
+async fn project_exec(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<crate::shell::ShellExecRequest>,
+) -> ApiResult<Json<crate::shell::ShellExecOutput>> {
+    Ok(Json(crate::shell::exec_in_project(&state, id, req).await?))
 }
 
 async fn interrupt(

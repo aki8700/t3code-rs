@@ -83,9 +83,10 @@
       <div id="approval" class="approval-stack"></div>
 
       <form id="composer" class="composer" autocomplete="off">
+        <div id="cmd-palette" class="cmd-palette" role="listbox" aria-label="コマンド候補" hidden></div>
         <div id="swarm-hint" class="swarm-hint" role="status"></div>
         <div id="att-chips" class="att-chips" hidden></div>
-        <textarea id="prompt" rows="1" aria-label="メッセージ"></textarea>
+        <textarea id="prompt" rows="1" aria-label="メッセージ" aria-autocomplete="list" aria-controls="cmd-palette" aria-expanded="false"></textarea>
         <div class="cbar">
           <button type="button" class="ibtn round" id="btn-attach" data-icon="plus" title="ファイルを添付（画像は貼り付け・ドロップも可）" aria-label="添付"></button>
           <input type="file" id="file-input" multiple hidden>
