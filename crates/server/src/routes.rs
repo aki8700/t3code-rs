@@ -35,6 +35,18 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/threads/{id}/messages", post(send_message))
         .route("/api/threads/{id}/exec", post(thread_exec))
         .route("/api/threads/{id}/interrupt", post(interrupt))
+        .route("/api/threads/{id}/queue", get(thread_queue))
+        .route(
+            "/api/threads/{id}/queue/{run_id}",
+            axum::routing::delete(cancel_queued_run),
+        )
+        .route(
+            "/api/threads/{id}/runs/{run_id}/rollback",
+            post(rollback_run),
+        )
+        .route("/api/threads/{id}/git/stage", post(git_stage))
+        .route("/api/threads/{id}/git/discard", post(git_discard))
+        .route("/api/threads/{id}/git/commit", post(git_commit))
         .route("/api/threads/{id}/fork", post(fork_thread))
         .route("/api/threads/{id}/respond", post(respond))
         .route("/api/threads/{id}/diff", get(diff))
@@ -225,19 +237,29 @@ async fn thread_detail(
 ) -> ApiResult<Json<Value>> {
     let store = &state.store;
     let thread = store.get_thread(id).await?;
-    let (runs, (items, has_more, total_items), children, handoffs, mut attachments, breakdown) =
-        tokio::try_join!(
-            store.list_runs(id),
-            store.list_turn_items_page(
-                id,
-                page.limit.unwrap_or(200).clamp(1, 1000),
-                page.before_ordinal
-            ),
-            store.list_child_threads(id),
-            store.list_handoffs(id),
-            store.list_attachments(id),
-            state.coordinator.items_breakdown(id),
-        )?;
+    let (
+        runs,
+        (items, has_more, total_items),
+        children,
+        handoffs,
+        mut attachments,
+        breakdown,
+        checkpoints,
+        queue,
+    ) = tokio::try_join!(
+        store.list_runs(id),
+        store.list_turn_items_page(
+            id,
+            page.limit.unwrap_or(200).clamp(1, 1000),
+            page.before_ordinal
+        ),
+        store.list_child_threads(id),
+        store.list_handoffs(id),
+        store.list_attachments(id),
+        state.coordinator.items_breakdown(id),
+        store.list_run_checkpoints(id),
+        store.list_queued_runs(id),
+    )?;
     let mut known: std::collections::HashSet<_> =
         attachments.iter().map(|attachment| attachment.id).collect();
     // Uploads made before a thread exists are referenced by its message items.
@@ -259,11 +281,25 @@ async fn thread_detail(
         }
     }
     let context = build_thread_context(&state, &thread, &runs, &breakdown).await;
+    let live = state.coordinator.live_stream(id).await;
+    let queue_items: Vec<Value> = queue
+        .into_iter()
+        .map(|run| {
+            json!({
+                "id": run.id,
+                "prompt": run.prompt,
+                "started_at": run.started_at,
+            })
+        })
+        .collect();
     Ok(Json(json!({
         "thread": thread, "runs": runs, "items": items, "children": children,
         "has_more": has_more, "total_items": total_items,
         "handoffs": handoffs, "attachments": attachments,
         "context": context,
+        "checkpoints": checkpoints,
+        "queue": queue_items,
+        "live": live,
     })))
 }
 
@@ -489,6 +525,69 @@ async fn interrupt(
 ) -> ApiResult<StatusCode> {
     state.coordinator.interrupt(id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn thread_queue(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Vec<Run>>> {
+    let _ = state.store.get_thread(id).await?;
+    Ok(Json(state.store.list_queued_runs(id).await?))
+}
+
+async fn cancel_queued_run(
+    State(state): State<ServerState>,
+    Path((id, run_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    if !state.coordinator.cancel_queued_run(id, run_id).await? {
+        return Err(CoreError::NotFound("queued run".into()).into());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn rollback_run(
+    State(state): State<ServerState>,
+    Path((id, run_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<Json<Value>> {
+    state.coordinator.rollback_run(id, run_id).await?;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct GitPathInput {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct GitCommitInput {
+    message: String,
+}
+
+async fn git_stage(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<GitPathInput>,
+) -> ApiResult<Json<Value>> {
+    state.coordinator.git_stage(id, &input.path).await?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn git_discard(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<GitPathInput>,
+) -> ApiResult<Json<Value>> {
+    state.coordinator.git_discard(id, &input.path).await?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn git_commit(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<GitCommitInput>,
+) -> ApiResult<Json<Value>> {
+    let sha = state.coordinator.git_commit(id, &input.message).await?;
+    Ok(Json(json!({"sha": sha})))
 }
 
 async fn fork_thread(

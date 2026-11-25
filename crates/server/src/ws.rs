@@ -83,6 +83,9 @@ async fn run(mut socket: WebSocket, coordinator: RunCoordinator, identity: AuthI
                         skipped,
                     ))) => {
                         tracing::debug!(skipped, "WebSocket client lagged behind broadcast channel");
+                        if !send(&mut socket, &WsServerMessage::Resync { thread_id: None }).await {
+                            return;
+                        }
                     }
                     None => {
                         let _ = socket.close().await;

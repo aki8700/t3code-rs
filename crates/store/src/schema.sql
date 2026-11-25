@@ -113,6 +113,14 @@ CREATE TABLE IF NOT EXISTS queued_run_inputs (
 );
 CREATE INDEX IF NOT EXISTS runs_status_thread_ordinal ON runs(status, thread_id, ordinal);
 
+CREATE TABLE IF NOT EXISTS run_checkpoints (
+    run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    pre_tree TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS run_checkpoints_thread ON run_checkpoints(thread_id);
+
 CREATE TABLE IF NOT EXISTS swarm_boards (
     id TEXT PRIMARY KEY NOT NULL,
     coordinator_thread_id TEXT UNIQUE NOT NULL REFERENCES threads(id) ON DELETE CASCADE,

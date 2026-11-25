@@ -56,6 +56,10 @@ impl ProviderDriver for MockDriver {
         ProviderId::Mock
     }
 
+    fn supports_mcp(&self) -> bool {
+        true
+    }
+
     async fn health_check(&self) -> ProviderHealth {
         let provider = self.provider_id();
         ProviderHealth {

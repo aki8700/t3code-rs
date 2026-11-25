@@ -742,6 +742,17 @@ async function loadDetail(id, { reset = false } = {}) {
   }
   if (id !== S.threadId) return;
   S.detail = keepOlderPages(d, S.detail);
+  // Restore an in-flight turn's streamed text after a reload. A longer
+  // client-side live text is never overwritten by a shorter server one.
+  if (d.live?.run_id && isBusy(d.thread.status)) {
+    const cur = S.live.get(id);
+    const next = { runId: d.live.run_id, assistant: d.live.assistant || '', reasoning: d.live.reasoning || '' };
+    if (cur?.runId === next.runId) {
+      if ((cur.assistant || '').length > next.assistant.length) next.assistant = cur.assistant;
+      if ((cur.reasoning || '').length > next.reasoning.length) next.reasoning = cur.reasoning;
+    }
+    S.live.set(id, next);
+  }
   pruneOptimistic(d);
   S.projectId = d.thread.project_id; ls.set('t3.project', S.projectId);
   const i = S.threads.findIndex((t) => t.id === id);
@@ -800,6 +811,7 @@ function renderAll() {
   renderHero();
   renderApprovals();
   renderComposer();
+  renderQueueStrip();
   renderStatPill();
   renderSwarm();
   renderContextMeters();
@@ -1341,6 +1353,7 @@ function runFooter(run) {
   if (!run || !TERMINAL_RUN.has(run.status)) return null;
   const ok = run.status === 'completed';
   const runCost = Number(S.detail?.context?.run_costs?.[run.id]) || 0;
+  const canRollback = S.detail?.checkpoints?.includes(run.id) && !isBusy(curThread()?.status);
   return h('div', { class: `run-foot ${run.status}`, dataset: { run: run.id } },
     h('span', { class: 'rf-line' },
       provDot(run.provider),
@@ -1348,7 +1361,21 @@ function runFooter(run) {
       run.duration_ms != null ? h('span', { text: fmtDur(run.duration_ms) }) : null,
       run.input_tokens || run.output_tokens ? h('span', { title: '入力 / 出力トークン', text: `↑${fmtTok(run.input_tokens)} ↓${fmtTok(run.output_tokens)}` }) : null,
       runCost > 0 ? h('span', { title: 'このターンの推定コスト', text: fmtUsd(runCost) }) : null,
-      ok ? null : h('span', { class: 'rf-status', text: STATUS_LABEL[run.status] || run.status })),
+      ok ? null : h('span', { class: 'rf-status', text: STATUS_LABEL[run.status] || run.status }),
+      canRollback ? h('button', {
+        class: 'btn xs rf-rollback', type: 'button', text: '元に戻す', title: 'このターン開始前の作業ツリー状態に戻す',
+        onclick: async (e) => {
+          const b = e.currentTarget;
+          // two-step confirm (window.confirm is unavailable in some webviews)
+          if (!b.dataset.armed) { b.dataset.armed = '1'; b.textContent = '本当に戻す'; b.classList.add('warn'); setTimeout(() => { if (!b.isConnected) return; delete b.dataset.armed; b.textContent = '元に戻す'; b.classList.remove('warn'); }, 3000); return; }
+          b.disabled = true;
+          try {
+            await api(`/api/threads/${S.threadId}/runs/${run.id}/rollback`, { method: 'POST' });
+            toast('ターン開始前の状態に戻しました', 'ok');
+            loadDetailSoon(); refreshDiffSoon();
+          } catch (err) { toast(`元に戻せません: ${err.message}`, 'err'); b.disabled = false; }
+        },
+      }) : null),
     run.status === 'failed' && run.error_message ? h('div', { class: 'rf-error', text: run.error_message }) : null);
 }
 
@@ -1552,12 +1579,39 @@ function renderComposer() {
   syncComposerHints();
   syncLimitAlert();
   renderContextMeters();
+  renderQueueStrip();
 }
 const syncSendEnabled = () => {
   $('#btn-send').disabled = sending || (!ta().value.trim() && !S.atts.length);
   syncComposerHints();
   updateCommandPalette();
 };
+
+/** Queued prompts for the current thread, with per-item cancel. Lives next to #swarm-hint. */
+function renderQueueStrip() {
+  const hint = $('#swarm-hint');
+  if (!hint) return;
+  let strip = $('#queue-strip');
+  if (!strip) { strip = h('div', { id: 'queue-strip', class: 'queue-strip', role: 'status' }); hint.after(strip); }
+  const queue = S.detail?.queue || [];
+  if (!queue.length) { strip.replaceChildren(); return; }
+  strip.replaceChildren(
+    h('span', { class: 'q-label', text: `予約中 (${queue.length})` }),
+    ...queue.map((q) => h('span', { class: 'q-item' },
+      h('span', { class: 'q-text', text: oneLine(q.prompt, 70) }),
+      h('button', {
+        class: 'q-cancel', type: 'button', text: '×', title: 'この予約をキャンセル', 'aria-label': '予約をキャンセル',
+        onclick: async (e) => {
+          const b = e.currentTarget; b.disabled = true;
+          try {
+            await api(`/api/threads/${S.threadId}/queue/${q.id}`, { method: 'DELETE' });
+            loadDetailSoon();
+            toast('予約をキャンセルしました');
+          } catch (err) { toast(`予約をキャンセルできません: ${err.message}`, 'err'); b.disabled = false; }
+        },
+      }))),
+  );
+}
 
 const SWARM_COMMAND = /^\s*\/swarm(\s|$)/i;
 const isShellModeInput = (val) => !!parseShellInput(val) || /^\s*\/(sh|shell|bash|run)(\s|$)/i.test(val || '');
@@ -3808,6 +3862,7 @@ function renderDiffView(d) {
   }
   const top = body.scrollTop;
   body.replaceChildren(...files.map(diffFile));
+  body.append(diffCommitForm(t));
   body.scrollTop = top;
 }
 
@@ -3836,18 +3891,70 @@ async function loadDiff() {
 const refreshDiffSoon = debounce(() => { if (S.rail === 'diff') loadDiff(); else refreshDiffStat(); }, 600);
 
 function diffFile(f) {
+  const t = curThread();
   const L = kindLetter(f.status);
   const slash = f.path.lastIndexOf('/');
   const d = h('details', { class: 'dfile', dataset: { path: f.path } }, // collapsed by default
     h('summary', {}, iconEl('chevron', 's-chev'), h('span', { class: `fk ${L}`, text: L }),
       h('span', { class: 'fp', title: f.path }, h('b', { text: f.path.slice(slash + 1) }), slash > 0 ? h('small', { text: f.path.slice(0, slash) }) : null),
       ibtn('copy', 'パスをコピー', (e) => { e.preventDefault(); e.stopPropagation(); copyText(f.path); }, 'xs dcopy'),
+      h('button', {
+        class: 'btn xs dgit', type: 'button', text: 'Stage', title: 'ステージする',
+        onclick: async (e) => {
+          e.preventDefault(); e.stopPropagation();
+          if (!t) return;
+          const b = e.currentTarget; b.disabled = true;
+          try {
+            await api(`/api/threads/${t.id}/git/stage`, { method: 'POST', json: { path: f.path } });
+            toast('ステージしました', 'ok');
+            loadDiff();
+          } catch (err) { toast(`ステージに失敗: ${err.message}`, 'err'); b.disabled = false; }
+        },
+      }),
+      h('button', {
+        class: 'btn xs dgit danger-ghost', type: 'button', text: '破棄', title: 'このファイルの変更を破棄する',
+        onclick: async (e) => {
+          e.preventDefault(); e.stopPropagation();
+          if (!t) return;
+          const b = e.currentTarget;
+          // two-step confirm (window.confirm is unavailable in some webviews)
+          if (!b.dataset.armed) { b.dataset.armed = '1'; b.textContent = '本当に破棄'; setTimeout(() => { if (!b.isConnected) return; delete b.dataset.armed; b.textContent = '破棄'; }, 3000); return; }
+          b.disabled = true;
+          try {
+            await api(`/api/threads/${t.id}/git/discard`, { method: 'POST', json: { path: f.path } });
+            toast('変更を破棄しました', 'ok');
+            loadDiff();
+          } catch (err) { toast(`破棄に失敗: ${err.message}`, 'err'); b.disabled = false; }
+        },
+      }),
       h('span', { class: 'sbadge plus', text: `+${f.additions}` }), h('span', { class: 'sbadge minus', text: `−${f.deletions}` })));
   let drawn = false;
   const draw = () => { if (d.open && !drawn) { drawn = true; d.append(patchLines(f.patch, 3000, f.path)); } };
   d.addEventListener('toggle', () => { d.open ? diffOpenFiles.add(f.path) : diffOpenFiles.delete(f.path); draw(); });
   if (diffOpenFiles.has(f.path)) { d.open = true; draw(); }
   return d;
+}
+
+/** One-line commit form shown at the end of the diff body when files changed. */
+function diffCommitForm(t) {
+  const inp = h('input', { class: 'inp sm dp-commit-input', type: 'text', placeholder: 'コミットメッセージ', 'aria-label': 'コミットメッセージ', autocomplete: 'off' });
+  const btn = h('button', { class: 'btn sm primary', type: 'submit', text: 'コミット' });
+  return h('form', {
+    class: 'dp-commit',
+    onsubmit: async (e) => {
+      e.preventDefault();
+      const message = inp.value.trim();
+      if (!message) { inp.focus(); return; }
+      btn.disabled = true;
+      try {
+        const r = await api(`/api/threads/${t.id}/git/commit`, { method: 'POST', json: { message } });
+        inp.value = '';
+        toast(`コミットしました (${(r?.sha || '').slice(0, 7)})`, 'ok');
+        loadDiff();
+      } catch (err) { toast(`コミットに失敗: ${err.message}`, 'err'); }
+      btn.disabled = false;
+    },
+  }, inp, btn);
 }
 
 // ───────────────────────── swarm board ─────────────────────────
@@ -4297,6 +4404,10 @@ function handleWs(m) {
     }
     case 'swarm_updated':
       pushSwarm(m.thread_id, m.board);
+      break;
+    case 'resync':
+      loadThreadsSoon();
+      if (S.threadId) { loadDetailSoon(); loadSwarm(S.threadId); }
       break;
     case 'error':
       toast(`サーバーエラー: ${m.message}`, 'err', 6000);

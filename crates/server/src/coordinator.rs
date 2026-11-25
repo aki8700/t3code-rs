@@ -29,6 +29,7 @@ pub(crate) struct Coordinator {
     pub(crate) events: broadcast::Sender<WsServerMessage>,
     pub(crate) active: Mutex<HashMap<Uuid, ActiveRun>>,
     pub(crate) latest_context: Mutex<HashMap<Uuid, LiveContextUsage>>,
+    pub(crate) live_streams: Mutex<HashMap<Uuid, LiveStreamSnapshot>>,
     shutting_down: AtomicBool,
     injection: McpInjectionSpec,
     tokens: McpTokens,
@@ -48,6 +49,13 @@ pub struct LiveContextUsage {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveStreamSnapshot {
+    pub run_id: Uuid,
+    pub assistant: String,
+    pub reasoning: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -135,12 +143,82 @@ impl RunCoordinator {
             events,
             active: Mutex::new(HashMap::new()),
             latest_context: Mutex::new(HashMap::new()),
+            live_streams: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
         }))
     }
 
     pub async fn live_context(&self, thread_id: Uuid) -> Option<LiveContextUsage> {
         self.0.latest_context.lock().await.get(&thread_id).cloned()
+    }
+
+    pub async fn live_stream(&self, thread_id: Uuid) -> Option<LiveStreamSnapshot> {
+        self.0.live_streams.lock().await.get(&thread_id).cloned()
+    }
+
+    pub async fn rollback_run(&self, thread_id: Uuid, run_id: Uuid) -> CoreResult<()> {
+        let active = self.0.active.lock().await;
+        if active.contains_key(&thread_id) {
+            return Err(CoreError::InvalidArgument(
+                "cannot rollback while thread has an active run".into(),
+            ));
+        }
+        let thread = self.0.store.get_thread(thread_id).await?;
+        if thread.archived {
+            return Err(CoreError::InvalidArgument("thread is archived".into()));
+        }
+        let pre_tree = self
+            .0
+            .store
+            .get_run_checkpoint(thread_id, run_id)
+            .await?
+            .ok_or_else(|| CoreError::NotFound("run checkpoint".into()))?;
+        let workspace = self.workspace(&thread).await?;
+        GitManager::restore_tree(&workspace, &pre_tree).await
+    }
+
+    pub async fn git_stage(&self, thread_id: Uuid, rel_path: &str) -> CoreResult<()> {
+        let thread = self.0.store.get_thread(thread_id).await?;
+        let workspace = self.workspace(&thread).await?;
+        GitManager::stage_file(&workspace, rel_path).await
+    }
+
+    pub async fn git_discard(&self, thread_id: Uuid, rel_path: &str) -> CoreResult<()> {
+        let active = self.0.active.lock().await;
+        if active.contains_key(&thread_id) {
+            return Err(CoreError::InvalidArgument(
+                "cannot discard files while thread has an active run".into(),
+            ));
+        }
+        let thread = self.0.store.get_thread(thread_id).await?;
+        let workspace = self.workspace(&thread).await?;
+        GitManager::discard_file(&workspace, rel_path).await
+    }
+
+    pub async fn git_commit(&self, thread_id: Uuid, message: &str) -> CoreResult<String> {
+        let active = self.0.active.lock().await;
+        if active.contains_key(&thread_id) {
+            return Err(CoreError::InvalidArgument(
+                "cannot commit while thread has an active run".into(),
+            ));
+        }
+        let thread = self.0.store.get_thread(thread_id).await?;
+        let workspace = self.workspace(&thread).await?;
+        GitManager::commit(&workspace, message).await
+    }
+
+    pub async fn cancel_queued_run(&self, thread_id: Uuid, run_id: Uuid) -> CoreResult<bool> {
+        let _active = self.0.active.lock().await;
+        let cancelled = self.0.store.cancel_queued_run(thread_id, run_id).await?;
+        if cancelled {
+            self.emit(WsServerMessage::RunStatusChanged {
+                thread_id,
+                run_id,
+                status: RunStatus::Cancelled,
+                error: Some("Cancelled".into()),
+            });
+        }
+        Ok(cancelled)
     }
 
     pub async fn stored_context(&self, thread_id: Uuid) -> Option<LiveContextUsage> {
@@ -555,15 +633,36 @@ impl RunCoordinator {
             .await?
             .map(|board| SwarmTurn::prepare(&board, thread.id, selection.provider, &mut prompt))
             .transpose()?;
-        let mcp_token = self.0.tokens.register(ActiveMcpToken {
-            thread_id: thread.id,
-            run_id,
-            runtime_mode: thread.runtime_mode,
-            interaction_mode: thread.interaction_mode,
-        })?;
-        let mut injection = self.0.injection.clone();
-        injection.thread_id = thread.id;
-        injection.internal_token = mcp_token.token.clone();
+        let (mcp_token, mcp_injection) = if driver.supports_mcp() {
+            let token = self.0.tokens.register(ActiveMcpToken {
+                thread_id: thread.id,
+                run_id,
+                runtime_mode: thread.runtime_mode,
+                interaction_mode: thread.interaction_mode,
+            })?;
+            let mut injection = self.0.injection.clone();
+            injection.thread_id = thread.id;
+            injection.internal_token = token.token.clone();
+            (Some(token), Some(injection))
+        } else {
+            (None, None)
+        };
+        if thread.interaction_mode != InteractionMode::Plan {
+            match GitManager::snapshot_tree(&workspace_dir).await {
+                Ok(Some(pre_tree)) => {
+                    if let Err(error) = store
+                        .save_run_checkpoint(run_id, thread.id, pre_tree)
+                        .await
+                    {
+                        tracing::debug!(%error, %run_id, "Could not save pre-run git checkpoint");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(%error, %run_id, "Could not snapshot workspace before run");
+                }
+            }
+        }
         let request = TurnRequest {
             thread_id: thread.id,
             run_id,
@@ -574,8 +673,9 @@ impl RunCoordinator {
             interaction_mode: thread.interaction_mode,
             resume_session_id: resume_session_id.clone(),
             attachments,
-            mcp_injection: Some(injection),
+            mcp_injection,
         };
+        let run_started_at = Utc::now();
         let run = store
             .start_queued_run(run_id, selection.clone(), resume_session_id)
             .await?;
@@ -622,6 +722,7 @@ impl RunCoordinator {
             notify_parent: queued.input.notify_parent,
             mcp_token,
             swarm,
+            started_at: run_started_at,
         };
         Ok((ticket, turn))
     }
@@ -718,6 +819,7 @@ impl RunCoordinator {
             notify_parent,
             mcp_token,
             swarm,
+            started_at: run_started_at,
         } = turn;
         let started = Instant::now();
         let thread_id = thread.id;
@@ -870,6 +972,22 @@ impl RunCoordinator {
         {
             tracing::error!(%error, %run_id, "Could not persist swarm member state");
         }
+        if (swarm.is_some() || thread.relationship.as_deref() == Some("swarm-worker"))
+            && !(thread.model_selection.provider == ProviderId::Mock
+                && status == RunStatus::Completed)
+            && let Err(error) = self
+                .notify_worker_ended_silently(
+                    &mut active,
+                    thread_id,
+                    run_started_at,
+                    status,
+                    error.as_deref(),
+                )
+                .await
+        {
+            tracing::error!(%error, %run_id, "Could not notify coordinator of silent worker exit");
+        }
+        self.0.live_streams.lock().await.remove(&thread_id);
         self.emit(WsServerMessage::RunStatusChanged {
             thread_id,
             run_id,
@@ -939,6 +1057,8 @@ impl RunCoordinator {
             }
             StreamEvent::AssistantDelta { text } => {
                 push_capped(&mut out.assistant, &text, out.reasoning.len());
+                self.update_live_stream(thread_id, run_id, &out.assistant, &out.reasoning)
+                    .await;
                 self.emit(WsServerMessage::Delta {
                     thread_id,
                     run_id,
@@ -948,6 +1068,8 @@ impl RunCoordinator {
             }
             StreamEvent::ReasoningDelta { text } => {
                 push_capped(&mut out.reasoning, &text, out.assistant.len());
+                self.update_live_stream(thread_id, run_id, &out.assistant, &out.reasoning)
+                    .await;
                 self.emit(WsServerMessage::Delta {
                     thread_id,
                     run_id,
@@ -982,6 +1104,8 @@ impl RunCoordinator {
                     )
                     .await?;
                 }
+                self.update_live_stream(thread_id, run_id, &out.assistant, &out.reasoning)
+                    .await;
                 let searchable = (kind == TurnItemKind::AssistantMessage
                     || kind == TurnItemKind::Reasoning)
                     .then(|| text_value(&payload).map(str::to_owned))
@@ -1160,6 +1284,31 @@ impl RunCoordinator {
         }
         Ok(())
     }
+    async fn update_live_stream(
+        &self,
+        thread_id: Uuid,
+        run_id: Uuid,
+        assistant: &str,
+        reasoning: &str,
+    ) {
+        const MAX_PREVIEW: usize = 200_000;
+        let tail = |s: &str| {
+            if s.len() <= MAX_PREVIEW {
+                s.to_owned()
+            } else {
+                let start = s.ceil_char_boundary(s.len() - MAX_PREVIEW);
+                s[start..].to_owned()
+            }
+        };
+        self.0.live_streams.lock().await.insert(
+            thread_id,
+            LiveStreamSnapshot {
+                run_id,
+                assistant: tail(assistant),
+                reasoning: tail(reasoning),
+            },
+        );
+    }
 }
 
 struct RunningTurn {
@@ -1169,8 +1318,9 @@ struct RunningTurn {
     done: watch::Sender<bool>,
     driver: Arc<dyn ProviderDriver>,
     notify_parent: bool,
-    mcp_token: RunMcpToken,
+    mcp_token: Option<RunMcpToken>,
     swarm: Option<SwarmTurn>,
+    started_at: chrono::DateTime<Utc>,
 }
 
 fn push_capped(buffer: &mut String, text: &str, other_len: usize) {

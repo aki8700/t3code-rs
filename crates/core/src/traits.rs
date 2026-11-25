@@ -49,6 +49,11 @@ pub struct TurnRequest {
 pub trait ProviderDriver: Send + Sync {
     fn provider_id(&self) -> ProviderId;
 
+    /// Returns true if this driver injects `TurnRequest::mcp_injection` into the provider CLI.
+    fn supports_mcp(&self) -> bool {
+        false
+    }
+
     async fn health_check(&self) -> ProviderHealth;
 
     /// Executes a turn, streaming `StreamEvent`s into `tx` until completion or cancellation.

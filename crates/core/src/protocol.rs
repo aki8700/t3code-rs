@@ -103,6 +103,9 @@ pub enum WsServerMessage {
         thread_id: Uuid,
         board: SwarmBoardSnapshot,
     },
+    Resync {
+        thread_id: Option<Uuid>,
+    },
     Error {
         message: String,
     },

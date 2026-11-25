@@ -40,6 +40,185 @@ impl GitManager {
             .collect())
     }
 
+    /// Write the current worktree state (including non-ignored untracked files) to a tree.
+    /// The temporary index keeps the repository's real index untouched.
+    pub async fn snapshot_tree(dir: &Path) -> CoreResult<Option<String>> {
+        if !Self::is_git_repo(dir).await {
+            return Ok(None);
+        }
+        let root_output = git_output(dir, &["rev-parse", "--show-toplevel"]).await?;
+        let root = git_path(root_output.strip_suffix(b"\n").unwrap_or(&root_output));
+        let filters = disabled_filters(&root).await?;
+        let index = std::env::temp_dir().join(format!("t3-git-index-{}", Uuid::new_v4()));
+        let result = async {
+            let head = git(&root)
+                .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+                .output()
+                .await
+                .map_err(git_error)?;
+            let mut command = git(&root);
+            command.env("GIT_INDEX_FILE", &index);
+            if head.status.success() {
+                command.args(["read-tree", "HEAD"]);
+            } else if head.status.code() == Some(1) {
+                command.args(["read-tree", "--empty"]);
+            } else {
+                return Err(command_error(&head));
+            }
+            checked_output(command, false).await?;
+
+            let mut add = git_with_filters(&root, &filters);
+            add.env("GIT_INDEX_FILE", &index)
+                .args(["--literal-pathspecs", "add", "-A", "--", "."]);
+            checked_output(add, false).await?;
+
+            let mut write = git(&root);
+            write.env("GIT_INDEX_FILE", &index).arg("write-tree");
+            let tree = checked_output(write, false).await?;
+            Ok(String::from_utf8_lossy(&tree).trim().to_owned())
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&index).await;
+        let _ = tokio::fs::remove_file(index.with_extension("lock")).await;
+        result.map(Some)
+    }
+
+    pub async fn restore_tree(dir: &Path, tree_sha: &str) -> CoreResult<()> {
+        let root_output = git_output(dir, &["rev-parse", "--show-toplevel"]).await?;
+        let root = git_path(root_output.strip_suffix(b"\n").unwrap_or(&root_output));
+        let verified = git_output(
+            &root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{tree_sha}^{{tree}}"),
+            ],
+        )
+        .await?;
+        let tree = String::from_utf8_lossy(&verified).trim().to_owned();
+        let filters = disabled_filters(&root).await?;
+        let index = std::env::temp_dir().join(format!("t3-git-index-{}", Uuid::new_v4()));
+        let result = async {
+            // Give clean an index containing the snapshot, so untracked files that belong
+            // to the snapshot survive while files created afterwards are removed.
+            let mut read = git(&root);
+            read.env("GIT_INDEX_FILE", &index)
+                .args(["read-tree", &tree]);
+            checked_output(read, false).await?;
+            let mut clean = git_with_filters(&root, &filters);
+            clean.env("GIT_INDEX_FILE", &index).args(["clean", "-fd"]);
+            checked_output(clean, false).await?;
+            let mut restore = git_with_filters(&root, &filters);
+            restore.args(["read-tree", "--reset", "-u", &tree]);
+            checked_output(restore, false).await?;
+            Ok(())
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&index).await;
+        let _ = tokio::fs::remove_file(index.with_extension("lock")).await;
+        result
+    }
+
+    pub async fn stage_file(dir: &Path, rel_path: &str) -> CoreResult<()> {
+        validate_relative_path(rel_path)?;
+        let mut command = git(dir);
+        command.args(["--literal-pathspecs", "add", "-A", "--", rel_path]);
+        checked_output(command, false).await?;
+        Ok(())
+    }
+
+    pub async fn discard_file(dir: &Path, rel_path: &str) -> CoreResult<()> {
+        validate_relative_path(rel_path)?;
+        let root_output = git_output(dir, &["rev-parse", "--show-toplevel"]).await?;
+        let root = git_path(root_output.strip_suffix(b"\n").unwrap_or(&root_output));
+        let in_head = git(&root)
+            .args([
+                "--literal-pathspecs",
+                "ls-tree",
+                "-r",
+                "-z",
+                "--name-only",
+                "HEAD",
+                "--",
+                rel_path,
+            ])
+            .output()
+            .await
+            .map_err(git_error)?;
+        let tracked = in_head.status.success()
+            && nul_fields(&in_head.stdout).any(|path| path == rel_path.as_bytes());
+        if tracked {
+            let mut command = git(&root);
+            command.args(["--literal-pathspecs", "checkout", "HEAD", "--", rel_path]);
+            checked_output(command, false).await?;
+        } else {
+            let path = root.join(rel_path);
+            ensure_inside_repo(&root, &path)?;
+            match tokio::fs::symlink_metadata(&path).await {
+                Ok(metadata) if metadata.is_dir() => {
+                    tokio::fs::remove_dir_all(path).await.map_err(git_error)?;
+                }
+                Ok(_) => tokio::fs::remove_file(path).await.map_err(git_error)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(git_error(error)),
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn commit(dir: &Path, message: &str) -> CoreResult<String> {
+        if message.trim().is_empty() {
+            return Err(git_error("commit message must not be empty"));
+        }
+        let staged = git(dir)
+            .args(["diff", "--cached", "--quiet", "--exit-code"])
+            .output()
+            .await
+            .map_err(git_error)?;
+        if staged.status.success() {
+            let mut add = git(dir);
+            add.args(["--literal-pathspecs", "add", "-A", "--", "."]);
+            checked_output(add, false).await?;
+        } else if staged.status.code() != Some(1) {
+            return Err(command_error(&staged));
+        }
+        let mut command = git(dir);
+        command.args(["commit", "-m", message]);
+        checked_output(command, false).await?;
+        let sha = git_output(dir, &["rev-parse", "HEAD"]).await?;
+        Ok(String::from_utf8_lossy(&sha).trim().to_owned())
+    }
+
+    pub async fn merge_branch(repo_root: &Path, branch: &str) -> CoreResult<String> {
+        validate_branch(repo_root, branch).await?;
+        let mut command = git(repo_root);
+        command.args(["merge", "--no-edit", "--", branch]);
+        if let Err(error) = checked_output(command, false).await {
+            let mut abort = git(repo_root);
+            abort.args(["merge", "--abort"]);
+            let _ = checked_output(abort, false).await;
+            return Err(error);
+        }
+        let sha = git_output(repo_root, &["rev-parse", "HEAD"]).await?;
+        Ok(String::from_utf8_lossy(&sha).trim().to_owned())
+    }
+
+    pub async fn delete_branch(repo_root: &Path, branch: &str) -> CoreResult<()> {
+        validate_branch(repo_root, branch).await?;
+        let mut command = git(repo_root);
+        command.args(["branch", "-D", "--", branch]);
+        checked_output(command, false).await?;
+        Ok(())
+    }
+
+    pub async fn prune_worktrees(&self, repo_root: &Path) -> CoreResult<()> {
+        let mut command = git(repo_root);
+        command.args(["worktree", "prune"]);
+        checked_output(command, false).await?;
+        Ok(())
+    }
+
     pub async fn create_worktree(
         &self,
         repo_root: &Path,
@@ -388,5 +567,171 @@ fn git_error(error: impl std::fmt::Display) -> CoreError {
     CoreError::Git(error.to_string())
 }
 
+fn validate_relative_path(path: &str) -> CoreResult<()> {
+    let path = Path::new(path);
+    let mut has_normal = false;
+    let invalid = path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| match component {
+            std::path::Component::Normal(seg) => {
+                has_normal = true;
+                seg.to_str().is_some_and(|s| s.eq_ignore_ascii_case(".git"))
+            }
+            _ => true,
+        })
+        || !has_normal;
+    if invalid {
+        return Err(git_error(
+            "path must be a non-empty repository-relative path without '.', '..', or '.git'",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_inside_repo(root: &Path, path: &Path) -> CoreResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| git_error("invalid repository-relative path"))?;
+    if let Ok(parent) = parent.canonicalize()
+        && !parent.starts_with(root)
+    {
+        return Err(git_error("path resolves outside repository"));
+    }
+    Ok(())
+}
+
+async fn validate_branch(repo_root: &Path, branch: &str) -> CoreResult<()> {
+    if branch.is_empty() {
+        return Err(git_error("branch name must not be empty"));
+    }
+    let mut command = git(repo_root);
+    command.args(["check-ref-format", "--branch", branch]);
+    checked_output(command, false).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod primitive_tests {
+    use super::*;
+    use std::fs;
+
+    struct Repo(PathBuf);
+
+    impl Repo {
+        async fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("t3-git-primitives-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            git_output(&path, &["init", "--initial-branch=main"])
+                .await
+                .unwrap();
+            git_output(&path, &["config", "user.name", "Git tests"])
+                .await
+                .unwrap();
+            git_output(
+                &path,
+                &["config", "user.email", "git-tests@example.invalid"],
+            )
+            .await
+            .unwrap();
+            fs::write(path.join("tracked.txt"), "base\n").unwrap();
+            git_output(&path, &["add", "--", "tracked.txt"])
+                .await
+                .unwrap();
+            git_output(&path, &["commit", "-m", "initial"])
+                .await
+                .unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_restores_tracked_and_untracked_files_without_changing_index() {
+        let repo = Repo::new().await;
+        fs::write(repo.0.join("tracked.txt"), "snapshot\n").unwrap();
+        fs::write(repo.0.join("untracked.txt"), "keep\n").unwrap();
+        let staged_before = git_output(&repo.0, &["diff", "--cached", "--raw"])
+            .await
+            .unwrap();
+        let tree = GitManager::snapshot_tree(&repo.0).await.unwrap().unwrap();
+        let staged_after = git_output(&repo.0, &["diff", "--cached", "--raw"])
+            .await
+            .unwrap();
+        assert_eq!(staged_before, staged_after);
+
+        fs::write(repo.0.join("tracked.txt"), "later\n").unwrap();
+        fs::write(repo.0.join("new.txt"), "remove\n").unwrap();
+        GitManager::restore_tree(&repo.0, &tree).await.unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.0.join("tracked.txt")).unwrap(),
+            "snapshot\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.0.join("untracked.txt")).unwrap(),
+            "keep\n"
+        );
+        assert!(!repo.0.join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn file_operations_reject_parent_paths_and_commit_staged_changes() {
+        let repo = Repo::new().await;
+        assert!(GitManager::stage_file(&repo.0, "../outside").await.is_err());
+        assert!(GitManager::discard_file(&repo.0, "/outside").await.is_err());
+        fs::write(repo.0.join("tracked.txt"), "updated\n").unwrap();
+        GitManager::stage_file(&repo.0, "tracked.txt")
+            .await
+            .unwrap();
+        let sha = GitManager::commit(&repo.0, "update tracked file")
+            .await
+            .unwrap();
+        assert_eq!(
+            git_output(&repo.0, &["rev-parse", "HEAD"])
+                .await
+                .unwrap()
+                .trim_ascii(),
+            sha.as_bytes()
+        );
+        assert!(GitManager::commit(&repo.0, " ").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn merges_and_deletes_a_validated_branch() {
+        let repo = Repo::new().await;
+        git_output(&repo.0, &["branch", "feature"]).await.unwrap();
+        git_output(&repo.0, &["checkout", "feature"]).await.unwrap();
+        fs::write(repo.0.join("feature.txt"), "feature\n").unwrap();
+        git_output(&repo.0, &["add", "--", "feature.txt"])
+            .await
+            .unwrap();
+        git_output(&repo.0, &["commit", "-m", "feature"])
+            .await
+            .unwrap();
+        git_output(&repo.0, &["checkout", "main"]).await.unwrap();
+
+        let sha = GitManager::merge_branch(&repo.0, "feature").await.unwrap();
+        assert_eq!(
+            git_output(&repo.0, &["rev-parse", "HEAD"])
+                .await
+                .unwrap()
+                .trim_ascii(),
+            sha.as_bytes()
+        );
+        GitManager::delete_branch(&repo.0, "feature").await.unwrap();
+        assert!(
+            !GitManager::list_branches(&repo.0)
+                .await
+                .unwrap()
+                .iter()
+                .any(|branch| branch == "feature")
+        );
+    }
+}

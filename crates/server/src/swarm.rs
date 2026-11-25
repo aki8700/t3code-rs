@@ -2,16 +2,19 @@ use crate::{
     coordinator::{ActiveRun, Message, RunCoordinator},
     threads::CreateThread,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use std::{collections::HashMap, fmt::Write};
+use std::{collections::HashMap, fmt::Write, path::Path};
 use t3_core::*;
 use t3_providers::ProviderRegistry;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 const MAX_WAKE_DEPTH: u8 = 8;
 const MAX_MESSAGE_BYTES: usize = 4096;
+const MAX_ACTIVE_WORKERS: usize = 8;
 const WAKE_BATCH: usize = 16;
+const ENDED_ERROR_CHARS: usize = 200;
 
 pub(crate) fn is_swarm_command(prompt: &str) -> bool {
     prompt.split_whitespace().next() == Some("/swarm")
@@ -182,6 +185,11 @@ impl RunCoordinator {
             return Err(CoreError::InvalidArgument(
                 "swarm name is already in use".into(),
             ));
+        }
+        if live_worker_count(&board) >= MAX_ACTIVE_WORKERS {
+            return Err(CoreError::InvalidArgument(format!(
+                "swarm allows at most {MAX_ACTIVE_WORKERS} active workers"
+            )));
         }
         let depth = wake_depth(active, caller_id);
         if depth >= MAX_WAKE_DEPTH {
@@ -369,6 +377,70 @@ impl RunCoordinator {
         }
     }
 
+    /// Wakes the coordinator when a non-coordinator member's run ends without a board post
+    /// since `run_started_at`, so a coordinator waiting on that worker cannot stall forever.
+    /// The notice is a follow-up queued on the coordinator, so an in-progress coordinator turn
+    /// finishes first and then picks it up.
+    pub(crate) async fn notify_worker_ended_silently(
+        &self,
+        active: &mut HashMap<Uuid, ActiveRun>,
+        thread_id: Uuid,
+        run_started_at: DateTime<Utc>,
+        status: RunStatus,
+        error: Option<&str>,
+    ) -> CoreResult<()> {
+        let Some(board) = self.get_board(thread_id).await? else {
+            return Ok(());
+        };
+        let Some(member) = board
+            .members
+            .iter()
+            .find(|member| member.thread_id == thread_id)
+        else {
+            return Ok(());
+        };
+        if member.role == "coordinator"
+            || member.state == "killed"
+            || self
+                .worker_posted_since(board.board_id, &member.name, run_started_at)
+                .await?
+        {
+            return Ok(());
+        }
+        let text = silent_end_text(&member.name, status, error);
+        self.post_locked(active, board.coordinator_thread_id, Some("system"), text)
+            .await?;
+        Ok(())
+    }
+
+    /// Pages through the whole board, since the snapshot only holds the most recent messages.
+    async fn worker_posted_since(
+        &self,
+        board_id: Uuid,
+        sender: &str,
+        since: DateTime<Utc>,
+    ) -> CoreResult<bool> {
+        const PAGE: usize = 200;
+        let mut cursor = 0;
+        loop {
+            let page = self
+                .0
+                .store
+                .list_swarm_messages(board_id, cursor, PAGE)
+                .await?;
+            if posted_since(&page, sender, since) {
+                return Ok(true);
+            }
+            let Some(last) = page.last() else {
+                return Ok(false);
+            };
+            if page.len() < PAGE {
+                return Ok(false);
+            }
+            cursor = last.seq;
+        }
+    }
+
     pub(crate) async fn read_board(
         &self,
         thread_id: Uuid,
@@ -422,8 +494,63 @@ impl RunCoordinator {
                 ));
             }
         }
-        self.swarm_state(member.thread_id, "killed").await?;
-        self.interrupt_locked(active, member.thread_id).await
+        let thread_id = member.thread_id;
+        self.swarm_state(thread_id, "killed").await?;
+        let done = self.interrupt_locked(active, thread_id).await?;
+        self.cleanup_killed_worktree(&board, thread_id, done.clone())
+            .await;
+        Ok(done)
+    }
+
+    /// Best-effort removal of a killed worker's own worktree, deferred until its run settles.
+    /// Shared-isolation workers reuse the coordinator's worktree path, so they are skipped.
+    async fn cleanup_killed_worktree(
+        &self,
+        board: &SwarmBoardSnapshot,
+        thread_id: Uuid,
+        done: Option<watch::Receiver<bool>>,
+    ) {
+        let worker = match self.0.store.get_thread(thread_id).await {
+            Ok(thread) => thread,
+            Err(error) => {
+                tracing::warn!(%error, %thread_id, "Could not load killed worker for worktree cleanup");
+                return;
+            }
+        };
+        let coordinator = match self.0.store.get_thread(board.coordinator_thread_id).await {
+            Ok(thread) => thread,
+            Err(error) => {
+                tracing::warn!(%error, "Could not load coordinator for worktree cleanup");
+                return;
+            }
+        };
+        let Some(path) = worker
+            .worktree_path
+            .filter(|path| coordinator.worktree_path.as_ref() != Some(path))
+        else {
+            return;
+        };
+        let coordinator = self.clone();
+        let project_id = worker.project_id;
+        tokio::spawn(async move {
+            if let Some(mut done) = done {
+                let _ = done.wait_for(|completed| *completed).await;
+            }
+            coordinator.remove_worker_worktree(project_id, &path).await;
+        });
+    }
+
+    async fn remove_worker_worktree(&self, project_id: Uuid, path: &Path) {
+        let workspace = match self.0.store.get_project(project_id).await {
+            Ok(project) => project.workspace_root,
+            Err(error) => {
+                tracing::warn!(%error, %project_id, "Could not load project for worktree cleanup");
+                return;
+            }
+        };
+        if let Err(error) = self.0.git.remove_worktree(&workspace, path).await {
+            tracing::warn!(%error, path = %path.display(), "Could not remove killed worker worktree");
+        }
     }
 
     pub(crate) async fn apply_swarm_actions(
@@ -472,6 +599,32 @@ fn live_member(board: &SwarmBoardSnapshot, thread_id: Uuid) -> CoreResult<&Swarm
 
 fn wake_depth(active: &HashMap<Uuid, ActiveRun>, id: Uuid) -> u8 {
     active.get(&id).map_or(0, |run| run.wake_depth)
+}
+
+fn live_worker_count(board: &SwarmBoardSnapshot) -> usize {
+    board
+        .members
+        .iter()
+        .filter(|member| member.role != "coordinator" && member.state != "killed")
+        .count()
+}
+
+fn posted_since(messages: &[SwarmMessage], sender: &str, since: DateTime<Utc>) -> bool {
+    messages
+        .iter()
+        .any(|message| message.sender == sender && message.created_at >= since)
+}
+
+/// The notice names the worker without an `@` so that posting it does not wake the ended worker.
+fn silent_end_text(name: &str, status: RunStatus, error: Option<&str>) -> String {
+    let suffix = match error.map(str::trim).filter(|error| !error.is_empty()) {
+        Some(error) => {
+            let error: String = error.chars().take(ENDED_ERROR_CHARS).collect();
+            format!(": {}", error.replace('@', "(at)"))
+        }
+        None => String::new(),
+    };
+    format!("@coordinator [system] worker {name} ended ({status:?}) without posting{suffix}")
 }
 
 fn can_dispatch(caller: &Thread, target: &Thread) -> bool {
@@ -592,5 +745,86 @@ mod tests {
         let next_turn =
             SwarmTurn::prepare(&board, thread_id, ProviderId::Codex, &mut next_prompt).unwrap();
         assert_eq!(turn.marker, next_turn.marker);
+    }
+
+    fn member(name: &str, role: &str, state: &str) -> SwarmMember {
+        SwarmMember {
+            board_id: Uuid::nil(),
+            name: name.into(),
+            thread_id: Uuid::new_v4(),
+            provider: ProviderId::Codex,
+            model: "test".into(),
+            effort: None,
+            state: state.into(),
+            role: role.into(),
+            last_read_seq: 0,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn message(seq: i64, sender: &str, created_at: DateTime<Utc>) -> SwarmMessage {
+        SwarmMessage {
+            seq,
+            board_id: Uuid::nil(),
+            sender: sender.into(),
+            text: "post".into(),
+            mentions: Vec::new(),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn active_worker_limit_ignores_coordinator_and_killed_members() {
+        let mut members = vec![member("coordinator", "coordinator", "working")];
+        members
+            .extend((0..MAX_ACTIVE_WORKERS).map(|i| member(&format!("w{i}"), "worker", "working")));
+        members.push(member("old", "worker", "killed"));
+        let board = SwarmBoardSnapshot {
+            board_id: Uuid::nil(),
+            coordinator_thread_id: Uuid::nil(),
+            title: "test".into(),
+            members,
+            messages: Vec::new(),
+            head_seq: 0,
+        };
+        assert_eq!(live_worker_count(&board), MAX_ACTIVE_WORKERS);
+    }
+
+    #[test]
+    fn worker_post_must_match_sender_and_run_start() {
+        let start = Utc::now();
+        let before = start - chrono::Duration::seconds(5);
+        let after = start + chrono::Duration::seconds(5);
+        let messages = [message(1, "reviewer", after), message(2, "coder", before)];
+        assert!(!posted_since(&messages, "coder", start));
+        assert!(posted_since(&messages, "reviewer", start));
+        assert!(posted_since(&messages, "reviewer", after));
+        assert!(!posted_since(
+            &messages,
+            "reviewer",
+            after + chrono::Duration::seconds(1)
+        ));
+    }
+
+    #[test]
+    fn silent_end_notice_does_not_mention_the_ended_worker() {
+        let text = silent_end_text("coder", RunStatus::Failed, Some("boom @coder"));
+        assert_eq!(
+            text,
+            "@coordinator [system] worker coder ended (Failed) without posting: boom (at)coder"
+        );
+        assert_eq!(mentions_in(&text), vec!["coordinator".to_owned()]);
+        assert_eq!(
+            silent_end_text("coder", RunStatus::Completed, None),
+            "@coordinator [system] worker coder ended (Completed) without posting"
+        );
+        assert!(
+            validate_text(&silent_end_text(
+                "coder",
+                RunStatus::Cancelled,
+                Some(&"x".repeat(10_000))
+            ))
+            .is_ok()
+        );
     }
 }

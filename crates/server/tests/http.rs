@@ -1778,3 +1778,136 @@ async fn shell_exec_runs_in_thread_and_project_and_records_history() {
     }
     assert_eq!(after["thread"]["status"], "completed");
 }
+
+#[tokio::test]
+async fn checkpoints_git_actions_and_queue_endpoints_work() {
+    let tmp = TempDir::new();
+    let workspace = tmp.0.join("repo");
+    std::fs::create_dir(&workspace).unwrap();
+    git(&workspace, &["init", "-q"]);
+    std::fs::write(workspace.join("a.txt"), "initial\n").unwrap();
+    git(&workspace, &["add", "a.txt"]);
+    git(
+        &workspace,
+        &[
+            "-c",
+            "user.name=T3 Test",
+            "-c",
+            "user.email=t3@example.test",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let id = create_parent(&app, &workspace).await;
+
+    let msg = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({"prompt": "checkpoint run"})),
+    )
+    .await;
+    let run_id = msg["run_id"].as_str().unwrap();
+    wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+
+    let detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
+    assert!(
+        detail["checkpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some(run_id))
+    );
+
+    // Mutate file & add untracked file, then rollback to pre-run checkpoint.
+    std::fs::write(workspace.join("a.txt"), "mutated\n").unwrap();
+    std::fs::write(workspace.join("extra.txt"), "temp\n").unwrap();
+    let rb = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/runs/{run_id}/rollback"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(rb["ok"], true);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
+        "initial\n"
+    );
+    assert!(!workspace.join("extra.txt").exists());
+
+    // Stage, discard, and commit endpoints.
+    std::fs::write(workspace.join("a.txt"), "discard-me\n").unwrap();
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/git/discard"),
+        Some(json!({"path": "a.txt"})),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
+        "initial\n"
+    );
+    std::fs::write(workspace.join("a.txt"), "committed\n").unwrap();
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/git/stage"),
+        Some(json!({"path": "a.txt"})),
+    )
+    .await;
+    let committed = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/git/commit"),
+        Some(json!({"message": "update a.txt"})),
+    )
+    .await;
+    assert!(committed["sha"].as_str().unwrap().len() >= 7);
+
+    // Queue list & individual cancel while a slow run is active.
+    let _slow = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({"prompt": "[slow] active turn"})),
+    )
+    .await;
+    let queued = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({"prompt": "queued follow-up", "behavior": "queue"})),
+    )
+    .await;
+    let q_id = queued["run_id"].as_str().unwrap();
+    let q_list = json_req(&app, Method::GET, &format!("/api/threads/{id}/queue"), None).await;
+    assert!(
+        q_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"].as_str() == Some(q_id))
+    );
+    let del = request(
+        &app,
+        Request::delete(format!("/api/threads/{id}/queue/{q_id}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+    let _ = request(
+        &app,
+        Request::post(format!("/api/threads/{id}/interrupt"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+}

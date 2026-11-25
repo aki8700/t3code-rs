@@ -1,7 +1,10 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     error::Error,
+    fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -176,6 +179,7 @@ async fn run(cli: Cli) -> CliResult<ExitCode> {
             let store = SqliteStore::open_for_gc(&cfg.db_path(), cfg.storage.clone(), apply)?;
             let report = store.gc_storage(&cfg.attachments_dir(), apply).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+            gc_orphan_worktrees(&store, &cfg.worktrees_dir(), apply).await;
         }
         Command::ImportProjects { from, data_dir } => {
             let cfg = local_config(data_dir);
@@ -337,6 +341,68 @@ fn legacy_source(from: Option<PathBuf>, destination: &Path) -> CliResult<PathBuf
         }
     }
     Ok(source)
+}
+
+/// Reports worktree directories that no thread references, and removes them with `apply`.
+/// Best-effort: a missing worktrees directory or a failed removal never fails the command.
+/// Git keeps its own registry of worktrees, so `git worktree prune` in the source repo
+/// is still needed afterwards to drop stale metadata.
+async fn gc_orphan_worktrees(store: &SqliteStore, worktrees_dir: &Path, apply: bool) {
+    let entries = match fs::read_dir(worktrees_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!(
+                "Skipped worktree gc in {}: {error}",
+                worktrees_dir.display()
+            );
+            return;
+        }
+    };
+    let threads = match store.list_threads(None, true, usize::MAX).await {
+        Ok(threads) => threads,
+        Err(error) => {
+            eprintln!("Skipped worktree gc: {error}");
+            return;
+        }
+    };
+    let referenced: HashSet<PathBuf> = threads
+        .iter()
+        .filter_map(|thread| thread.worktree_path.as_deref().map(canonical_or_self))
+        .collect();
+    let orphans: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .filter(|path| !referenced.contains(&canonical_or_self(path)))
+        .collect();
+    if orphans.is_empty() {
+        println!("No orphan worktrees in {}", worktrees_dir.display());
+        return;
+    }
+    for path in &orphans {
+        if apply {
+            match fs::remove_dir_all(path) {
+                Ok(()) => println!("Removed orphan worktree {}", path.display()),
+                Err(error) => eprintln!(
+                    "Could not remove orphan worktree {}: {error}",
+                    path.display()
+                ),
+            }
+        } else {
+            println!("Orphan worktree {}", path.display());
+        }
+    }
+    if !apply {
+        println!(
+            "Run with --apply to remove {} orphan worktree(s).",
+            orphans.len()
+        );
+    }
+}
+
+fn canonical_or_self(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
 }
 
 fn local_config(data_dir: Option<PathBuf>) -> ServerConfig {

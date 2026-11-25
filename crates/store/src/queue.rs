@@ -93,6 +93,107 @@ impl SqliteStore {
         .await
     }
 
+    pub async fn list_queued_runs(&self, thread_id: Uuid) -> CoreResult<Vec<Run>> {
+        self.with_reader(move |connection| {
+            query_all(
+                connection,
+                "SELECT id, thread_id, ordinal, provider, model, effort, status, prompt,
+                    provider_session_id, input_tokens, output_tokens, duration_ms, error_message,
+                    started_at, completed_at FROM runs
+                 WHERE thread_id = ?1 AND status = ?2 ORDER BY ordinal",
+                params![thread_id.to_string(), encode(&RunStatus::Queued)?],
+                run_row,
+            )
+        })
+        .await
+    }
+
+    pub async fn cancel_queued_run(&self, thread_id: Uuid, run_id: Uuid) -> CoreResult<bool> {
+        self.with_writer(move |connection| {
+            let tx = connection.transaction().map_err(storage_error)?;
+            let changed = tx
+                .execute(
+                    "UPDATE runs SET status = ?3, completed_at = ?4, error_message = 'Interrupted'
+                 WHERE id = ?1 AND thread_id = ?2 AND status = ?5",
+                    params![
+                        run_id.to_string(),
+                        thread_id.to_string(),
+                        encode(&RunStatus::Cancelled)?,
+                        timestamp(Utc::now()),
+                        encode(&RunStatus::Queued)?
+                    ],
+                )
+                .map_err(storage_error)?
+                != 0;
+            if changed {
+                tx.execute(
+                    "DELETE FROM queued_run_inputs WHERE run_id = ?1",
+                    [run_id.to_string()],
+                )
+                .map_err(storage_error)?;
+            }
+            tx.commit().map_err(storage_error)?;
+            Ok(changed)
+        })
+        .await
+    }
+
+    pub async fn save_run_checkpoint(
+        &self,
+        run_id: Uuid,
+        thread_id: Uuid,
+        pre_tree: String,
+    ) -> CoreResult<()> {
+        self.with_writer(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO run_checkpoints (run_id, thread_id, pre_tree, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                    thread_id = excluded.thread_id, pre_tree = excluded.pre_tree,
+                    created_at = excluded.created_at",
+                    params![
+                        run_id.to_string(),
+                        thread_id.to_string(),
+                        pre_tree,
+                        timestamp(Utc::now())
+                    ],
+                )
+                .map_err(storage_error)?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn get_run_checkpoint(
+        &self,
+        thread_id: Uuid,
+        run_id: Uuid,
+    ) -> CoreResult<Option<String>> {
+        self.with_reader(move |connection| {
+            connection
+                .query_row(
+                    "SELECT pre_tree FROM run_checkpoints WHERE thread_id = ?1 AND run_id = ?2",
+                    params![thread_id.to_string(), run_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage_error)
+        })
+        .await
+    }
+
+    pub async fn list_run_checkpoints(&self, thread_id: Uuid) -> CoreResult<Vec<Uuid>> {
+        self.with_reader(move |connection| {
+            query_all(
+                connection,
+                "SELECT run_id FROM run_checkpoints WHERE thread_id = ?1 ORDER BY created_at, run_id",
+                [thread_id.to_string()],
+                |row| parse(row, 0),
+            )
+        }).await
+    }
+
     pub async fn previous_run(&self, thread_id: Uuid, before: Uuid) -> CoreResult<Option<Run>> {
         self.with_reader(move |connection| connection.query_row(
             "SELECT id, thread_id, ordinal, provider, model, effort, status, prompt, provider_session_id,
@@ -182,5 +283,116 @@ impl SqliteStore {
             Ok(ids)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use t3_core::{InteractionMode, ProviderId, RuntimeMode, Thread, ThreadStatus};
+
+    async fn fixture() -> (SqliteStore, Uuid) {
+        let store = SqliteStore::open_in_memory(StorageConfig::default()).unwrap();
+        let project = store
+            .create_project("Queue tests".into(), "/tmp/queue-tests".into())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let thread = store
+            .create_thread(Thread {
+                id: Uuid::new_v4(),
+                project_id: project.id,
+                parent_thread_id: None,
+                relationship: None,
+                title: "Queue".into(),
+                model_selection: ModelSelection::default(),
+                runtime_mode: RuntimeMode::AutoAcceptEdits,
+                interaction_mode: InteractionMode::Plan,
+                status: ThreadStatus::Idle,
+                worktree_path: None,
+                branch: None,
+                provider_session_id: None,
+                archived: false,
+                pinned: false,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        (store, thread.id)
+    }
+
+    fn queued_run(thread_id: Uuid) -> Run {
+        Run {
+            id: Uuid::new_v4(),
+            thread_id,
+            ordinal: 1,
+            provider: ProviderId::Mock,
+            model: "mock".into(),
+            effort: None,
+            status: RunStatus::Queued,
+            prompt: "queued".into(),
+            provider_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: None,
+            error_message: None,
+            started_at: Utc::now(),
+            completed_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn lists_and_cancels_only_matching_queued_run() {
+        let (store, thread_id) = fixture().await;
+        let run = store.create_run(queued_run(thread_id)).await.unwrap();
+        assert_eq!(store.list_queued_runs(thread_id).await.unwrap().len(), 1);
+        assert!(
+            !store
+                .cancel_queued_run(Uuid::new_v4(), run.id)
+                .await
+                .unwrap()
+        );
+        assert!(store.cancel_queued_run(thread_id, run.id).await.unwrap());
+        assert!(store.list_queued_runs(thread_id).await.unwrap().is_empty());
+        assert!(!store.cancel_queued_run(thread_id, run.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stores_and_lists_run_checkpoints() {
+        let (store, thread_id) = fixture().await;
+        let run = store.create_run(queued_run(thread_id)).await.unwrap();
+        assert_eq!(
+            store.get_run_checkpoint(thread_id, run.id).await.unwrap(),
+            None
+        );
+        store
+            .save_run_checkpoint(run.id, thread_id, "tree-one".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_run_checkpoint(thread_id, run.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tree-one")
+        );
+        store
+            .save_run_checkpoint(run.id, thread_id, "tree-two".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_run_checkpoint(thread_id, run.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tree-two")
+        );
+        assert_eq!(
+            store.list_run_checkpoints(thread_id).await.unwrap(),
+            vec![run.id]
+        );
     }
 }

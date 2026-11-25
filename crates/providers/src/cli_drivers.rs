@@ -74,7 +74,7 @@ impl Cli {
 }
 
 macro_rules! cli_driver {
-    ($name:ident, $provider:ident, $build:ident) => {
+    ($name:ident, $provider:ident, $build:ident, $supports_mcp:expr) => {
         #[doc = concat!("Local CLI driver for ", stringify!($provider), ".")]
         #[derive(Clone)]
         pub struct $name(Cli);
@@ -89,6 +89,10 @@ macro_rules! cli_driver {
         impl ProviderDriver for $name {
             fn provider_id(&self) -> ProviderId {
                 ProviderId::$provider
+            }
+
+            fn supports_mcp(&self) -> bool {
+                $supports_mcp
             }
 
             async fn health_check(&self) -> ProviderHealth {
@@ -114,10 +118,10 @@ macro_rules! cli_driver {
     };
 }
 
-cli_driver!(ClaudeDriver, Claude, claude_args);
-cli_driver!(CodexDriver, Codex, codex_args);
-cli_driver!(AntigravityDriver, Antigravity, antigravity_args);
-cli_driver!(OpenCodeDriver, OpenCode, opencode_args);
+cli_driver!(ClaudeDriver, Claude, claude_args, true);
+cli_driver!(CodexDriver, Codex, codex_args, true);
+cli_driver!(AntigravityDriver, Antigravity, antigravity_args, false);
+cli_driver!(OpenCodeDriver, OpenCode, opencode_args, true);
 
 impl AntigravityDriver {
     pub fn with_data_dir(binary: impl Into<PathBuf>, data_dir: impl Into<PathBuf>) -> Self {
@@ -268,6 +272,26 @@ fn opencode_args(cmd: &mut Command, req: &TurnRequest) -> Input {
     }
     for attachment in &req.attachments {
         cmd.arg("-f").arg(&attachment.storage_path);
+    }
+    if let Some(spec) = &req.mcp_injection {
+        let mut cmd_vec = vec![spec.binary_path.to_string_lossy().into_owned()];
+        cmd_vec.extend(mcp_args(spec));
+        cmd.env("T3_MCP_TOKEN", &spec.internal_token);
+        cmd.env(
+            "OPENCODE_CONFIG_CONTENT",
+            json!({
+                "mcp": {
+                    "t3rs": {
+                        "type": "local",
+                        "command": cmd_vec,
+                        "environment": {
+                            "T3_MCP_TOKEN": "{env:T3_MCP_TOKEN}",
+                        },
+                    }
+                }
+            })
+            .to_string(),
+        );
     }
     cmd.args(["--", &req.prompt]);
     Input::None
@@ -598,6 +622,70 @@ mod tests {
                 "--version and literal text",
             ]
         );
+    }
+
+    #[test]
+    fn cli_drivers_report_mcp_capability() {
+        assert!(ClaudeDriver::new("claude").supports_mcp());
+        assert!(CodexDriver::new("codex").supports_mcp());
+        assert!(OpenCodeDriver::new("opencode").supports_mcp());
+        assert!(!AntigravityDriver::new("agy").supports_mcp());
+    }
+
+    #[tokio::test]
+    async fn opencode_injects_mcp_via_env_without_embedding_secret() {
+        let req = request(ProviderId::OpenCode);
+        let mut cmd = OpenCodeDriver::new("opencode").0.command();
+        assert!(matches!(opencode_args(&mut cmd, &req), Input::None));
+
+        assert!(args(&cmd).iter().all(|arg| !arg.contains("fixture-token")));
+        assert_token_env(&cmd);
+
+        let config_raw = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == "OPENCODE_CONFIG_CONTENT")
+                    .then(|| value.and_then(|val| val.to_str()))
+                    .flatten()
+            })
+            .expect("OPENCODE_CONFIG_CONTENT env should be set")
+            .to_owned();
+        assert!(!config_raw.contains("fixture-token"));
+        let config: serde_json::Value = serde_json::from_str(&config_raw).unwrap();
+        assert_eq!(
+            config,
+            json!({
+                "mcp": {
+                    "t3rs": {
+                        "type": "local",
+                        "command": [
+                            "/test tools/t3d",
+                            "mcp",
+                            "--url",
+                            "http://127.0.0.1:3780",
+                            "--thread-id",
+                            "00000000-0000-0000-0000-000000000000"
+                        ],
+                        "environment": {
+                            "T3_MCP_TOKEN": "{env:T3_MCP_TOKEN}"
+                        }
+                    }
+                }
+            })
+        );
+
+        let plain_req = test_request(ProviderId::OpenCode);
+        let mut plain_cmd = OpenCodeDriver::new("opencode").0.command();
+        opencode_args(&mut plain_cmd, &plain_req);
+        assert!(plain_cmd
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == "T3_MCP_TOKEN" && value.is_none()));
+        assert!(plain_cmd
+            .as_std()
+            .get_envs()
+            .all(|(key, _)| key != "OPENCODE_CONFIG_CONTENT"));
     }
 
     #[tokio::test]
