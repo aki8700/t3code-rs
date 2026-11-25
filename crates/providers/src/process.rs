@@ -1,9 +1,10 @@
 use crate::{
     parsers::{Parser, provider_error},
-    watchdog::{RepetitionWatchdog, ToolLoopWatchdog},
+    watchdog::{InFlightTools, RepetitionWatchdog, ToolLoopWatchdog},
 };
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io,
     path::Path,
@@ -39,6 +40,9 @@ const MIN_IDLE_TIMEOUT_SECS: u64 = 60;
 const MAX_IDLE_TIMEOUT_SECS: u64 = 3600;
 const IDLE_TIMEOUT_ENV: &str = "T3_IDLE_TIMEOUT_SECS";
 const LEGACY_IDLE_STDOUT_TIMEOUT_ENV: &str = "T3_IDLE_STDOUT_TIMEOUT_SECS";
+/// While a tool step is running the idle limit is stretched by this factor
+/// (default 900 s -> 1 h), so a hung tool is still stopped eventually.
+const IN_FLIGHT_TOOL_IDLE_FACTOR: u32 = 4;
 
 /// Messages written to a streaming provider's stdin while the turn is open.
 enum StdinMsg {
@@ -485,19 +489,18 @@ async fn run_turn_with_idle_timeout(
             #[cfg(unix)]
             {
                 let pid = child.id().expect("unreaped child");
-                let mut killed_group = false;
                 let result = tokio::select! {
                     result = wait_for_exit(pid) => result,
                     Ok(()) = reader_stop_rx => {
                         GroupCleanup(Some(pid)).kill();
-                        killed_group = true;
                         wait_for_exit(pid).await
                     }
                 };
                 if result.is_ok() || already_reaped(&result) {
-                    // Clean up descendants holding pipes before reaping the leader; skip
-                    // a second kill when reader_stop_rx already terminated the group.
-                    guard.finish(result.is_ok() && !killed_group);
+                    // Clean up descendants holding pipes before reaping the leader. Kill
+                    // again even after reader_stop_rx did: on macOS a child forked while
+                    // the first SIGKILL was delivered can survive it and keep stderr open.
+                    guard.finish(result.is_ok());
                 }
                 result?;
                 child.wait().await
@@ -613,7 +616,7 @@ fn redact_value(value: &mut serde_json::Value, secret: &str) {
 
 enum ReadOutcome {
     Terminal(Option<StreamEvent>),
-    Stopped(&'static str),
+    Stopped(Cow<'static, str>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -624,7 +627,7 @@ async fn read_events(
     tx: &mpsc::UnboundedSender<StreamEvent>,
     control_requests: &ControlRequests,
     close_stdin: oneshot::Sender<()>,
-    stop_process: oneshot::Sender<()>,
+    mut stop_process: oneshot::Sender<()>,
     idle_timeout: Duration,
 ) -> io::Result<ReadOutcome> {
     let mut lines = BufReader::new(stdout);
@@ -635,40 +638,53 @@ async fn read_events(
     let mut assistant = RepetitionWatchdog::default();
     let mut reasoning = RepetitionWatchdog::default();
     let mut tool_loop = ToolLoopWatchdog::default();
-    // Stop reading after one extra byte, even when the producer never sends a newline.
+    let mut in_flight = InFlightTools::default();
     loop {
-        let bytes = match tokio::time::timeout(
-            idle_timeout,
-            (&mut lines)
-                .take((STDOUT_LINE_LIMIT + 1) as u64)
-                .read_until(b'\n', &mut line),
-        )
-        .await
-        {
+        let wait = match in_flight.oldest() {
+            Some(_) => idle_timeout * IN_FLIGHT_TOOL_IDLE_FACTOR,
+            None => idle_timeout,
+        };
+        let chunk = match tokio::time::timeout(wait, lines.fill_buf()).await {
             Ok(result) => result?,
             Err(_) => {
                 let _ = stop_process.send(());
                 if terminal.is_some() {
                     return Ok(ReadOutcome::Terminal(terminal));
                 }
-                return Ok(ReadOutcome::Stopped(
-                    "provider produced no stdout output before the idle timeout",
-                ));
+                return Ok(ReadOutcome::Stopped(match in_flight.oldest() {
+                    Some(tool) => format!(
+                        "provider tool `{tool}` was still running with no stdout output after {}s",
+                        wait.as_secs()
+                    )
+                    .into(),
+                    None => "provider produced no stdout output before the idle timeout".into(),
+                }));
             }
         };
-        if bytes == 0 {
-            break;
-        }
-        if line.len() > STDOUT_LINE_LIMIT && line.last() != Some(&b'\n') {
-            let _ = stop_process.send(());
-            return Ok(ReadOutcome::Stopped(
-                "provider stdout line exceeds the 4 MiB limit",
-            ));
+        if chunk.is_empty() {
+            if line.is_empty() {
+                break;
+            }
+        } else {
+            let newline = chunk.iter().position(|&byte| byte == b'\n');
+            let len = newline.unwrap_or(chunk.len());
+            if len > STDOUT_LINE_LIMIT - line.len() {
+                let _ = stop_process.send(());
+                return Ok(ReadOutcome::Stopped(
+                    "provider stdout line exceeds the 4 MiB limit".into(),
+                ));
+            }
+            line.extend_from_slice(&chunk[..len]);
+            lines.consume(len + usize::from(newline.is_some()));
+            if newline.is_none() {
+                continue;
+            }
         }
         if let Ok(mut value) = serde_json::from_slice(&line) {
             if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
                 redact_value(&mut value, secret);
             }
+            in_flight.observe(provider, &value);
             for event in parser.parse(&value) {
                 if let StreamEvent::PendingApproval { request } = &event
                     && let Some(provider_request_id) =
@@ -701,7 +717,7 @@ async fn read_events(
                     };
                     if let Some(reason) = stop_reason {
                         let _ = stop_process.send(());
-                        return Ok(ReadOutcome::Stopped(reason));
+                        return Ok(ReadOutcome::Stopped(reason.into()));
                     }
                 }
                 match event {
@@ -723,6 +739,22 @@ async fn read_events(
             }
         }
         line.clear();
+    }
+    // Some streaming CLIs wait for stdin EOF before exiting. The process waiter
+    // drops the stop receiver on exit, even when stdout closes first.
+    drop(close_stdin);
+    if tokio::time::timeout(idle_timeout, stop_process.closed())
+        .await
+        .is_err()
+        && stop_process.send(()).is_ok()
+        && !matches!(
+            terminal,
+            Some(StreamEvent::Failed { .. } | StreamEvent::RateLimited { .. })
+        )
+    {
+        return Ok(ReadOutcome::Stopped(
+            "provider stdout closed but the process did not exit before the idle timeout".into(),
+        ));
     }
     Ok(ReadOutcome::Terminal(terminal.or_else(|| parser.finish())))
 }
@@ -1410,15 +1442,14 @@ wait
         assert!(!driver.send_steer(id, "late".into()).await.unwrap());
     }
 
-    #[tokio::test]
-    async fn idle_stdout_timeout_terminates_hung_cli_and_descendants() {
-        let fixture = Fixture::new(
+    async fn assert_idle_group_cleanup(wait_script: &str, expected_failure: &str) {
+        let fixture = Fixture::new(&format!(
             r#"
-/bin/sleep 60 &
-printf '{"type":"system","session_id":"%s:%s"}\n' "$$" "$!"
-wait
+/bin/sleep 60 >/dev/null &
+printf '{{"type":"system","session_id":"%s:%s"}}\n' "$$" "$!"
+{wait_script}
 "#,
-        );
+        ));
         let active = ActiveRunMap::default();
         let run_id = Uuid::new_v4();
         let mut cmd = command(&fixture.binary());
@@ -1434,27 +1465,155 @@ wait
                 Input::None,
                 None,
                 tx,
-                Duration::from_millis(350),
+                Duration::from_secs(1),
             ),
         )
         .await
         .expect("idle timeout must terminate hung CLI")
         .unwrap();
 
+        let first = receive(&mut rx).await;
         let Some(StreamEvent::SessionStarted {
             provider_session_id,
-        }) = receive(&mut rx).await
+        }) = first
         else {
-            panic!("fixture did not start");
+            panic!("expected fixture session, received {first:?}");
         };
         let (pid, grandchild) = provider_session_id.split_once(':').unwrap();
         assert_processes_exited(pid.parse().unwrap(), grandchild.parse().unwrap()).await;
         assert!(matches!(
             receive(&mut rx).await,
-            Some(StreamEvent::Failed { message }) if message.contains("idle timeout")
+            Some(StreamEvent::Failed { message }) if message.contains(expected_failure)
         ));
         assert!(receive(&mut rx).await.is_none());
         assert!(active.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_stdout_timeout_terminates_hung_cli_and_descendants() {
+        assert_idle_group_cleanup("wait", "idle timeout").await;
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_terminates_provider_after_stdout_closes() {
+        assert_idle_group_cleanup("exec 1>&-\nwait", "stdout closed").await;
+    }
+
+    #[tokio::test]
+    async fn stdout_eof_closes_streaming_stdin_and_preserves_exit_diagnostics() {
+        let fixture = Fixture::new(
+            r#"
+IFS= read -r prompt
+exec 1>&-
+if IFS= read -r extra; then exit 17; fi
+echo 'fixture shutdown error' >&2
+exit 37
+"#,
+        );
+        let driver = ClaudeDriver::new(fixture.binary());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            driver.run_turn(test_request(ProviderId::Claude), tx),
+        )
+        .await
+        .expect("CLI must receive stdin EOF after closing stdout")
+        .unwrap();
+        assert!(matches!(
+            receive(&mut rx).await,
+            Some(StreamEvent::Failed { message }) if message.contains("37") && message.contains("fixture shutdown error")
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_resets_while_a_single_event_is_arriving() {
+        let fixture = Fixture::new(
+            r#"
+printf '{"type":"result","result":"'
+for i in 1 2 3 4 5; do
+    /bin/sleep 0.15
+    printf x
+done
+printf '"}\n'
+"#,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_turn_with_idle_timeout(
+            &ActiveRunMap::default(),
+            Uuid::new_v4(),
+            ProviderId::Claude,
+            command(&fixture.binary()),
+            Input::None,
+            None,
+            tx,
+            Duration::from_millis(600),
+        )
+        .await
+        .unwrap();
+        let event = receive(&mut rx).await;
+        assert!(
+            matches!(&event, Some(StreamEvent::Completed { final_text: Some(text) }) if text == "xxxxx"),
+            "{event:?}"
+        );
+    }
+
+    async fn run_agy_fixture(script: &str, idle: Duration) -> Vec<StreamEvent> {
+        let fixture = Fixture::new(script);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_turn_with_idle_timeout(
+            &ActiveRunMap::default(),
+            Uuid::new_v4(),
+            ProviderId::Antigravity,
+            command(&fixture.binary()),
+            Input::None,
+            None,
+            tx,
+            idle,
+        )
+        .await
+        .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = receive(&mut rx).await {
+            events.push(event);
+        }
+        events
+    }
+
+    // agy holds every later step on stdout until an ACTIVE tool step finishes,
+    // so a long background command looks silent even though the agent is working.
+    #[tokio::test]
+    async fn idle_timeout_waits_for_in_flight_agy_tool() {
+        let events = run_agy_fixture(
+            r#"
+printf '%s\n' '{"event":"init","conversation_id":"c"}' \
+  '{"event":"step_update","step_update":{"step_index":2,"step_type":"tool","state":"ACTIVE","tool_name":"run_command"}}'
+/bin/sleep 2.5
+printf '%s\n' '{"event":"step_update","step_update":{"step_index":2,"step_type":"tool","state":"DONE","tool_name":"run_command"}}' \
+  '{"event":"result","result":{"status":"SUCCESS","response":"done"}}'
+"#,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Completed { final_text: Some(text) }) if text == "done"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_still_stops_a_tool_that_never_finishes() {
+        let events = run_agy_fixture(
+            r#"
+printf '%s\n' '{"event":"step_update","step_update":{"step_index":2,"step_type":"tool","state":"ACTIVE","tool_name":"run_command"}}'
+exec /bin/sleep 60
+"#,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Failed { message }) if message.contains("run_command")),
+            "{events:?}"
+        );
     }
 
     #[tokio::test]
@@ -1462,7 +1621,7 @@ wait
         let fixture = Fixture::new(
             r#"
 printf '{"type":"system","session_id":"active-stream"}\n'
-for i in 1 2 3 4 5; do
+for i in 1 2 3 4 5 6 7 8 9 10; do
     /bin/sleep 0.15
     printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"tick "}}}\n'
 done
@@ -1483,7 +1642,7 @@ printf '{"type":"result","subtype":"success","result":"done"}\n'
                 Input::None,
                 None,
                 tx,
-                Duration::from_millis(600),
+                Duration::from_secs(1),
             ),
         )
         .await

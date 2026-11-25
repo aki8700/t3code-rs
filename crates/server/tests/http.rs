@@ -1430,6 +1430,129 @@ async fn swarm_mock_workers_post_results_and_wake_the_coordinator() {
     assert_eq!(detail["runs"].as_array().unwrap().len(), 1);
 }
 
+// A coordinator without MCP emits T3_SWARM_ACTION lines that run after its turn.
+// Calls up to `failing_turns` emit a worktree worker (fails: the workspace is not
+// a git repository) followed by a plain post.
+#[cfg(unix)]
+async fn swarm_text_action_fixture(tmp: &TempDir, failing_turns: u32) -> (Router, Uuid) {
+    use std::os::unix::fs::PermissionsExt;
+    let driver = tmp.0.join("fixture-claude");
+    std::fs::write(
+        &driver,
+        format!(
+            r#"#!/bin/sh
+IFS= read -r prompt
+n=$(cat calls 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > calls
+marker=$(printf '%s' "$prompt" | grep -o 'T3_SWARM_ACTION [0-9a-f-]*' | head -n 1)
+if [ "$n" -le {failing_turns} ]; then
+  text='planned\n'"$marker"' {{\"tool\":\"swarm_add_worker\",\"name\":\"w1\",\"brief\":\"x\",\"isolation\":\"worktree\"}}\n'"$marker"' {{\"tool\":\"swarm_post_message\",\"text\":\"after-failure\"}}'
+else
+  text="noted"
+fi
+printf '{{"type":"result","subtype":"success","result":"%s"}}\n' "$text"
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut config = ServerConfig {
+        data_dir: tmp.0.join("server"),
+        enabled_providers: vec![ProviderId::Mock, ProviderId::Claude],
+        ..Default::default()
+    };
+    config.providers.claude_bin = driver;
+    let state = ServerState::new(config, "http://127.0.0.1:3774".into()).unwrap();
+    let app = router(state);
+    let id = create_parent(&app, &tmp.0).await;
+    (app, id)
+}
+
+#[cfg(unix)]
+async fn start_swarm(app: &Router, id: Uuid) {
+    json_req(
+        app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({
+            "prompt":"/swarm split the work",
+            "model_selection":{"provider":"claude","model":"fixture"}
+        })),
+    )
+    .await;
+}
+
+// One failing action must not fail the turn or drop later actions, and the
+// coordinator (whose turn already ended) must be woken with the error.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_swarm_text_action_is_reported_to_the_coordinator() {
+    let tmp = TempDir::new();
+    let (app, id) = swarm_text_action_fixture(&tmp, 1).await;
+    start_swarm(&app, id).await;
+    let detail = wait_for_runs(&app, id, 2).await;
+    let runs = detail["runs"].as_array().unwrap();
+    assert_eq!(runs[0]["status"], "completed", "{}", runs[0]);
+    let messages = mcp_tool(&app, "swarm_read_board", json!({"thread_id":id})).await;
+    let messages = messages.as_array().unwrap();
+    assert!(
+        messages.iter().any(|m| m["text"] == "after-failure"),
+        "{messages:?}"
+    );
+    let notice = messages
+        .iter()
+        .find(|m| m["sender"] == "system")
+        .unwrap_or_else(|| panic!("{messages:?}"));
+    assert_eq!(notice["mentions"], json!(["coordinator"]));
+    let text = notice["text"].as_str().unwrap();
+    assert!(text.contains("swarm_add_worker w1"), "{text}");
+    assert!(
+        runs[1]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("swarm_add_worker w1")
+    );
+}
+
+// A coordinator that repeats the same failing action must stop being woken.
+#[cfg(unix)]
+#[tokio::test]
+async fn repeated_failing_swarm_action_stops_at_the_wake_depth_limit() {
+    let tmp = TempDir::new();
+    let (app, id) = swarm_text_action_fixture(&tmp, u32::MAX).await;
+    start_swarm(&app, id).await;
+    wait_for_runs(&app, id, 2).await;
+    let mut last = 0;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let calls: u32 = std::fs::read_to_string(tmp.0.join("calls"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        if calls == last && calls > 1 {
+            break;
+        }
+        last = calls;
+    }
+    assert!((2..=10).contains(&last), "coordinator woken {last} times");
+}
+
+#[cfg(unix)]
+async fn wait_for_runs(app: &Router, id: Uuid, count: usize) -> Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let detail = json_req(app, Method::GET, &format!("/api/threads/{id}"), None).await;
+            let runs = detail["runs"].as_array().unwrap();
+            if runs.len() >= count && runs.iter().all(|run| run["status"] != "running") {
+                return detail;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("swarm runs did not finish")
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn usage_limits_probes_claude_and_codex_clis_with_cache_and_refresh() {

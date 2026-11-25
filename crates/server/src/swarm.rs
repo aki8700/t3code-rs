@@ -294,7 +294,8 @@ impl RunCoordinator {
         validate_text(&text)?;
         let board = self.require_board(caller_id).await?;
         let (sender, caller, depth) = if let Some(sender) = sender_override {
-            (sender.to_owned(), None, 0)
+            // Inherit the caller's depth so system notices cannot wake members forever.
+            (sender.to_owned(), None, wake_depth(active, caller_id))
         } else {
             let member = live_member(&board, caller_id)?;
             (
@@ -559,21 +560,44 @@ impl RunCoordinator {
         thread_id: Uuid,
         actions: Vec<Action>,
     ) -> CoreResult<()> {
+        // These actions run after the coordinator's turn ended, so it cannot see
+        // an error. Apply the rest and report failures on the board instead.
+        let mut failures = String::new();
         for action in actions {
-            match action {
-                Action::Add(spec) => {
-                    self.add_worker_locked(active, thread_id, spec).await?;
-                }
-                Action::Post { text } => {
-                    self.post_locked(active, thread_id, None, text).await?;
-                }
-                Action::Kill { name } => {
+            let (label, result) = match action {
+                Action::Add(spec) => (
+                    format!("swarm_add_worker {}", spec.name),
+                    self.add_worker_locked(active, thread_id, spec)
+                        .await
+                        .map(drop),
+                ),
+                Action::Post { text } => (
+                    "swarm_post_message".to_owned(),
+                    self.post_locked(active, thread_id, None, text)
+                        .await
+                        .map(drop),
+                ),
+                Action::Kill { name } => (
+                    format!("swarm_kill_worker {name}"),
                     self.kill_worker_locked(active, thread_id, &name, true)
-                        .await?;
-                }
+                        .await
+                        .map(drop),
+                ),
+            };
+            if let Err(error) = result {
+                let error: String = error.to_string().chars().take(ENDED_ERROR_CHARS).collect();
+                let _ = writeln!(failures, "- {label}: {error}");
             }
         }
-        Ok(())
+        if failures.is_empty() {
+            return Ok(());
+        }
+        let text = format!(
+            "@coordinator Swarm action(s) from your last turn failed:\n{failures}Fix the action and emit it again."
+        );
+        self.post_locked(active, thread_id, Some("system"), text)
+            .await
+            .map(drop)
     }
 }
 

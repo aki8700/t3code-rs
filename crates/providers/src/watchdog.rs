@@ -1,5 +1,6 @@
 use serde_json::Value;
-use t3_core::types::TurnItemKind;
+use std::collections::BTreeMap;
+use t3_core::types::{ProviderId, TurnItemKind};
 
 const WINDOW_BYTES: usize = 8 * 1024;
 const MIN_PERIOD: usize = 48;
@@ -8,6 +9,42 @@ const LINE_REPEATS: usize = 8;
 const MAX_PERIOD: usize = 512;
 const BLOCK_REPEATS: usize = 6;
 const TOOL_LOOP_REPEATS: usize = 8;
+
+/// Tool steps a provider has started but not yet finished.
+///
+/// agy withholds every later stdout event while a tool step is ACTIVE (for
+/// example a background `sleep` or `muse-wait`), so stdout silence then means
+/// "a tool is still running", not "the provider hung".
+#[derive(Default)]
+pub(crate) struct InFlightTools {
+    steps: BTreeMap<u64, String>,
+}
+
+impl InFlightTools {
+    pub(crate) fn observe(&mut self, provider: ProviderId, event: &Value) {
+        let step = &event["step_update"];
+        if provider != ProviderId::Antigravity
+            || event["event"] != "step_update"
+            || step["step_type"] != "tool"
+        {
+            return;
+        }
+        let Some(index) = step["step_index"].as_u64() else {
+            return;
+        };
+        if step["state"] == "ACTIVE" {
+            let name = step["tool_name"].as_str().unwrap_or("tool");
+            self.steps.insert(index, name.to_owned());
+        } else {
+            self.steps.remove(&index);
+        }
+    }
+
+    /// Name of the earliest tool step still running, if any.
+    pub(crate) fn oldest(&self) -> Option<&str> {
+        self.steps.values().next().map(String::as_str)
+    }
+}
 
 /// Detects consecutive identical tool or command executions in a turn stream.
 #[derive(Default)]
