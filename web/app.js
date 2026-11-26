@@ -4779,11 +4779,11 @@ function notifyUser(title, body, threadId) {
   }
 }
 
-// Run outcomes raise OS notifications for top-level threads only; swarm workers, delegated tasks and forks stay in-app.
+// Run outcomes raise OS notifications for top-level threads and forks; swarm workers and delegated tasks stay in-app.
 async function notifyRunOutcome(title, threadId) {
   // a just-spawned child may not be in the thread list yet
   const t = threadById(threadId) || (await api(`/api/threads/${threadId}`).catch(() => null))?.thread;
-  if (!t?.parent_thread_id) notifyUser(title, cleanTitle(t?.title) || threadId, threadId);
+  if (!t?.parent_thread_id || t.relationship === 'fork') notifyUser(title, cleanTitle(t?.title) || threadId, threadId);
 }
 
 function handleWs(m) {
