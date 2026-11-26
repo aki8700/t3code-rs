@@ -272,8 +272,8 @@ impl Parser {
                 self.codex_item(&event["item"], kind(event) == "item.completed", out);
             }
             "turn.completed" => {
-                // This usage sums every request in the turn, so it is not the context size.
-                // The server reads that from the session file's latest `token_count` instead.
+                // On resume this usage is the session's running total, not this run's share
+                // or the context size. The server replaces it with the session file's delta.
                 push_usage(out, ProviderId::Codex, &event["usage"]);
                 out.push(StreamEvent::Completed { final_text: None });
             }
