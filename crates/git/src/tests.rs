@@ -50,6 +50,104 @@ async fn worktree_checkout_preserves_raw_content_with_configured_filters() {
     );
 }
 
+#[tokio::test]
+async fn worktree_include_copies_only_listed_ignored_files() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let fixture = TempRepo::new().await;
+    let write = |name: &str, content: &str| {
+        let path = fixture.repo.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    };
+    write(
+        ".gitignore",
+        ".env\n*.local\nvendor/\ndeps/\n.claude/\nlink-*\nlogs/*\n",
+    );
+    write(
+        ".worktreeinclude",
+        ".env\ntracked.txt\nvendor/**/config.json\n**/settings.json\n\
+         **/.claude/skills/*.md\nlink-*\nlogs/\n!logs/skip.log\n",
+    );
+    write("tracked.txt", "committed\n");
+    fixture.commit().await;
+    write("tracked.txt", "dirty\n");
+    let copied = [
+        ".env",
+        "sub/.env",
+        "vendor/a/config.json",
+        ".claude/skills/a.md",
+        "logs/keep.log",
+    ];
+    // `logs/skip.log` stays included: Git cannot re-exclude below a matched directory.
+    for name in copied {
+        write(name, name);
+    }
+    write("logs/skip.log", "skip");
+    write("other.local", "unlisted");
+    write("deps/pkg/settings.json", "unreached by **/");
+    write("untracked.txt", "not ignored");
+    fs::set_permissions(fixture.repo.join(".env"), fs::Permissions::from_mode(0o750)).unwrap();
+    fs::write(fixture.root.join("outside"), "secret").unwrap();
+    symlink(fixture.root.join("outside"), fixture.repo.join("link-out")).unwrap();
+    symlink(".git/config", fixture.repo.join("link-git")).unwrap();
+    symlink(".env", fixture.repo.join("link-in")).unwrap();
+
+    let manager = GitManager::new(fixture.root.join("worktrees"));
+    // A subdirectory of the checkout resolves to the same repository root.
+    let (worktree, _) = manager
+        .create_worktree(&fixture.repo.join("sub"), "include", None)
+        .await
+        .unwrap();
+
+    for name in copied {
+        assert_eq!(fs::read_to_string(worktree.join(name)).unwrap(), name);
+    }
+    assert!(worktree.join("logs/skip.log").is_file());
+    let mode = fs::metadata(worktree.join(".env")).unwrap().permissions();
+    assert_eq!(mode.mode() & 0o777, 0o750);
+    assert_eq!(
+        fs::read_to_string(worktree.join("link-in")).unwrap(),
+        ".env"
+    );
+    for name in [
+        "other.local",
+        "deps/pkg/settings.json",
+        "untracked.txt",
+        "link-out",
+        "link-git",
+    ] {
+        assert!(worktree.join(name).symlink_metadata().is_err(), "{name}");
+    }
+    assert_eq!(
+        fs::read_to_string(worktree.join("tracked.txt")).unwrap(),
+        "committed\n"
+    );
+}
+
+#[tokio::test]
+async fn worktree_include_is_optional_and_respects_the_checked_out_revision() {
+    let fixture = TempRepo::new().await;
+    fixture.write("tracked.txt", "committed\n");
+    fixture.commit().await;
+    fixture.write(".gitignore", ".env\n");
+    fixture.write(".env", "secret");
+    let manager = GitManager::new(fixture.root.join("worktrees"));
+    let (without, _) = manager
+        .create_worktree(&fixture.repo, "none", None)
+        .await
+        .unwrap();
+    assert!(!without.join(".env").exists());
+
+    // The ignore rule is uncommitted, so a copy would show up as a new file.
+    fixture.write(".worktreeinclude", ".env\n");
+    let (unignored, _) = manager
+        .create_worktree(&fixture.repo, "unignored", None)
+        .await
+        .unwrap();
+    assert!(!unignored.join(".env").exists());
+}
+
 struct TempRepo {
     root: PathBuf,
     repo: PathBuf,

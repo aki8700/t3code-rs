@@ -1,10 +1,15 @@
 use std::{
     collections::HashMap,
     ffi::OsStr,
+    io::ErrorKind,
     path::{Path, PathBuf},
     process::{Output, Stdio},
 };
 
+use ignore::{
+    Match,
+    gitignore::{Gitignore, GitignoreBuilder},
+};
 use t3_core::{CoreError, CoreResult, DiffFile, DiffSummary, classify_diff_risk};
 use tokio::{io::AsyncReadExt, process::Command};
 use uuid::Uuid;
@@ -365,6 +370,10 @@ impl GitManager {
             command.arg(String::from_utf8_lossy(&commit).trim());
         }
         checked_output(command, false).await?;
+        // The worktree is usable without the local files, so a copy failure is not fatal.
+        if let Err(error) = copy_worktree_includes(repo_root, &path).await {
+            tracing::warn!(%error, "Failed to apply .worktreeinclude");
+        }
         tracing::debug!("Created Git worktree");
         Ok((path, branch))
     }
@@ -1049,6 +1058,132 @@ fn ensure_inside_repo(root: &Path, path: &Path) -> CoreResult<()> {
     {
         return Err(git_error("path resolves outside repository"));
     }
+    Ok(())
+}
+
+/// Copies gitignored files selected by `.worktreeinclude` into a new worktree.
+/// Git decides what is ignored (hence never tracked); the `ignore` crate matches the include
+/// file because the `**/` rule depends on which pattern matched.
+/// <https://code.claude.com/docs/en/worktrees#copy-gitignored-files-into-worktrees>
+async fn copy_worktree_includes(repo_root: &Path, worktree: &Path) -> CoreResult<()> {
+    let root = git_output(repo_root, &["rev-parse", "--show-toplevel"]).await?;
+    let root = git_path(root.strip_suffix(b"\n").unwrap_or(&root));
+    let patterns = match tokio::fs::read_to_string(root.join(".worktreeinclude")).await {
+        Ok(patterns) => patterns,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(git_error(error)),
+    };
+    let lines = || patterns.trim_start_matches('\u{feff}').lines();
+    let all = include_matcher(&root, lines())?;
+    // Fallback for files that an unreached `**/` pattern shadows in the full matcher.
+    let rooted = include_matcher(&root, lines().filter(|line| !line.starts_with("**/")))?;
+    let list = [
+        "ls-files",
+        "-z",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+    ];
+    let ignored = git_output(&root, &list).await?;
+    let root = tokio::fs::canonicalize(&root).await.map_err(git_error)?;
+    let mut cache = HashMap::new();
+    for relative in nul_fields(&ignored).map(git_path) {
+        if !is_included(&root, &all, &relative, &mut cache).await?
+            && !is_included(&root, &rooted, &relative, &mut cache).await?
+        {
+            continue;
+        }
+        if let Err(error) = copy_include(&root, worktree, &relative).await {
+            tracing::warn!(%error, path = %relative.display(), "Failed to copy included file");
+        }
+    }
+    Ok(())
+}
+
+fn include_matcher<'a>(root: &Path, lines: impl Iterator<Item = &'a str>) -> CoreResult<Gitignore> {
+    let mut builder = GitignoreBuilder::new(root);
+    for line in lines {
+        // Like Git, skip a malformed pattern without discarding the rest.
+        if let Err(error) = builder.add_line(None, line) {
+            tracing::warn!(%error, "Invalid .worktreeinclude pattern");
+        }
+    }
+    builder.build().map_err(git_error)
+}
+
+async fn is_included(
+    root: &Path,
+    matcher: &Gitignore,
+    relative: &Path,
+    cache: &mut HashMap<PathBuf, bool>,
+) -> CoreResult<bool> {
+    let mut paths: Vec<&Path> = relative.ancestors().collect();
+    paths.pop(); // the empty root
+    paths.reverse();
+    // Top down, as in Git: a matched directory includes everything below it.
+    for (depth, path) in paths.iter().enumerate() {
+        let Match::Ignore(glob) = matcher.matched(path, depth + 1 < paths.len()) else {
+            continue;
+        };
+        let Some(rest) = glob.original().strip_prefix("**/") else {
+            return Ok(true);
+        };
+        // `**/` enters a wholly ignored directory above the match only if it names it.
+        for dir in &paths[..depth] {
+            if !cache.contains_key(*dir) {
+                cache.insert(dir.to_path_buf(), is_ignored(root, dir).await?);
+            }
+            if cache[*dir] {
+                let name = rest.split('/').next();
+                return Ok(dir.iter().any(|part| part.to_str() == name));
+            }
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn is_ignored(dir: &Path, relative: &Path) -> CoreResult<bool> {
+    let mut command = git(dir);
+    // The `./` prefix keeps a leading `:` from being read as pathspec magic.
+    command
+        .args(["check-ignore", "-q", "--"])
+        .arg(Path::new(".").join(relative));
+    let output = command.output().await.map_err(git_error)?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(command_error(&output)),
+    }
+}
+
+async fn copy_include(root: &Path, worktree: &Path, relative: &Path) -> CoreResult<()> {
+    // Resolving symlinks first rejects anything that leads outside the repo or into `.git`.
+    let source = tokio::fs::canonicalize(root.join(relative))
+        .await
+        .map_err(git_error)?;
+    let in_git = |path: &Path| path.iter().any(|part| part.eq_ignore_ascii_case(".git"));
+    let inside = source.strip_prefix(root);
+    if !inside.is_ok_and(|inside| !in_git(inside)) || in_git(relative) || !source.is_file() {
+        return Ok(());
+    }
+    // Never overwrite checked-out content or write through a checked-out symlink. A file the
+    // worktree's revision does not ignore is skipped too, so it cannot be committed by accident.
+    let target = worktree.join(relative);
+    if target.symlink_metadata().is_ok()
+        || relative
+            .ancestors()
+            .skip(1)
+            .any(|dir| worktree.join(dir).is_symlink())
+        || !is_ignored(worktree, relative).await?
+    {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(git_error)?;
+    }
+    // `copy` also carries over the permission bits.
+    tokio::fs::copy(source, target).await.map_err(git_error)?;
     Ok(())
 }
 
