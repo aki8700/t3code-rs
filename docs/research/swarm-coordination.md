@@ -43,6 +43,14 @@
 - `scout-forks` は完了報告を `(1/4)`〜`(4/4)` に分割して約12秒で投稿した。各投稿が `@coordinator` を mention している。
 - 無限ループと depth 上限での取りこぼしは、この DB では確認していない。前者は fixture driver の test で再現した（修正前は15秒で provider 起動462回）。
 
+## 4096バイト超過の扱い（追加の実測）
+
+telemetry の集計（2026-11-25 03:09Z〜26 09:11Z）では、Claude の `swarm_post_message` 呼び出し24回のうち4回（16.7%）が上限超過で拒否された。内訳は worker 3 run、coordinator 1 run。codex は27回で同じ失敗が0件。
+
+採ったのは、上限を事前に伝えて本文を短く保つ方法（coordinator と worker の指示、tool description、error message）。切り詰めは末尾の `blockers:` などが黙って欠ける。全文を server がファイルに保存する方法は、worktree や sandbox をまたいで読めるパスの管理が要る。拒否なら送り手が本文を持ったまま書き直せる。変更後の拒否率は未測定で、指標は 拒否 ÷ 投稿呼び出し（変更前 4/24）。
+
+action 行経由の超過は、失敗通知が coordinator にだけ届き、本文は board に残らない。この経路は直していない。
+
 ## 選んだ2件と理由
 
 1. **停止条件を実際に効かせ、見えるようにする。** 上限の迂回は token を際限なく消費する欠陥で、修正は `swarm.rs` 内の depth の引き継ぎと通知1件で済みます。
