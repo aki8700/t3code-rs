@@ -724,10 +724,19 @@ impl RunCoordinator {
         let project = store.get_project(thread.project_id).await?;
         let original_prompt = queued.prompt.clone();
         let claude_slash = selection.provider == ProviderId::Claude
-            && matches!(
-                queued.prompt.split_whitespace().next(),
-                Some("/pstack:poteto-mode" | "/pstack:poteto-help")
-            );
+            && queued
+                .prompt
+                .split_whitespace()
+                .next()
+                .is_some_and(|command| {
+                    command == "/verify-t3code"
+                        || command.strip_prefix("/pstack:").is_some_and(|skill| {
+                            !skill.is_empty()
+                                && skill
+                                    .bytes()
+                                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                        })
+                });
         let handoff = if previous_run.is_some() && resume_session_id.is_none() {
             let handoff = self.handoff_summary(&thread).await?;
             Some(format!("Context from the previous run:\n{handoff}"))

@@ -2532,10 +2532,14 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"fixture complete"}
         .unwrap();
     let help = "/pstack:poteto-help Which skill handles a synthetic task?";
     let mode = "/pstack:poteto-mode Explain the fixture.";
+    let verify = "/verify-t3code Check persistence";
+    let playbook = "/pstack:create-verification-skill Inspect this fixture";
     for body in [
         json!({"prompt": help, "attachment_ids": [attachment_id]}),
         json!({"prompt": mode}),
         json!({"prompt": "Continue the conversation."}),
+        json!({"prompt": verify, "attachment_ids": [attachment_id]}),
+        json!({"prompt": playbook, "attachment_ids": [attachment_id]}),
     ] {
         json_req(
             &app,
@@ -2566,6 +2570,11 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"fixture complete"}
         messages[2]["message"]["content"],
         "Continue the conversation."
     );
+    for (message, command) in messages[3..].iter().zip([verify, playbook]) {
+        let content = &message["message"]["content"];
+        assert_eq!(content[1]["text"], command);
+        assert!(content[0]["text"].as_str().unwrap().contains("notes.txt"));
+    }
     let argv = std::fs::read_to_string(tmp.0.join("argv.txt")).unwrap();
     let mut argv = argv.lines();
     assert!(!argv.next().unwrap().contains("--resume"));
