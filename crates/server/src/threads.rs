@@ -16,8 +16,9 @@ use std::{
 use t3_core::*;
 use t3_git::{GitManager, MergeOutcome};
 use t3_mcp::{
-    Capabilities, DelegateMode, DelegatedTask, ForkOptions, OrchestratorBackend, TaskMergeResult,
-    ThreadRead,
+    Capabilities, DelegateMode, DelegatedTask, ForkOptions, OrchestratorBackend, SwarmMemberResult,
+    SwarmMemberSummary, SwarmPostResult, SwarmReadMessage, SwarmStatusResult, SwarmWorkerResult,
+    TaskMergeResult, ThreadRead,
 };
 use t3_providers::ProviderRegistry;
 use uuid::Uuid;
@@ -383,7 +384,13 @@ impl RunCoordinator {
                     .0
                     .git
                     .create_worktree(workspace, &input.title, input.base_ref.as_deref())
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        CoreError::InvalidArgument(format!(
+                            "could not create worktree from cwd {}: {error}",
+                            workspace.display()
+                        ))
+                    })?;
                 (Some(path), Some(branch))
             }
             IsolationMode::Shared => (
@@ -993,41 +1000,66 @@ fn workspace_merge_lock(canonical_workspace: &Path) -> Arc<tokio::sync::Mutex<()
 
 #[async_trait]
 impl OrchestratorBackend for RunCoordinator {
-    async fn swarm_status(&self, thread_id: Uuid) -> CoreResult<Option<SwarmBoardSnapshot>> {
-        self.get_board(thread_id).await
+    async fn swarm_status(&self, thread_id: Uuid) -> CoreResult<Option<SwarmStatusResult>> {
+        let Some(board) = self.get_board(thread_id).await? else {
+            return Ok(None);
+        };
+        let message_count = self.0.store.count_swarm_messages(board.board_id).await?;
+        Ok(Some(SwarmStatusResult {
+            board_id: board.board_id,
+            members: board
+                .members
+                .into_iter()
+                .map(SwarmMemberSummary::from)
+                .collect(),
+            head_seq: board.head_seq,
+            message_count,
+        }))
     }
 
     async fn swarm_add_worker(
         &self,
         thread_id: Uuid,
         spec: SwarmWorkerSpec,
-    ) -> CoreResult<SwarmMember> {
-        self.add_worker(thread_id, spec).await
+    ) -> CoreResult<SwarmWorkerResult> {
+        let brief_chars = spec.brief.chars().count();
+        let member = self.add_worker(thread_id, spec).await?;
+        Ok(SwarmWorkerResult {
+            member: member.into(),
+            brief_chars,
+        })
     }
 
     async fn swarm_post_message(
         &self,
         thread_id: Uuid,
         text: String,
-    ) -> CoreResult<SwarmBoardSnapshot> {
-        self.post_message(thread_id, None, text).await
+    ) -> CoreResult<SwarmPostResult> {
+        self.post_message_result(thread_id, text).await
     }
 
     async fn swarm_read_board(
         &self,
         thread_id: Uuid,
-        since: i64,
+        since_seq: Option<i64>,
         limit: usize,
-    ) -> CoreResult<Vec<SwarmMessage>> {
-        self.read_board(thread_id, since, limit).await
+        seq: Option<i64>,
+    ) -> CoreResult<Vec<SwarmReadMessage>> {
+        self.read_board(thread_id, since_seq, limit, seq).await
     }
 
     async fn swarm_kill_worker(
         &self,
         thread_id: Uuid,
         name: &str,
-    ) -> CoreResult<SwarmBoardSnapshot> {
-        self.kill_worker(thread_id, name, true).await
+    ) -> CoreResult<SwarmMemberResult> {
+        let board = self.kill_worker(thread_id, name, true).await?;
+        let member = board
+            .members
+            .into_iter()
+            .find(|member| member.name == name)
+            .ok_or_else(|| CoreError::NotFound("swarm worker".into()))?;
+        Ok(member.into())
     }
 
     async fn get_thread(&self, id: Uuid) -> CoreResult<Thread> {

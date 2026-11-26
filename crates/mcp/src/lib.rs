@@ -56,6 +56,91 @@ pub struct TaskMergeResult {
     pub cleaned_up: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SwarmMemberResult {
+    pub board_id: Uuid,
+    pub name: String,
+    pub thread_id: Uuid,
+    pub provider: ProviderId,
+    pub model: String,
+    pub effort: Option<String>,
+    pub state: String,
+    pub role: String,
+    pub last_read_seq: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<SwarmMember> for SwarmMemberResult {
+    fn from(member: SwarmMember) -> Self {
+        Self {
+            board_id: member.board_id,
+            name: member.name,
+            thread_id: member.thread_id,
+            provider: member.provider,
+            model: member.model,
+            effort: member.effort,
+            state: member.state,
+            role: member.role,
+            last_read_seq: member.last_read_seq,
+            created_at: member.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SwarmWorkerResult {
+    #[serde(flatten)]
+    pub member: SwarmMemberResult,
+    pub brief_chars: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SwarmMemberSummary {
+    pub name: String,
+    pub state: String,
+    pub provider: ProviderId,
+    pub model: String,
+    pub last_read_seq: i64,
+}
+
+impl From<SwarmMember> for SwarmMemberSummary {
+    fn from(member: SwarmMember) -> Self {
+        Self {
+            name: member.name,
+            state: member.state,
+            provider: member.provider,
+            model: member.model,
+            last_read_seq: member.last_read_seq,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SwarmStatusResult {
+    pub board_id: Uuid,
+    pub members: Vec<SwarmMemberSummary>,
+    pub head_seq: i64,
+    pub message_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SwarmPostResult {
+    pub seq: i64,
+    pub board_id: Uuid,
+    pub woken: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SwarmReadMessage {
+    pub seq: i64,
+    pub board_id: Uuid,
+    pub sender: String,
+    pub text: String,
+    pub mentions: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub truncated: bool,
+}
+
 #[async_trait]
 pub trait OrchestratorBackend: Send + Sync {
     async fn get_thread(&self, id: Uuid) -> CoreResult<Thread>;
@@ -103,36 +188,37 @@ pub trait OrchestratorBackend: Send + Sync {
     ) -> CoreResult<Uuid>;
     async fn thread_fork(&self, thread_id: Uuid, options: ForkOptions) -> CoreResult<Thread>;
     async fn orch_stats(&self) -> CoreResult<Vec<OrchModelStat>>;
-    async fn swarm_status(&self, _thread_id: Uuid) -> CoreResult<Option<SwarmBoardSnapshot>> {
+    async fn swarm_status(&self, _thread_id: Uuid) -> CoreResult<Option<SwarmStatusResult>> {
         swarm_unsupported()
     }
     async fn swarm_add_worker(
         &self,
         _thread_id: Uuid,
         _spec: SwarmWorkerSpec,
-    ) -> CoreResult<SwarmMember> {
+    ) -> CoreResult<SwarmWorkerResult> {
         swarm_unsupported()
     }
     async fn swarm_post_message(
         &self,
         _thread_id: Uuid,
         _text: String,
-    ) -> CoreResult<SwarmBoardSnapshot> {
+    ) -> CoreResult<SwarmPostResult> {
         swarm_unsupported()
     }
     async fn swarm_read_board(
         &self,
         _thread_id: Uuid,
-        _since: i64,
+        _since_seq: Option<i64>,
         _limit: usize,
-    ) -> CoreResult<Vec<SwarmMessage>> {
+        _seq: Option<i64>,
+    ) -> CoreResult<Vec<SwarmReadMessage>> {
         swarm_unsupported()
     }
     async fn swarm_kill_worker(
         &self,
         _thread_id: Uuid,
         _name: &str,
-    ) -> CoreResult<SwarmBoardSnapshot> {
+    ) -> CoreResult<SwarmMemberResult> {
         swarm_unsupported()
     }
 }
@@ -282,8 +368,9 @@ impl<B: OrchestratorBackend> McpServer<B> {
                     backend
                         .swarm_read_board(
                             swarm_thread(args.thread_id, context)?,
-                            args.input.since,
+                            args.input.since_seq,
                             args.input.limit,
+                            args.input.seq,
                         )
                         .await?,
                 )
@@ -528,6 +615,9 @@ fn empty_object() -> Value {
 fn default_limit() -> usize {
     50
 }
+fn default_swarm_limit() -> usize {
+    20
+}
 
 #[derive(Deserialize)]
 struct SwarmStatus {
@@ -549,9 +639,11 @@ struct SwarmPost {
 #[derive(Deserialize)]
 struct SwarmRead {
     #[serde(default)]
-    since: i64,
-    #[serde(default = "default_limit")]
+    since_seq: Option<i64>,
+    #[serde(default = "default_swarm_limit")]
     limit: usize,
+    #[serde(default)]
+    seq: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -659,6 +751,7 @@ fn tools() -> Vec<Value> {
     let string = json!({"type": "string"});
     let uuid = json!({"type": "string", "format": "uuid"});
     let limit = json!({"type": "integer", "minimum": 0});
+    let swarm_limit = json!({"type": "integer", "minimum": 0, "default": 20});
     let provider =
         json!({"enum": ["claude", "codex", "antigravity", "open-code", "opencode", "mock"]});
     let make = |name: &str, description: &str, properties: Value, required: &[&str]| {
@@ -675,32 +768,33 @@ fn tools() -> Vec<Value> {
         ),
         make(
             "swarm_status",
-            "Get the swarm board for the current thread.",
+            "Get compact swarm status: member name/state/provider/model/last_read_seq, head sequence, and message count.",
             json!({"thread_id": uuid}),
             &[],
         ),
         make(
             "swarm_add_worker",
-            "Start a named worker on this swarm with a brief and optional provider, model, effort and isolation.",
+            "Start a named worker and return its member record with brief_chars (not the brief text).",
             json!({"thread_id": uuid, "name": string, "brief": string, "provider": provider,
                 "model": string, "effort": string, "isolation": {"enum": ["shared", "worktree"]}}),
             &["name", "brief"],
         ),
         make(
             "swarm_post_message",
-            "Post to this swarm. @name, @all and @coordinator wake the addressed members.",
+            "Post to this swarm and return seq, board_id, and names of members woken. @name, @all, and @coordinator wake addressed members.",
             json!({"thread_id": uuid, "text": string}),
             &["text"],
         ),
         make(
             "swarm_read_board",
-            "Read board messages after the given sequence number.",
-            json!({"thread_id": uuid, "since": {"type": "integer", "minimum": 0}, "limit": limit}),
+            "Read messages after since_seq (defaults to the caller's last_read_seq), up to 20 by default. Text is limited to 2,000 characters; provide seq to fetch one message with full text.",
+            json!({"thread_id": uuid, "since_seq": {"type": "integer", "minimum": 0}, "limit": swarm_limit,
+                "seq": {"type": "integer", "minimum": 1}}),
             &[],
         ),
         make(
             "swarm_kill_worker",
-            "Stop a worker and cancel its queued follow-ups.",
+            "Stop a worker and cancel its queued follow-ups. Return the affected member record.",
             json!({"thread_id": uuid, "name": string}),
             &["name"],
         ),

@@ -165,6 +165,20 @@ impl SqliteStore {
         })
         .await
     }
+
+    pub async fn count_swarm_messages(&self, board_id: Uuid) -> CoreResult<usize> {
+        self.with_reader(move |connection| {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM swarm_messages WHERE board_id = ?1",
+                    [board_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(storage_error)?;
+            usize::try_from(count).map_err(storage_error)
+        })
+        .await
+    }
 }
 
 fn board_by_thread(

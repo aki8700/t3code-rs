@@ -1345,7 +1345,8 @@ async fn swarm_mock_workers_post_results_and_wake_the_coordinator() {
     .await;
     wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
     let before = mcp_tool(&app, "swarm_status", json!({"thread_id":id})).await;
-    assert_eq!(before["coordinator_thread_id"], json!(id));
+    assert_eq!(before["board_id"].as_str().unwrap().len(), 36);
+    assert!(before.get("messages").is_none());
     let rejected = json_req(&app, Method::POST, "/mcp", Some(json!({
         "jsonrpc":"2.0","id":1,"method":"tools/call","params":{
             "name":"swarm_add_worker","arguments":{"thread_id":id,"name":"unsafe","brief":"check","isolation":"worktree"}
@@ -1357,6 +1358,8 @@ async fn swarm_mock_workers_post_results_and_wake_the_coordinator() {
     let worker = mcp_tool(&app, "swarm_add_worker", json!({
         "thread_id":id,"name":"reviewer","brief":"Review the fixture","provider":"mock","model":"mock",
     })).await;
+    assert_eq!(worker["brief_chars"], 18);
+    assert!(worker.get("brief").is_none());
     let worker_id: Uuid = serde_json::from_value(worker["thread_id"].clone()).unwrap();
     let worker_path = format!("/api/threads/{worker_id}");
     wait_for_thread(&mut events, worker_id, ThreadStatus::Completed).await;
@@ -1390,18 +1393,30 @@ async fn swarm_mock_workers_post_results_and_wake_the_coordinator() {
         }),
     )
     .await;
+    assert_eq!(done["woken"], json!(["coordinator"]));
     wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
     let messages = mcp_tool(
         &app,
         "swarm_read_board",
         json!({
-            "thread_id":worker_id, "since":note["head_seq"], "limit":1,
+            "thread_id":worker_id,
         }),
     )
     .await;
-    assert_eq!(messages.as_array().unwrap().len(), 1);
-    assert_eq!(messages[0]["sender"], "reviewer");
-    assert_eq!(messages[0]["mentions"], json!(["coordinator"]));
+    assert_eq!(messages.as_array().unwrap().len(), 2);
+    assert_eq!(messages[0]["sender"], "user");
+    assert_eq!(messages[1]["sender"], "reviewer");
+    assert_eq!(messages[1]["mentions"], json!(["coordinator"]));
+    let after_note = mcp_tool(
+        &app,
+        "swarm_read_board",
+        json!({
+            "thread_id":worker_id, "since_seq":note["head_seq"], "limit":1,
+        }),
+    )
+    .await;
+    assert_eq!(after_note.as_array().unwrap().len(), 1);
+    assert_eq!(after_note[0]["sender"], "reviewer");
     let detail = json_req(&app, Method::GET, &thread, None).await;
     assert_eq!(detail["runs"].as_array().unwrap().len(), 2);
     let prompt = detail["runs"][1]["prompt"].as_str().unwrap();
@@ -1409,16 +1424,16 @@ async fn swarm_mock_workers_post_results_and_wake_the_coordinator() {
     assert!(prompt.contains("@coordinator [done] Fixture checked"));
     let board = json_req(&app, Method::GET, &format!("{worker_path}/swarm"), None).await;
     assert_eq!(board["board_id"], before["board_id"]);
-    assert_eq!(board["members"][0]["last_read_seq"], done["head_seq"]);
+    assert_eq!(board["members"][0]["last_read_seq"], done["seq"]);
     assert_eq!(board["members"][1]["state"], "waiting");
-    let killed = json_req(
+    let killed = mcp_tool(
         &app,
-        Method::POST,
-        &format!("{swarm}/workers/reviewer/kill"),
-        None,
+        "swarm_kill_worker",
+        json!({"thread_id":id,"name":"reviewer"}),
     )
     .await;
-    assert_eq!(killed["members"][1]["state"], "killed");
+    assert_eq!(killed["state"], "killed");
+    assert!(killed.get("members").is_none());
     json_req(
         &app,
         Method::POST,
@@ -1428,6 +1443,132 @@ async fn swarm_mock_workers_post_results_and_wake_the_coordinator() {
     .await;
     let detail = json_req(&app, Method::GET, &worker_path, None).await;
     assert_eq!(detail["runs"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn swarm_mcp_status_and_reader_return_compact_truncated_messages() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let app = router(state);
+    let id = create_parent(&app, &tmp.0).await;
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({"prompt":"/swarm inspect board"})),
+    )
+    .await;
+
+    let long_text = "x".repeat(2_500);
+    let mut first_post = Value::Null;
+    for index in 0..21 {
+        let text = if index == 0 {
+            long_text.clone()
+        } else {
+            format!("post {index}")
+        };
+        let post = mcp_tool(
+            &app,
+            "swarm_post_message",
+            json!({"thread_id":id,"text":text}),
+        )
+        .await;
+        assert!(post.to_string().len() < 500, "{post}");
+        if index == 0 {
+            first_post = post;
+        }
+    }
+
+    let status = mcp_tool(&app, "swarm_status", json!({"thread_id":id})).await;
+    assert_eq!(status["message_count"], 21);
+    assert!(status.get("messages").is_none());
+    assert_eq!(
+        status["members"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["last_read_seq", "model", "name", "provider", "state"]
+    );
+    let messages = mcp_tool(
+        &app,
+        "swarm_read_board",
+        json!({"thread_id":id,"since_seq":0}),
+    )
+    .await;
+    let messages = messages.as_array().unwrap();
+    assert_eq!(messages.len(), 20);
+    assert_eq!(messages[0]["text"].as_str().unwrap().len(), 2_000);
+    assert_eq!(messages[0]["truncated"], true);
+
+    let full = mcp_tool(
+        &app,
+        "swarm_read_board",
+        json!({"thread_id":id,"seq":first_post["seq"]}),
+    )
+    .await;
+    assert_eq!(full[0]["text"], long_text);
+    assert_eq!(full[0]["truncated"], false);
+}
+
+#[tokio::test]
+async fn coordinator_wake_prompt_excludes_posts_from_the_coordinator() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let app = router(state);
+    let id = create_parent(&app, &tmp.0).await;
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({"prompt":"/swarm coordinate"})),
+    )
+    .await;
+
+    let worker = mcp_tool(
+        &app,
+        "swarm_add_worker",
+        json!({"thread_id":id,"name":"reviewer","brief":"Review the fixture"}),
+    )
+    .await;
+    let worker_id: Uuid = serde_json::from_value(worker["thread_id"].clone()).unwrap();
+    let worker_path = format!("/api/threads/{worker_id}");
+    let detail = json_req(&app, Method::GET, &worker_path, None).await;
+    assert_eq!(detail["runs"].as_array().unwrap().len(), 1);
+
+    let own_post = "coordinator private context that must not be replayed";
+    mcp_tool(
+        &app,
+        "swarm_post_message",
+        json!({"thread_id":id,"text":own_post}),
+    )
+    .await;
+    mcp_tool(
+        &app,
+        "swarm_post_message",
+        json!({"thread_id":worker_id,"text":"@coordinator [done] Fixture checked"}),
+    )
+    .await;
+
+    let detail = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
+            let runs = detail["runs"].as_array().unwrap();
+            if runs.len() >= 2 && runs.iter().all(|run| run["status"] != "running") {
+                break detail;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("coordinator wake did not finish");
+    let prompt = detail["runs"][1]["prompt"].as_str().unwrap();
+    assert!(prompt.contains("@coordinator [done] Fixture checked"));
+    assert!(
+        !prompt.contains(own_post),
+        "coordinator's own post was replayed"
+    );
 }
 
 // A coordinator without MCP emits T3_SWARM_ACTION lines that run after its turn.
@@ -1492,7 +1633,12 @@ async fn failed_swarm_text_action_is_reported_to_the_coordinator() {
     let detail = wait_for_runs(&app, id, 2).await;
     let runs = detail["runs"].as_array().unwrap();
     assert_eq!(runs[0]["status"], "completed", "{}", runs[0]);
-    let messages = mcp_tool(&app, "swarm_read_board", json!({"thread_id":id})).await;
+    let messages = mcp_tool(
+        &app,
+        "swarm_read_board",
+        json!({"thread_id":id,"since_seq":0}),
+    )
+    .await;
     let messages = messages.as_array().unwrap();
     assert!(
         messages.iter().any(|m| m["text"] == "after-failure"),
@@ -1505,6 +1651,7 @@ async fn failed_swarm_text_action_is_reported_to_the_coordinator() {
     assert_eq!(notice["mentions"], json!(["coordinator"]));
     let text = notice["text"].as_str().unwrap();
     assert!(text.contains("swarm_add_worker w1"), "{text}");
+    assert!(text.contains(&tmp.0.display().to_string()), "{text}");
     assert!(
         runs[1]["prompt"]
             .as_str()

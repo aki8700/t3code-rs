@@ -120,6 +120,64 @@ impl OrchestratorBackend for Backend {
     async fn orch_stats(&self) -> CoreResult<Vec<OrchModelStat>> {
         Ok(vec![])
     }
+
+    async fn swarm_post_message(
+        &self,
+        _thread_id: Uuid,
+        _text: String,
+    ) -> CoreResult<SwarmPostResult> {
+        let board = large_swarm_board();
+        Ok(SwarmPostResult {
+            seq: board.head_seq + 1,
+            board_id: board.board_id,
+            woken: vec!["worker-1".into()],
+        })
+    }
+}
+
+fn large_swarm_board() -> SwarmBoardSnapshot {
+    let board_id = Uuid::new_v4();
+    let created_at = caller(None).created_at;
+    let members = (0..20)
+        .map(|index| SwarmMember {
+            board_id,
+            name: if index == 0 {
+                "coordinator".into()
+            } else {
+                format!("worker-{index}")
+            },
+            thread_id: Uuid::new_v4(),
+            provider: ProviderId::Mock,
+            model: "mock".into(),
+            effort: None,
+            state: "working".into(),
+            role: if index == 0 {
+                "coordinator".into()
+            } else {
+                "worker".into()
+            },
+            last_read_seq: 0,
+            created_at,
+        })
+        .collect();
+    let messages = (0..20)
+        .map(|index| SwarmMessage {
+            seq: index + 1,
+            board_id,
+            sender: format!("worker-{index}"),
+            text: format!("brief {index}: {}", "x".repeat(5 * 1024)),
+            mentions: vec![],
+            created_at,
+        })
+        .collect();
+    SwarmBoardSnapshot {
+        board_id,
+        coordinator_thread_id: server_id(),
+        title: "large swarm".into(),
+        members,
+        messages,
+        head_seq: 20,
+    }
 }
 
 fn request(method: &str, params: Value) -> Value {
@@ -208,6 +266,15 @@ async fn handshake_discovery_batches_and_protocol_errors() {
         assert_eq!(tool["inputSchema"]["type"], "object");
         assert!(tool["name"].is_string());
     }
+    let read = tools
+        .iter()
+        .find(|tool| tool["name"] == "swarm_read_board")
+        .unwrap();
+    let properties = &read["inputSchema"]["properties"];
+    assert!(properties.get("since_seq").is_some());
+    assert!(properties.get("since").is_none());
+    assert_eq!(properties["limit"]["default"], 20);
+    assert!(properties.get("seq").is_some());
 }
 
 #[tokio::test]
@@ -281,6 +348,24 @@ async fn dispatches_tools_with_thread_context_and_validates_arguments() {
     ] {
         assert_eq!(call(&server, name, args).await["isError"], true);
     }
+}
+
+#[tokio::test]
+async fn swarm_post_response_stays_small_on_a_large_board() {
+    let server = McpServer::new(Backend::new(server_id()));
+    let result = call(
+        &server,
+        "swarm_post_message",
+        json!({"text":"@worker-1 check this"}),
+    )
+    .await;
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.len() < 500, "post response was {} bytes", text.len());
+    let response: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(response.as_object().unwrap().len(), 3);
+    assert!(response.get("seq").is_some());
+    assert!(response.get("board_id").is_some());
+    assert_eq!(response["woken"], json!(["worker-1"]));
 }
 
 fn caller(worktree: Option<&Path>) -> Thread {

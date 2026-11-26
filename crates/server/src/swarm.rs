@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::{collections::HashMap, fmt::Write, path::Path};
 use t3_core::*;
+use t3_mcp::{SwarmPostResult, SwarmReadMessage};
 use t3_providers::ProviderRegistry;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -15,6 +16,7 @@ const MAX_MESSAGE_BYTES: usize = 4096;
 const MAX_ACTIVE_WORKERS: usize = 8;
 const WAKE_BATCH: usize = 16;
 const ENDED_ERROR_CHARS: usize = 200;
+const READ_MESSAGE_MAX_CHARS: usize = 2_000;
 
 pub(crate) fn is_swarm_command(prompt: &str) -> bool {
     prompt.split_whitespace().next() == Some("/swarm")
@@ -279,6 +281,27 @@ impl RunCoordinator {
         sender_override: Option<&str>,
         text: String,
     ) -> CoreResult<SwarmBoardSnapshot> {
+        self.post_message_outcome(caller_id, sender_override, text)
+            .await
+            .map(|(board, _)| board)
+    }
+
+    pub(crate) async fn post_message_result(
+        &self,
+        caller_id: Uuid,
+        text: String,
+    ) -> CoreResult<SwarmPostResult> {
+        self.post_message_outcome(caller_id, None, text)
+            .await
+            .map(|(_, result)| result)
+    }
+
+    async fn post_message_outcome(
+        &self,
+        caller_id: Uuid,
+        sender_override: Option<&str>,
+        text: String,
+    ) -> CoreResult<(SwarmBoardSnapshot, SwarmPostResult)> {
         let mut active = self.0.active.lock().await;
         self.post_locked(&mut active, caller_id, sender_override, text)
             .await
@@ -290,7 +313,7 @@ impl RunCoordinator {
         caller_id: Uuid,
         sender_override: Option<&str>,
         text: String,
-    ) -> CoreResult<SwarmBoardSnapshot> {
+    ) -> CoreResult<(SwarmBoardSnapshot, SwarmPostResult)> {
         validate_text(&text)?;
         let board = self.require_board(caller_id).await?;
         let (sender, caller, depth) = if let Some(sender) = sender_override {
@@ -312,29 +335,40 @@ impl RunCoordinator {
             .await?;
         let board = self.require_board(caller_id).await?;
         self.emit_board(&board);
-        if depth >= MAX_WAKE_DEPTH || post.mentions.is_empty() {
-            return Ok(board);
-        }
-        for member in &board.members {
-            if member.state == "killed"
-                || member.name == sender
-                || !post
-                    .mentions
-                    .iter()
-                    .any(|name| name == "all" || name == &member.name)
-            {
-                continue;
-            }
-            if let Err(error) = self
-                .wake_member(active, member, caller.as_ref(), depth + 1)
-                .await
-            {
-                tracing::warn!(%error, thread_id = %member.thread_id, "Could not deliver swarm mention");
+        let mut woken = Vec::new();
+        if depth < MAX_WAKE_DEPTH && !post.mentions.is_empty() {
+            for member in &board.members {
+                if member.state == "killed"
+                    || member.name == sender
+                    || !post
+                        .mentions
+                        .iter()
+                        .any(|name| name == "all" || name == &member.name)
+                {
+                    continue;
+                }
+                match self
+                    .wake_member(active, member, caller.as_ref(), depth + 1)
+                    .await
+                {
+                    Ok(true) => woken.push(member.name.clone()),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, thread_id = %member.thread_id, "Could not deliver swarm mention");
+                    }
+                }
             }
         }
         let updated = self.require_board(caller_id).await?;
         self.emit_board(&updated);
-        Ok(updated)
+        Ok((
+            updated,
+            SwarmPostResult {
+                seq: post.seq,
+                board_id: post.board_id,
+                woken,
+            },
+        ))
     }
 
     async fn wake_member(
@@ -343,37 +377,45 @@ impl RunCoordinator {
         member: &SwarmMember,
         caller: Option<&Thread>,
         depth: u8,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<bool> {
         let store = &self.0.store;
         let target = store.get_thread(member.thread_id).await?;
         if target.archived || caller.is_some_and(|caller| !can_dispatch(caller, &target)) {
-            return Ok(());
+            return Ok(false);
         }
         let mut cursor = member.last_read_seq;
+        let mut woken = false;
         loop {
             let messages = store
                 .list_swarm_messages(member.board_id, cursor, WAKE_BATCH)
                 .await?;
             let Some(last) = messages.last() else {
-                return Ok(());
+                return Ok(woken);
             };
-            let mut prompt = format!("Unread swarm board posts for @{}:\n", member.name);
-            for message in &messages {
-                writeln!(
-                    prompt,
-                    "#{} {}: {}",
-                    message.seq, message.sender, message.text
-                )
-                .expect("write to String");
+            let unread = messages
+                .iter()
+                .filter(|message| message.sender != member.name)
+                .collect::<Vec<_>>();
+            if !unread.is_empty() {
+                let mut prompt = format!("Unread swarm board posts for @{}:\n", member.name);
+                for message in unread {
+                    writeln!(
+                        prompt,
+                        "#{} {}: {}",
+                        message.seq, message.sender, message.text
+                    )
+                    .expect("write to String");
+                }
+                self.send_locked(active, target.clone(), queued_message(prompt), depth)
+                    .await?;
+                woken = true;
             }
-            self.send_locked(active, target.clone(), queued_message(prompt), depth)
-                .await?;
             cursor = last.seq;
             store
                 .update_swarm_member_read_seq(target.id, cursor)
                 .await?;
             if messages.len() < WAKE_BATCH {
-                return Ok(());
+                return Ok(woken);
             }
         }
     }
@@ -445,14 +487,40 @@ impl RunCoordinator {
     pub(crate) async fn read_board(
         &self,
         thread_id: Uuid,
-        since: i64,
+        since_seq: Option<i64>,
         limit: usize,
-    ) -> CoreResult<Vec<SwarmMessage>> {
+        seq: Option<i64>,
+    ) -> CoreResult<Vec<SwarmReadMessage>> {
         let board = self.require_board(thread_id).await?;
-        self.0
-            .store
-            .list_swarm_messages(board.board_id, since.max(0), limit.min(200))
-            .await
+        let messages = if let Some(seq) = seq {
+            if seq <= 0 {
+                Vec::new()
+            } else {
+                self.0
+                    .store
+                    .list_swarm_messages(board.board_id, seq - 1, 1)
+                    .await?
+                    .into_iter()
+                    .filter(|message| message.seq == seq)
+                    .collect()
+            }
+        } else {
+            let since_seq = since_seq.unwrap_or_else(|| {
+                board
+                    .members
+                    .iter()
+                    .find(|member| member.thread_id == thread_id)
+                    .map_or(0, |member| member.last_read_seq)
+            });
+            self.0
+                .store
+                .list_swarm_messages(board.board_id, since_seq.max(0), limit.min(200))
+                .await?
+        };
+        Ok(messages
+            .into_iter()
+            .map(|message| read_message(message, seq.is_none()))
+            .collect())
     }
 
     pub(crate) async fn kill_worker(
@@ -606,6 +674,24 @@ fn queued_message(prompt: String) -> Message {
         prompt,
         behavior: Some(FollowUpBehavior::Queue),
         ..Default::default()
+    }
+}
+
+fn read_message(message: SwarmMessage, truncate: bool) -> SwarmReadMessage {
+    let truncated = truncate && message.text.chars().count() > READ_MESSAGE_MAX_CHARS;
+    let text = if truncated {
+        message.text.chars().take(READ_MESSAGE_MAX_CHARS).collect()
+    } else {
+        message.text
+    };
+    SwarmReadMessage {
+        seq: message.seq,
+        board_id: message.board_id,
+        sender: message.sender,
+        text,
+        mentions: message.mentions,
+        created_at: message.created_at,
+        truncated,
     }
 }
 
