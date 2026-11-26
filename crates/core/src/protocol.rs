@@ -31,8 +31,16 @@ pub enum StreamEvent {
         message: String,
     },
     Usage {
-        input_tokens: u64,
-        output_tokens: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_read_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_creation_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_tokens: Option<u64>,
     },
     ContextUsage {
         context_tokens: u64,

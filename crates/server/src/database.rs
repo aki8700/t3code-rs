@@ -27,7 +27,9 @@ pub async fn orchestration_stats(config: &ServerConfig) -> CoreResult<Vec<OrchMo
         let mut query = db.prepare(
             "SELECT provider, model, count(*), sum(status = ?1), sum(status = ?2),
                 avg(status = ?1), coalesce(avg(duration_ms), 0.0),
-                coalesce(sum(input_tokens), 0), coalesce(sum(output_tokens), 0)
+                coalesce(sum(input_tokens), 0), coalesce(sum(output_tokens), 0),
+                coalesce(sum(cache_read_tokens), 0), coalesce(sum(cache_creation_tokens), 0),
+                coalesce(sum(reasoning_tokens), 0)
              FROM runs WHERE ordinal <> 0
              GROUP BY provider, model ORDER BY count(*) DESC, provider, model",
         )?;
@@ -51,6 +53,9 @@ pub async fn orchestration_stats(config: &ServerConfig) -> CoreResult<Vec<OrchMo
                     avg_duration_ms: row.get(6)?,
                     total_input_tokens: row.get(7)?,
                     total_output_tokens: row.get(8)?,
+                    total_cache_read_tokens: row.get(9)?,
+                    total_cache_creation_tokens: row.get(10)?,
+                    total_reasoning_tokens: row.get(11)?,
                 })
             })?
             .collect()

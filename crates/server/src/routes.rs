@@ -452,10 +452,13 @@ async fn build_thread_context(
             let cost = crate::usage::estimate_tokens_cost(
                 run.provider,
                 &run.model,
-                run.input_tokens.unwrap_or(0),
+                run.input_tokens
+                    .unwrap_or(0)
+                    .saturating_sub(run.cache_read_tokens.unwrap_or(0))
+                    .saturating_sub(run.cache_creation_tokens.unwrap_or(0)),
                 run.output_tokens.unwrap_or(0),
-                0,
-                0,
+                run.cache_read_tokens.unwrap_or(0),
+                run.cache_creation_tokens.unwrap_or(0),
             );
             (run.id.to_string(), json!(cost))
         })

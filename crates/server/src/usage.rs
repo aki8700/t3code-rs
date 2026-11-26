@@ -118,22 +118,9 @@ struct CodexContextPayload {
 
 #[derive(Deserialize)]
 struct CodexContextInfo {
-    last_token_usage: Option<CodexLastUsage>,
+    last_token_usage: Option<RawTokens>,
+    total_token_usage: Option<RawTokens>,
     model_context_window: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct CodexLastUsage {
-    #[serde(default, deserialize_with = "token_count_or_zero")]
-    input_tokens: u64,
-    #[serde(default, deserialize_with = "token_count_or_zero")]
-    cached_input_tokens: u64,
-    #[serde(default, deserialize_with = "token_count_or_zero")]
-    cache_write_input_tokens: u64,
-    #[serde(default, deserialize_with = "token_count_or_zero")]
-    output_tokens: u64,
-    #[serde(default, deserialize_with = "token_count_or_zero")]
-    total_tokens: u64,
 }
 
 /// Codex context size is the latest request's `last_token_usage`, which Codex also rewrites
@@ -229,6 +216,114 @@ fn find_codex_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CodexSessionUsageSnapshot {
+    total: Option<RawTokens>,
+    last: Option<RawTokens>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CodexRunUsage {
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
+pub(crate) fn codex_session_usage_snapshot(
+    home: Option<&Path>,
+    session_id: &str,
+) -> Option<CodexSessionUsageSnapshot> {
+    let home = home?;
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return None;
+    }
+    let path = find_codex_session_file(home, session_id)?;
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(transcript_open_flags().ok()?);
+    }
+    let mut file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let mut reader = if metadata.len() > SESSION_TAIL_BYTES {
+        file.seek(SeekFrom::Start(metadata.len() - SESSION_TAIL_BYTES))
+            .ok()?;
+        let mut reader = BufReader::new(file);
+        let mut discard = Vec::new();
+        let _ = reader.read_until(b'\n', &mut discard);
+        reader
+    } else {
+        BufReader::new(file)
+    };
+    codex_rollout_usage_snapshot(&mut reader).ok().flatten()
+}
+
+pub(crate) fn codex_run_usage_since(
+    before: Option<CodexSessionUsageSnapshot>,
+    after: Option<CodexSessionUsageSnapshot>,
+) -> Option<CodexRunUsage> {
+    let after = after?;
+    let tokens = match (after.total, before.and_then(|snapshot| snapshot.total)) {
+        (Some(total), Some(before)) => total.delta(before),
+        (Some(total), None) => total,
+        (None, _) => after.last?,
+    };
+    if tokens.input_tokens == 0 && tokens.output_tokens == 0 {
+        return None;
+    }
+    Some(CodexRunUsage {
+        // Codex input already includes cached input and output already includes reasoning.
+        input_tokens: tokens.input_tokens,
+        cache_read_tokens: tokens.cached_input_tokens,
+        cache_creation_tokens: tokens.cache_write_input_tokens,
+        output_tokens: tokens.output_tokens,
+        reasoning_tokens: tokens.reasoning_output_tokens,
+    })
+}
+
+fn codex_rollout_usage_snapshot(
+    mut input: impl BufRead,
+) -> io::Result<Option<CodexSessionUsageSnapshot>> {
+    let mut latest = None;
+    let mut line = Vec::new();
+    while input
+        .by_ref()
+        .take((MAX_JSONL_LINE + 1) as u64)
+        .read_until(b'\n', &mut line)?
+        != 0
+    {
+        if line.len() > MAX_JSONL_LINE {
+            if line.last() != Some(&b'\n') {
+                input.skip_until(b'\n')?;
+            }
+        } else if line.windows(13).any(|window| window == b"\"token_count\"")
+            && let Ok(parsed) = serde_json::from_slice::<CodexContextLine>(&line)
+            && parsed.payload.kind.as_deref() == Some("token_count")
+            && let Some(info) = parsed.payload.info
+            && (info.total_token_usage.is_some() || info.last_token_usage.is_some())
+        {
+            latest = Some(CodexSessionUsageSnapshot {
+                total: info.total_token_usage,
+                last: info.last_token_usage,
+            });
+        }
+        line.clear();
+    }
+    Ok(latest)
 }
 
 pub(crate) async fn get(
@@ -538,6 +633,8 @@ struct RawTokens {
     cache_write_input_tokens: u64,
     #[serde(deserialize_with = "token_count_or_zero")]
     reasoning_output_tokens: u64,
+    #[serde(deserialize_with = "token_count_or_zero")]
+    total_tokens: u64,
 }
 
 fn token_count_or_zero<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
@@ -546,7 +643,10 @@ fn token_count_or_zero<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64
 
 impl RawTokens {
     fn delta(self, before: Self) -> Self {
-        if self.input_tokens < before.input_tokens || self.output_tokens < before.output_tokens {
+        if self.input_tokens < before.input_tokens
+            || self.output_tokens < before.output_tokens
+            || self.total_tokens < before.total_tokens
+        {
             return self;
         }
         Self {
@@ -561,6 +661,7 @@ impl RawTokens {
             reasoning_output_tokens: self
                 .reasoning_output_tokens
                 .saturating_sub(before.reasoning_output_tokens),
+            total_tokens: self.total_tokens.saturating_sub(before.total_tokens),
         }
     }
 
@@ -736,7 +837,8 @@ fn read_local_runs(path: &Path, since: DateTime<Utc>) -> CoreResult<Vec<LocalRun
         let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         db.busy_timeout(StdDuration::from_secs(5))?;
         let mut query = db.prepare(
-            "SELECT provider, thread_id, model, input_tokens, output_tokens, coalesce(completed_at, started_at)
+            "SELECT provider, thread_id, model, input_tokens, output_tokens, cache_read_tokens,
+                cache_creation_tokens, reasoning_tokens, coalesce(completed_at, started_at)
              FROM runs WHERE provider IN (?1, ?2, ?3)
              AND julianday(coalesce(completed_at, started_at)) >= julianday(?4)",
         )?;
@@ -754,13 +856,16 @@ fn read_local_runs(path: &Path, since: DateTime<Utc>) -> CoreResult<Vec<LocalRun
                         r#""open-code""# => ProviderId::OpenCode,
                         _ => ProviderId::Mock,
                     };
+                    let input_tokens = row.get::<_, Option<u64>>(3)?.unwrap_or_default();
+                    let cache_read_tokens = row.get::<_, Option<u64>>(5)?.unwrap_or_default();
+                    let cache_creation_tokens = row.get::<_, Option<u64>>(6)?.unwrap_or_default();
                     let at =
-                        row.get_ref(5)?
+                        row.get_ref(8)?
                             .as_str()?
                             .parse::<DateTime<Utc>>()
                             .map_err(|error| {
                                 rusqlite::Error::FromSqlConversionFailure(
-                                    5,
+                                    8,
                                     rusqlite::types::Type::Text,
                                     Box::new(error),
                                 )
@@ -772,9 +877,13 @@ fn read_local_runs(path: &Path, since: DateTime<Utc>) -> CoreResult<Vec<LocalRun
                             at,
                             model: row.get(2)?,
                             tokens: Tokens {
-                                input_tokens: row.get::<_, Option<u64>>(3)?.unwrap_or_default(),
+                                input_tokens: input_tokens
+                                    .saturating_sub(cache_read_tokens)
+                                    .saturating_sub(cache_creation_tokens),
                                 output_tokens: row.get::<_, Option<u64>>(4)?.unwrap_or_default(),
-                                ..Tokens::default()
+                                cache_read_tokens,
+                                cache_write_tokens: cache_creation_tokens,
+                                reasoning_tokens: row.get::<_, Option<u64>>(7)?.unwrap_or_default(),
                             },
                         },
                     })
@@ -1251,6 +1360,77 @@ invalid json
     }
 
     #[test]
+    fn codex_rollout_run_usage_uses_total_deltas_and_rebases_after_resume_reset() {
+        let home = Fixture::new();
+        let sessions = home.0.join(".codex/sessions/2026/11/26");
+        fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("rollout-2026-11-26T10-00-00-codex-meter-1.jsonl");
+        let line = |input, cached, written, output, reasoning, total| {
+            json!({
+                "timestamp": "2026-11-26T10:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": input,
+                            "cached_input_tokens": cached,
+                            "cache_write_input_tokens": written,
+                            "output_tokens": output,
+                            "reasoning_output_tokens": reasoning,
+                            "total_tokens": total
+                        },
+                        "last_token_usage": {
+                            "input_tokens": input,
+                            "cached_input_tokens": cached,
+                            "cache_write_input_tokens": written,
+                            "output_tokens": output,
+                            "reasoning_output_tokens": reasoning,
+                            "total_tokens": total
+                        }
+                    }
+                }
+            })
+            .to_string()
+        };
+        fs::write(&path, line(600, 500, 20, 80, 20, 700)).unwrap();
+        let before = codex_session_usage_snapshot(Some(&home.0), "codex-meter-1").unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                line(600, 500, 20, 80, 20, 700),
+                line(950, 750, 35, 120, 30, 1070)
+            ),
+        )
+        .unwrap();
+        let after = codex_session_usage_snapshot(Some(&home.0), "codex-meter-1").unwrap();
+        assert_eq!(
+            codex_run_usage_since(Some(before), Some(after)),
+            Some(CodexRunUsage {
+                input_tokens: 350,
+                cache_read_tokens: 250,
+                cache_creation_tokens: 15,
+                output_tokens: 40,
+                reasoning_tokens: 10,
+            })
+        );
+
+        fs::write(&path, line(120, 80, 5, 20, 8, 145)).unwrap();
+        let resumed = codex_session_usage_snapshot(Some(&home.0), "codex-meter-1").unwrap();
+        assert_eq!(
+            codex_run_usage_since(Some(after), Some(resumed)),
+            Some(CodexRunUsage {
+                input_tokens: 120,
+                cache_read_tokens: 80,
+                cache_creation_tokens: 5,
+                output_tokens: 20,
+                reasoning_tokens: 8,
+            })
+        );
+    }
+
+    #[test]
     fn hourly_and_daily_windows_include_empty_buckets() {
         let file = CachedFile {
             modified: None,
@@ -1370,6 +1550,9 @@ invalid json
                     provider_session_id: None,
                     input_tokens: Some(30),
                     output_tokens: Some(10),
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
+                    reasoning_tokens: None,
                     duration_ms: Some(1),
                     error_message: None,
                     started_at: now,
@@ -1536,6 +1719,9 @@ invalid json
                 provider_session_id: Some("codex-ctx-1".into()),
                 input_tokens: Some(1_148_907),
                 output_tokens: Some(3_658),
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
                 duration_ms: Some(1),
                 error_message: None,
                 started_at: now,

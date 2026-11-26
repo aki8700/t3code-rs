@@ -397,6 +397,9 @@ impl SqliteStore {
         for migration in [
             "ALTER TABLE projects ADD COLUMN instructions TEXT",
             "ALTER TABLE projects ADD COLUMN verify_command TEXT",
+            "ALTER TABLE runs ADD COLUMN cache_read_tokens INTEGER",
+            "ALTER TABLE runs ADD COLUMN cache_creation_tokens INTEGER",
+            "ALTER TABLE runs ADD COLUMN reasoning_tokens INTEGER",
         ] {
             if let Err(error) = transaction.execute_batch(migration)
                 && !matches!(
@@ -811,7 +814,8 @@ impl Store for SqliteStore {
             query_all(
                 connection,
                 "SELECT id, thread_id, ordinal, provider, model, effort, status, prompt, provider_session_id,
-                    input_tokens, output_tokens, duration_ms, error_message, started_at, completed_at
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, reasoning_tokens,
+                    duration_ms, error_message, started_at, completed_at
                  FROM runs WHERE thread_id = ?1 ORDER BY ordinal, started_at, id",
                 [thread_id.to_string()],
                 run_row,
@@ -827,6 +831,9 @@ impl Store for SqliteStore {
         provider_session_id: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_creation_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
         duration_ms: u64,
         error_message: Option<String>,
     ) -> CoreResult<()> {
@@ -835,11 +842,13 @@ impl Store for SqliteStore {
             require_change(
                 transaction.execute(
                     "UPDATE runs SET status = ?2, provider_session_id = COALESCE(?3, provider_session_id),
-                        input_tokens = ?4, output_tokens = ?5, duration_ms = ?6, error_message = ?7,
-                        completed_at = ?8 WHERE id = ?1",
+                        input_tokens = ?4, output_tokens = ?5, cache_read_tokens = ?6,
+                        cache_creation_tokens = ?7, reasoning_tokens = ?8, duration_ms = ?9,
+                        error_message = ?10, completed_at = ?11 WHERE id = ?1",
                     params![
                         run_id.to_string(), encode(&status)?, provider_session_id,
-                        input_tokens, output_tokens, duration_ms, error_message, timestamp(Utc::now()),
+                        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                        reasoning_tokens, duration_ms, error_message, timestamp(Utc::now()),
                     ],
                 ),
                 "run",
@@ -1045,7 +1054,9 @@ impl Store for SqliteStore {
                 connection,
                 "SELECT provider, model, count(*), sum(status = ?1), sum(status = ?2),
                     avg(status = ?1), coalesce(avg(duration_ms), 0.0),
-                    coalesce(sum(input_tokens), 0), coalesce(sum(output_tokens), 0)
+                    coalesce(sum(input_tokens), 0), coalesce(sum(output_tokens), 0),
+                    coalesce(sum(cache_read_tokens), 0), coalesce(sum(cache_creation_tokens), 0),
+                    coalesce(sum(reasoning_tokens), 0)
                  FROM runs GROUP BY provider, model ORDER BY count(*) DESC, provider, model",
                 params![encode(&RunStatus::Completed)?, encode(&RunStatus::Failed)?],
                 |row| {
@@ -1059,6 +1070,9 @@ impl Store for SqliteStore {
                         avg_duration_ms: row.get(6)?,
                         total_input_tokens: row.get(7)?,
                         total_output_tokens: row.get(8)?,
+                        total_cache_read_tokens: row.get(9)?,
+                        total_cache_creation_tokens: row.get(10)?,
+                        total_reasoning_tokens: row.get(11)?,
                     })
                 },
             )
@@ -1246,8 +1260,9 @@ fn insert_run(connection: &Connection, run: &Run) -> CoreResult<()> {
         .prepare_cached(
             "INSERT INTO runs (
             id, thread_id, ordinal, provider, model, effort, status, prompt, provider_session_id,
-            input_tokens, output_tokens, duration_ms, error_message, started_at, completed_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, reasoning_tokens,
+            duration_ms, error_message, started_at, completed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         )
         .map_err(storage_error)?
         .execute(params![
@@ -1262,6 +1277,9 @@ fn insert_run(connection: &Connection, run: &Run) -> CoreResult<()> {
             run.provider_session_id,
             run.input_tokens,
             run.output_tokens,
+            run.cache_read_tokens,
+            run.cache_creation_tokens,
+            run.reasoning_tokens,
             run.duration_ms,
             run.error_message,
             timestamp(run.started_at),
@@ -1487,10 +1505,13 @@ fn run_row(row: &Row<'_>) -> rusqlite::Result<Run> {
         provider_session_id: row.get(8)?,
         input_tokens: row.get(9)?,
         output_tokens: row.get(10)?,
-        duration_ms: row.get(11)?,
-        error_message: row.get(12)?,
-        started_at: parse(row, 13)?,
-        completed_at: parse_optional(row, 14)?,
+        cache_read_tokens: row.get(11)?,
+        cache_creation_tokens: row.get(12)?,
+        reasoning_tokens: row.get(13)?,
+        duration_ms: row.get(14)?,
+        error_message: row.get(15)?,
+        started_at: parse(row, 16)?,
+        completed_at: parse_optional(row, 17)?,
     })
 }
 
