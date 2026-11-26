@@ -14,6 +14,7 @@ mod resume;
 pub mod routes;
 mod settings;
 mod shell;
+mod sleep_guard;
 mod swarm;
 mod threads;
 mod usage;
@@ -138,6 +139,7 @@ pub async fn serve(config: ServerConfig) -> CoreResult<()> {
     let coordinator = state.coordinator.clone();
     let _daemon_lock = state.daemon_lock.clone();
     coordinator.resume_queued_runs().await?;
+    let _sleep_guard = sleep_guard::spawn(coordinator.clone());
     let (shutdown, stop) = watch::channel(false);
     let public = axum::serve(
         listener,
