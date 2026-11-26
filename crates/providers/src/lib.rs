@@ -88,6 +88,7 @@ fn test_request(provider: ProviderId) -> t3_core::traits::TurnRequest {
         run_id: uuid::Uuid::new_v4(),
         workspace_dir: std::env::temp_dir(),
         prompt: "hello".into(),
+        claude_slash_context: None,
         model_selection: t3_core::types::ModelSelection {
             provider,
             model: "test-model".into(),

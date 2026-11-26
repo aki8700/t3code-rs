@@ -37,6 +37,8 @@ pub struct TurnRequest {
     pub run_id: Uuid,
     pub workspace_dir: PathBuf,
     pub prompt: String,
+    /// When set, keep the Claude slash invocation in `prompt` as its own text block.
+    pub claude_slash_context: Option<String>,
     pub model_selection: ModelSelection,
     pub runtime_mode: RuntimeMode,
     pub interaction_mode: InteractionMode,

@@ -52,6 +52,8 @@ export const PROVIDER_COMMANDS = {
     { name: 'review', args: '[対象]', desc: 'コードレビューを実行', icon: 'diff' },
     { name: 'init', args: '', desc: 'CLAUDE.md を初期化・更新', icon: 'filePen' },
     { name: 'doctor', args: '', desc: '環境診断を実行', icon: 'info' },
+    { name: 'pstack:poteto-mode', args: '[タスク]', desc: 'Poteto モードで作業（pstack プラグインが必要）', icon: 'terminal', completeOnly: true },
+    { name: 'pstack:poteto-help', args: '[質問]', desc: 'pstack の使い方を質問（pstack プラグインが必要）', icon: 'info', completeOnly: true },
   ],
   codex: [
     { name: 'review', args: '[対象]', desc: 'コードレビューを実行', icon: 'diff' },
@@ -316,7 +318,7 @@ function commandItem(c, fuzzy) {
     kind: 'command',
     cmd: c,
     insert: c.needsArg || c.args ? `/${c.name} ` : `/${c.name}`,
-    execute: !c.needsArg,
+    execute: !c.needsArg && !c.completeOnly,
     label: `/${c.name}`,
     args: c.args || '',
     desc: c.desc,
