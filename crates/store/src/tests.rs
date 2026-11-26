@@ -54,6 +54,9 @@ fn run(thread_id: Uuid, ordinal: i64, provider: ProviderId) -> Run {
         provider_session_id: Some("resumed".into()),
         input_tokens: None,
         output_tokens: None,
+        cache_read_tokens: None,
+        cache_creation_tokens: None,
+        reasoning_tokens: None,
         duration_ms: None,
         error_message: None,
         started_at: Utc::now(),
@@ -217,10 +220,17 @@ async fn project_metadata_migrates_and_updates() {
     let legacy = Connection::open(&db_path).unwrap();
     legacy
         .execute_batch(
-            "CREATE TABLE projects (
-            id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, workspace_root TEXT NOT NULL,
-            default_model TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );",
+            r#"CREATE TABLE projects (
+                id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, workspace_root TEXT NOT NULL,
+                default_model TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE runs (
+            id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+            provider TEXT NOT NULL, model TEXT NOT NULL, effort TEXT, status TEXT NOT NULL,
+            prompt TEXT NOT NULL, provider_session_id TEXT, input_tokens INTEGER, output_tokens INTEGER,
+            duration_ms INTEGER, error_message TEXT, started_at TEXT NOT NULL, completed_at TEXT,
+            UNIQUE (id, thread_id)
+            );"#,
         )
         .unwrap();
     legacy
@@ -236,6 +246,25 @@ async fn project_metadata_migrates_and_updates() {
     let migrated = store.get_project(id).await.unwrap();
     assert_eq!(migrated.instructions, None);
     assert_eq!(migrated.verify_command, None);
+    let columns = {
+        let connection = Connection::open(&db_path).unwrap();
+        let mut statement = connection.prepare("PRAGMA table_info(runs)").unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    for column in [
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "reasoning_tokens",
+    ] {
+        assert!(
+            columns.iter().any(|name| name == column),
+            "missing {column}"
+        );
+    }
 
     let updated = store
         .update_project(
@@ -353,6 +382,9 @@ async fn entity_lifecycle_and_cascade() {
             Some("continued".into()),
             Some(13),
             Some(21),
+            Some(4),
+            Some(6),
+            Some(3),
             40,
             None,
         )
@@ -365,9 +397,12 @@ async fn entity_lifecycle_and_cascade() {
         (
             finished.input_tokens,
             finished.output_tokens,
+            finished.cache_read_tokens,
+            finished.cache_creation_tokens,
+            finished.reasoning_tokens,
             finished.duration_ms
         ),
-        (Some(13), Some(21), Some(40))
+        (Some(13), Some(21), Some(4), Some(6), Some(3), Some(40))
     );
     assert!(finished.completed_at.unwrap() >= finished.started_at);
     let saved = store
@@ -715,6 +750,9 @@ async fn orchestration_aggregates_by_provider_and_model() {
             None,
             Some(80),
             Some(15),
+            Some(8),
+            Some(2),
+            Some(3),
             100,
             None,
         )
@@ -727,6 +765,9 @@ async fn orchestration_aggregates_by_provider_and_model() {
             None,
             Some(7),
             None,
+            Some(1),
+            None,
+            Some(1),
             300,
             Some("failure".into()),
         )
@@ -748,6 +789,14 @@ async fn orchestration_aggregates_by_provider_and_model() {
     assert_eq!(
         (mock.total_input_tokens, mock.total_output_tokens),
         (87, 15)
+    );
+    assert_eq!(
+        (
+            mock.total_cache_read_tokens,
+            mock.total_cache_creation_tokens,
+            mock.total_reasoning_tokens
+        ),
+        (9, 2, 4)
     );
     assert!(rows.iter().any(|row| row.provider == ProviderId::OpenCode));
     assert!(rows.iter().any(|row| row.model == "other-model"));

@@ -457,6 +457,15 @@ fn import_runs(
             output_tokens: payload["outputTokens"]
                 .as_u64()
                 .or_else(|| payload["usage"]["outputTokens"].as_u64()),
+            cache_read_tokens: payload["cacheReadTokens"]
+                .as_u64()
+                .or_else(|| payload["usage"]["cacheReadTokens"].as_u64()),
+            cache_creation_tokens: payload["cacheCreationTokens"]
+                .as_u64()
+                .or_else(|| payload["usage"]["cacheCreationTokens"].as_u64()),
+            reasoning_tokens: payload["reasoningTokens"]
+                .as_u64()
+                .or_else(|| payload["usage"]["reasoningTokens"].as_u64()),
             duration_ms: payload["durationMs"].as_u64().or_else(|| {
                 completed_at.and_then(|end| (end - started_at).num_milliseconds().try_into().ok())
             }),
@@ -697,6 +706,9 @@ fn synthetic_run(
             provider_session_id: thread.provider_session_id.clone(),
             input_tokens: None,
             output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
             duration_ms: None,
             error_message: None,
             started_at: created_at,

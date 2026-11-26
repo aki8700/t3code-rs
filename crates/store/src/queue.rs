@@ -104,7 +104,8 @@ impl SqliteStore {
             query_all(
                 connection,
                 "SELECT id, thread_id, ordinal, provider, model, effort, status, prompt,
-                    provider_session_id, input_tokens, output_tokens, duration_ms, error_message,
+                    provider_session_id, input_tokens, output_tokens, cache_read_tokens,
+                    cache_creation_tokens, reasoning_tokens, duration_ms, error_message,
                     started_at, completed_at FROM runs
                  WHERE thread_id = ?1 AND status = ?2 ORDER BY ordinal",
                 params![thread_id.to_string(), encode(&RunStatus::Queued)?],
@@ -203,7 +204,8 @@ impl SqliteStore {
     pub async fn previous_run(&self, thread_id: Uuid, before: Uuid) -> CoreResult<Option<Run>> {
         self.with_reader(move |connection| connection.query_row(
             "SELECT id, thread_id, ordinal, provider, model, effort, status, prompt, provider_session_id,
-                input_tokens, output_tokens, duration_ms, error_message, started_at, completed_at
+                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, reasoning_tokens,
+                duration_ms, error_message, started_at, completed_at
              FROM runs WHERE thread_id = ?1 AND ordinal > 0
                 AND model != 'shell'
                 AND ordinal < (SELECT ordinal FROM runs WHERE id = ?2)
@@ -228,7 +230,8 @@ impl SqliteStore {
                     "UPDATE runs SET status = ?2, provider_session_id = ?3, started_at = ?4
                  WHERE id = ?1 AND status = ?5
                  RETURNING id, thread_id, ordinal, provider, model, effort, status, prompt,
-                    provider_session_id, input_tokens, output_tokens, duration_ms, error_message,
+                    provider_session_id, input_tokens, output_tokens, cache_read_tokens,
+                    cache_creation_tokens, reasoning_tokens, duration_ms, error_message,
                     started_at, completed_at",
                     params![
                         id.to_string(),
@@ -341,6 +344,9 @@ mod tests {
             provider_session_id: None,
             input_tokens: None,
             output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
             duration_ms: None,
             error_message: None,
             started_at: Utc::now(),

@@ -165,8 +165,11 @@ impl ProviderDriver for MockDriver {
         }
 
         emit(StreamEvent::Usage {
-            input_tokens: 1,
-            output_tokens: 1,
+            input_tokens: Some(1),
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            output_tokens: Some(1),
+            reasoning_tokens: None,
         });
         emit(StreamEvent::Completed {
             final_text: Some("done".into()),
@@ -236,8 +239,9 @@ mod tests {
         assert!(matches!(
             events[5],
             StreamEvent::Usage {
-                input_tokens: 1,
-                output_tokens: 1
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                ..
             }
         ));
         assert!(matches!(events[6], StreamEvent::Completed { .. }));

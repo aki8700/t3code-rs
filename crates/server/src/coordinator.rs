@@ -118,6 +118,9 @@ struct Outcome {
     session: Option<String>,
     input: Option<u64>,
     output: Option<u64>,
+    cache_read: Option<u64>,
+    cache_creation: Option<u64>,
+    reasoning_tokens: Option<u64>,
     has_context_usage: bool,
     had_file_changes: bool,
     had_side_effects: bool,
@@ -583,6 +586,9 @@ impl RunCoordinator {
                     provider_session_id: None,
                     input_tokens: None,
                     output_tokens: None,
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
+                    reasoning_tokens: None,
                     duration_ms: None,
                     error_message: None,
                     started_at: Utc::now(),
@@ -649,6 +655,9 @@ impl RunCoordinator {
                         .finish_run(
                             run_id,
                             RunStatus::Failed,
+                            None,
+                            None,
+                            None,
                             None,
                             None,
                             None,
@@ -943,6 +952,21 @@ impl RunCoordinator {
         let thread_id = thread.id;
         let run_id = request.run_id;
         let current_selection = request.model_selection.clone();
+        let codex_usage_before = if request.model_selection.provider == ProviderId::Codex {
+            if let Some(session_id) = request.resume_session_id.clone() {
+                let home = std::env::home_dir();
+                tokio::task::spawn_blocking(move || {
+                    crate::usage::codex_session_usage_snapshot(home.as_deref(), &session_id)
+                })
+                .await
+                .ok()
+                .flatten()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Capture pre-run Git tree snapshot outside the global `active` lock (Astra B1)
         // so slow git subprocesses never block unrelated threads.
@@ -975,6 +999,9 @@ impl RunCoordinator {
             session: request.resume_session_id.clone(),
             input: None,
             output: None,
+            cache_read: None,
+            cache_creation: None,
+            reasoning_tokens: None,
             has_context_usage: false,
             had_file_changes: false,
             had_side_effects: false,
@@ -1278,6 +1305,41 @@ impl RunCoordinator {
             status = RunStatus::Failed;
             error = Some(failure.to_string());
         }
+        if outcome.provider == ProviderId::Codex
+            && (outcome.input.is_none()
+                || outcome.output.is_none()
+                || (outcome.input == Some(0) && outcome.output == Some(0))
+                || outcome.cache_read.is_none()
+                || outcome.cache_creation.is_none()
+                || outcome.reasoning_tokens.is_none())
+            && let Some(session_id) = outcome.session.clone()
+        {
+            let home = std::env::home_dir();
+            let before = codex_usage_before;
+            let usage = tokio::task::spawn_blocking(move || {
+                let after =
+                    crate::usage::codex_session_usage_snapshot(home.as_deref(), &session_id);
+                crate::usage::codex_run_usage_since(before, after)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(usage) = usage {
+                if outcome.input.is_none() || outcome.input == Some(0) {
+                    outcome.input = Some(usage.input_tokens);
+                }
+                if outcome.output.is_none() || outcome.output == Some(0) {
+                    outcome.output = Some(usage.output_tokens);
+                }
+                outcome.cache_read.get_or_insert(usage.cache_read_tokens);
+                outcome
+                    .cache_creation
+                    .get_or_insert(usage.cache_creation_tokens);
+                outcome
+                    .reasoning_tokens
+                    .get_or_insert(usage.reasoning_tokens);
+            }
+        }
         let thread_status = match status {
             RunStatus::Completed => ThreadStatus::Completed,
             RunStatus::Cancelled => ThreadStatus::Interrupted,
@@ -1292,6 +1354,9 @@ impl RunCoordinator {
                 outcome.session.clone(),
                 outcome.input,
                 outcome.output,
+                outcome.cache_read,
+                outcome.cache_creation,
+                outcome.reasoning_tokens,
                 started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                 error.clone(),
             )
@@ -1576,13 +1641,23 @@ impl RunCoordinator {
             }
             StreamEvent::Usage {
                 input_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
                 output_tokens,
+                reasoning_tokens,
             } => {
-                out.input = Some(out.input.unwrap_or(0).saturating_add(input_tokens));
-                out.output = Some(out.output.unwrap_or(0).saturating_add(output_tokens));
+                accumulate_usage(&mut out.input, input_tokens);
+                accumulate_usage(&mut out.cache_read, cache_read_tokens);
+                accumulate_usage(&mut out.cache_creation, cache_creation_tokens);
+                accumulate_usage(&mut out.output, output_tokens);
+                accumulate_usage(&mut out.reasoning_tokens, reasoning_tokens);
                 // Codex turn usage sums every request in the turn; its context size comes from
                 // the session file instead (see `build_thread_context`).
                 if !out.has_context_usage && out.provider != ProviderId::Codex {
+                    let input_tokens = input_tokens.unwrap_or(0);
+                    let output_tokens = output_tokens.unwrap_or(0);
+                    let cache_read_tokens = cache_read_tokens.unwrap_or(0);
+                    let cache_write_tokens = cache_creation_tokens.unwrap_or(0);
                     let context_tokens = input_tokens.saturating_add(output_tokens);
                     if context_tokens > 0 {
                         let snap = LiveContextUsage {
@@ -1593,8 +1668,8 @@ impl RunCoordinator {
                             context_tokens,
                             input_tokens,
                             output_tokens,
-                            cache_read_tokens: 0,
-                            cache_write_tokens: 0,
+                            cache_read_tokens,
+                            cache_write_tokens,
                         };
                         self.record_live_context(thread_id, snap).await;
                         self.emit(WsServerMessage::RunUsageUpdated {
@@ -1603,8 +1678,8 @@ impl RunCoordinator {
                             context_tokens,
                             input_tokens,
                             output_tokens,
-                            cache_read_tokens: 0,
-                            cache_write_tokens: 0,
+                            cache_read_tokens,
+                            cache_write_tokens,
                         });
                     }
                 }
@@ -1802,6 +1877,12 @@ fn redact_and_tail(text: &str, max_chars: usize) -> String {
         joined
     } else {
         joined.chars().skip(count - max_chars).collect()
+    }
+}
+
+fn accumulate_usage(total: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *total = Some((*total).unwrap_or_default().saturating_add(value));
     }
 }
 

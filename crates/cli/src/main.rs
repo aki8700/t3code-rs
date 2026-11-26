@@ -671,7 +671,7 @@ fn local_store(data_dir: Option<PathBuf>) -> CliResult<SqliteStore> {
 
 fn print_stats(models: &[OrchModelStat], db: &DbStats) {
     println!(
-        "{:<14} {:<32} {:>7} {:>7} {:>7} {:>9} {:>10} {:>12} {:>12}",
+        "{:<14} {:<32} {:>7} {:>7} {:>7} {:>9} {:>10} {:>12} {:>12} {:>12} {:>12} {:>12}",
         "Provider",
         "Model",
         "Runs",
@@ -680,11 +680,14 @@ fn print_stats(models: &[OrchModelStat], db: &DbStats) {
         "Success",
         "Avg ms",
         "Input tokens",
-        "Out tokens"
+        "Out tokens",
+        "Cache read",
+        "Cache write",
+        "Reasoning"
     );
     for row in models {
         println!(
-            "{:<14} {:<32} {:>7} {:>7} {:>7} {:>8.1}% {:>10.0} {:>12} {:>12}",
+            "{:<14} {:<32} {:>7} {:>7} {:>7} {:>8.1}% {:>10.0} {:>12} {:>12} {:>12} {:>12} {:>12}",
             row.provider.as_str(),
             row.model,
             row.total_runs,
@@ -693,7 +696,10 @@ fn print_stats(models: &[OrchModelStat], db: &DbStats) {
             row.success_rate * 100.0,
             row.avg_duration_ms,
             row.total_input_tokens,
-            row.total_output_tokens
+            row.total_output_tokens,
+            row.total_cache_read_tokens,
+            row.total_cache_creation_tokens,
+            row.total_reasoning_tokens
         );
     }
     println!();

@@ -185,6 +185,9 @@ pub struct Run {
     pub provider_session_id: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
     pub duration_ms: Option<u64>,
     pub error_message: Option<String>,
     pub started_at: DateTime<Utc>,
@@ -302,6 +305,9 @@ pub struct OrchModelStat {
     pub avg_duration_ms: f64,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_cache_creation_tokens: u64,
+    pub total_reasoning_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

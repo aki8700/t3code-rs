@@ -605,6 +605,9 @@ async fn fork_handoff_keeps_recent_failures_and_redacts_credentials() {
                 provider_session_id: None,
                 input_tokens: None,
                 output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
                 duration_ms: None,
                 error_message: error,
                 started_at: now,
@@ -900,6 +903,9 @@ async fn mock_rest_mcp_worktrees_handoff_search_compression_and_attachments() {
     assert_eq!(models[0]["total_runs"], 3);
     assert_eq!(models[0]["completed_runs"], 3);
     assert_eq!(models[0]["total_output_tokens"], 3);
+    assert_eq!(models[0]["total_cache_read_tokens"], 0);
+    assert_eq!(models[0]["total_cache_creation_tokens"], 0);
+    assert_eq!(models[0]["total_reasoning_tokens"], 0);
 
     let meta = json_req(&app, Method::GET, "/api/meta", None).await;
     assert_eq!(meta["telemetry_enabled"], false);
@@ -1157,6 +1163,9 @@ async fn usage_route_buckets_both_sides_of_jst_midnight() {
                 provider_session_id: None,
                 input_tokens: Some(tokens),
                 output_tokens: Some(0),
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                reasoning_tokens: None,
                 duration_ms: Some(1),
                 error_message: None,
                 started_at: at,
@@ -2697,6 +2706,9 @@ async fn tier5_thread_export_markdown_headers_and_credential_redaction() {
             provider_session_id: None,
             input_tokens: Some(120),
             output_tokens: Some(45),
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
             duration_ms: Some(300),
             error_message: Some(format!("transient auth warning {ghp_secret}")),
             started_at: now,

@@ -15,7 +15,86 @@ pub(crate) struct Parser {
     claude_step_context: bool,
     codex_text: HashMap<String, String>,
     codex_calls: HashSet<String>,
+    claude_model_usage: HashMap<String, UsageFields>,
     opencode_step_finished: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct UsageFields {
+    input_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_creation_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+}
+
+impl UsageFields {
+    fn has_any(self) -> bool {
+        self.input_tokens.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cache_creation_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.reasoning_tokens.is_some()
+    }
+
+    fn add(self, other: Self) -> Self {
+        fn add_known(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+            match (left, right) {
+                (Some(left), Some(right)) => Some(left.saturating_add(right)),
+                (Some(value), None) | (None, Some(value)) => Some(value),
+                (None, None) => None,
+            }
+        }
+        Self {
+            input_tokens: add_known(self.input_tokens, other.input_tokens),
+            cache_read_tokens: add_known(self.cache_read_tokens, other.cache_read_tokens),
+            cache_creation_tokens: add_known(
+                self.cache_creation_tokens,
+                other.cache_creation_tokens,
+            ),
+            output_tokens: add_known(self.output_tokens, other.output_tokens),
+            reasoning_tokens: add_known(self.reasoning_tokens, other.reasoning_tokens),
+        }
+    }
+
+    fn delta(self, before: Self) -> Self {
+        fn delta_count(current: Option<u64>, previous: Option<u64>) -> Option<u64> {
+            current.map(|current| match previous {
+                Some(previous) if current >= previous => current - previous,
+                Some(_) | None => current,
+            })
+        }
+        Self {
+            input_tokens: delta_count(self.input_tokens, before.input_tokens),
+            cache_read_tokens: delta_count(self.cache_read_tokens, before.cache_read_tokens),
+            cache_creation_tokens: delta_count(
+                self.cache_creation_tokens,
+                before.cache_creation_tokens,
+            ),
+            output_tokens: delta_count(self.output_tokens, before.output_tokens),
+            reasoning_tokens: delta_count(self.reasoning_tokens, before.reasoning_tokens),
+        }
+    }
+
+    fn as_claude_value(self) -> Value {
+        let mut value = serde_json::Map::new();
+        if let Some(input) = self.input_tokens {
+            value.insert("input_tokens".into(), input.into());
+        }
+        if let Some(cache_read) = self.cache_read_tokens {
+            value.insert("cache_read_input_tokens".into(), cache_read.into());
+        }
+        if let Some(cache_creation) = self.cache_creation_tokens {
+            value.insert("cache_creation_input_tokens".into(), cache_creation.into());
+        }
+        if let Some(output) = self.output_tokens {
+            value.insert("output_tokens".into(), output.into());
+        }
+        if let Some(reasoning) = self.reasoning_tokens {
+            value.insert("reasoning_tokens".into(), reasoning.into());
+        }
+        Value::Object(value)
+    }
 }
 
 impl Parser {
@@ -28,6 +107,7 @@ impl Parser {
             claude_step_context: false,
             codex_text: HashMap::new(),
             codex_calls: HashSet::new(),
+            claude_model_usage: HashMap::new(),
             opencode_step_finished: false,
         }
     }
@@ -70,20 +150,52 @@ impl Parser {
             .then_some(StreamEvent::Completed { final_text: None })
     }
 
+    fn claude_model_usage_delta(&mut self, model_usage: Option<&Value>) -> Option<UsageFields> {
+        let models = model_usage?.as_object()?;
+        if models.is_empty() {
+            return None;
+        }
+        let mut usage = UsageFields::default();
+        for (model, entry) in models {
+            let Some(current) = claude_model_usage_fields(entry) else {
+                continue;
+            };
+            let previous = self
+                .claude_model_usage
+                .insert(model.clone(), current)
+                .unwrap_or_default();
+            usage = usage.add(current.delta(previous));
+        }
+        usage.has_any().then_some(usage)
+    }
+
     fn claude(&mut self, event: &Value, out: &mut Vec<StreamEvent>) {
         match kind(event) {
             "stream_event" => self.claude_partial(&event["event"], out),
             "control_request" => claude_control_request(event, out),
             "assistant" | "user" => self.claude_message(event, out),
             "result" => {
-                let usage = event
+                let direct_usage = event
                     .get("usage")
-                    .or(event.get("stats"))
-                    .unwrap_or(&Value::Null);
-                if !self.claude_step_context && has_cache_tokens(usage) {
-                    push_context_usage(ProviderId::Claude, usage, out);
+                    .filter(|usage| usage_fields(usage).is_some())
+                    .or_else(|| {
+                        event
+                            .get("stats")
+                            .filter(|usage| usage_fields(usage).is_some())
+                    });
+                let model_usage = self.claude_model_usage_delta(event.get("modelUsage"));
+                let usage = direct_usage.and_then(usage_fields).or(model_usage);
+                let usage_value = usage.map(UsageFields::as_claude_value);
+                if !self.claude_step_context
+                    && let Some(value) = usage_value.as_ref()
+                    && has_cache_tokens(value)
+                {
+                    push_context_usage(ProviderId::Claude, value, out);
                 }
-                stream_json_result(event, out);
+                if let Some(usage) = usage {
+                    push_usage_fields(out, ProviderId::Claude, usage);
+                }
+                stream_json_result_without_usage(event, out);
             }
             "error" | "failed" | "rate_limit" | "rate_limited" => out.push(error_event(event)),
             "rate_limit_event"
@@ -162,7 +274,7 @@ impl Parser {
             "turn.completed" => {
                 // This usage sums every request in the turn, so it is not the context size.
                 // The server reads that from the session file's latest `token_count` instead.
-                push_usage(out, &event["usage"]);
+                push_usage(out, ProviderId::Codex, &event["usage"]);
                 out.push(StreamEvent::Completed { final_text: None });
             }
             "error"
@@ -245,7 +357,7 @@ impl Parser {
                     if has_cache_tokens(usage) {
                         push_context_usage(ProviderId::Antigravity, usage, out);
                     }
-                    push_usage(out, usage);
+                    push_usage(out, ProviderId::Antigravity, usage);
                     let status = string(res, "status").unwrap_or("");
                     let failed = status.eq_ignore_ascii_case("error")
                         || status.eq_ignore_ascii_case("failed")
@@ -287,7 +399,9 @@ impl Parser {
             "tool_result" | "tool_response" => push_item(out, TurnItemKind::ToolResult, event),
             "command_execution" => push_item(out, TurnItemKind::CommandExecution, event),
             "file_change" => push_item(out, TurnItemKind::FileChange, event),
-            "result" | "completed" | "done" => stream_json_result(event, out),
+            "result" | "completed" | "done" => {
+                stream_json_result(ProviderId::Antigravity, event, out)
+            }
             "error" | "failed" | "rate_limit" | "rate_limited" => out.push(error_event(event)),
             _ => {}
         }
@@ -318,7 +432,7 @@ impl Parser {
                 if has_cache_tokens(tokens) {
                     push_context_usage(ProviderId::OpenCode, tokens, out);
                 }
-                push_usage(out, tokens);
+                push_usage(out, ProviderId::OpenCode, tokens);
             }
             "error" | "failed" | "rate_limit" | "rate_limited" => out.push(error_event(event)),
             _ => {}
@@ -417,6 +531,70 @@ fn token_counts(value: &Value) -> Option<(u64, u64)> {
     (input.is_some() || output.is_some()).then_some((input.unwrap_or(0), output.unwrap_or(0)))
 }
 
+fn count(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_u64))
+}
+
+fn usage_fields(value: &Value) -> Option<UsageFields> {
+    let (cache_read_tokens, cache_creation_tokens) = cache_counts(value);
+    let reasoning_tokens = count(
+        value,
+        &[
+            "reasoning_tokens",
+            "reasoning_output_tokens",
+            "thinking_tokens",
+        ],
+    )
+    .or_else(|| {
+        value
+            .pointer("/output_tokens_details/thinking_tokens")
+            .and_then(Value::as_u64)
+    })
+    .or_else(|| {
+        value
+            .pointer("/outputTokensDetails/thinkingTokens")
+            .and_then(Value::as_u64)
+    });
+    let fields = UsageFields {
+        input_tokens: count(
+            value,
+            &["input_tokens", "input", "inputTokens", "promptTokenCount"],
+        ),
+        cache_read_tokens,
+        cache_creation_tokens,
+        output_tokens: count(
+            value,
+            &[
+                "output_tokens",
+                "output",
+                "outputTokens",
+                "candidatesTokenCount",
+            ],
+        ),
+        reasoning_tokens,
+    };
+    fields.has_any().then_some(fields)
+}
+
+fn claude_model_usage_fields(value: &Value) -> Option<UsageFields> {
+    let (cache_read_tokens, cache_creation_tokens) = cache_counts(value);
+    let fields = UsageFields {
+        input_tokens: count(value, &["inputTokens"]),
+        cache_read_tokens,
+        cache_creation_tokens,
+        output_tokens: count(value, &["outputTokens"]),
+        reasoning_tokens: count(value, &["reasoningTokens", "reasoningOutputTokens"]).or_else(
+            || {
+                value
+                    .pointer("/outputTokensDetails/thinkingTokens")
+                    .and_then(Value::as_u64)
+            },
+        ),
+    };
+    fields.has_any().then_some(fields)
+}
+
 fn cache_counts(value: &Value) -> (Option<u64>, Option<u64>) {
     let read = [
         "cache_read_input_tokens",
@@ -484,23 +662,52 @@ fn push_context_usage(provider: ProviderId, value: &Value, out: &mut Vec<StreamE
     true
 }
 
-fn push_usage(out: &mut Vec<StreamEvent>, value: &Value) {
-    if let Some((input_tokens, output_tokens)) = token_counts(value) {
-        out.push(StreamEvent::Usage {
-            input_tokens,
-            output_tokens,
-        });
+fn push_usage(out: &mut Vec<StreamEvent>, provider: ProviderId, value: &Value) {
+    if let Some(fields) = usage_fields(value) {
+        push_usage_fields(out, provider, fields);
     }
 }
 
-fn stream_json_result(event: &Value, out: &mut Vec<StreamEvent>) {
+fn push_usage_fields(out: &mut Vec<StreamEvent>, provider: ProviderId, fields: UsageFields) {
+    if !fields.has_any() {
+        return;
+    }
+    let input_tokens = fields.input_tokens.map(|input| {
+        if provider == ProviderId::Claude {
+            input
+                .saturating_add(fields.cache_read_tokens.unwrap_or(0))
+                .saturating_add(fields.cache_creation_tokens.unwrap_or(0))
+        } else {
+            input
+        }
+    });
+    out.push(StreamEvent::Usage {
+        input_tokens,
+        cache_read_tokens: fields.cache_read_tokens,
+        cache_creation_tokens: fields.cache_creation_tokens,
+        output_tokens: fields.output_tokens,
+        reasoning_tokens: fields.reasoning_tokens,
+    });
+}
+
+fn stream_json_result(provider: ProviderId, event: &Value, out: &mut Vec<StreamEvent>) {
     push_usage(
         out,
+        provider,
         event
             .get("usage")
-            .or(event.get("stats"))
+            .filter(|usage| usage_fields(usage).is_some())
+            .or_else(|| event.get("stats"))
             .unwrap_or(&Value::Null),
     );
+    complete_json_result(event, out);
+}
+
+fn stream_json_result_without_usage(event: &Value, out: &mut Vec<StreamEvent>) {
+    complete_json_result(event, out);
+}
+
+fn complete_json_result(event: &Value, out: &mut Vec<StreamEvent>) {
     let failed = ["subtype", "status"].into_iter().any(|field| {
         string(event, field).is_some_and(|name| {
             name.starts_with("error") || matches!(name, "failed" | "rate_limited")
@@ -852,9 +1059,20 @@ mod tests {
         // context window and must only count as run usage.
         let events = fixture(
             ProviderId::Codex,
-            r#"{"type":"turn.completed","usage":{"input_tokens":1148907,"cached_input_tokens":1096832,"output_tokens":3658}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":1148907,"cached_input_tokens":1096832,"cache_write_input_tokens":400,"output_tokens":3658,"reasoning_output_tokens":250}}"#,
         );
         assert_eq!(event_types(&events), ["usage", "completed"]);
+        assert_eq!(
+            events[0],
+            json!({
+                "type":"usage",
+                "input_tokens":1148907,
+                "cache_read_tokens":1096832,
+                "cache_creation_tokens":400,
+                "output_tokens":3658,
+                "reasoning_tokens":250
+            })
+        );
     }
 
     #[test]
@@ -905,7 +1123,7 @@ mod tests {
         let lines = concat!(
             r#"{"type":"assistant","session_id":"claude-ctx","message":{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":120,"cache_read_input_tokens":40000,"cache_creation_input_tokens":1500,"output_tokens":380}}}"#,
             "\n",
-            r#"{"type":"result","subtype":"success","result":"hi","usage":{"input_tokens":120,"cache_read_input_tokens":40000,"cache_creation_input_tokens":1500,"output_tokens":380}}"#,
+            r#"{"type":"result","subtype":"success","result":"hi","usage":{"input_tokens":120,"cache_read_input_tokens":40000,"cache_creation_input_tokens":1500,"output_tokens":380,"output_tokens_details":{"thinking_tokens":100}}}"#,
         );
         let events = fixture(ProviderId::Claude, lines);
         assert_eq!(
@@ -928,6 +1146,69 @@ mod tests {
                 "cache_read_tokens": 40000,
                 "cache_write_tokens": 1500
             })
+        );
+        assert_eq!(
+            events[3],
+            json!({
+                "type": "usage",
+                "input_tokens": 41620,
+                "cache_read_tokens": 40000,
+                "cache_creation_tokens": 1500,
+                "output_tokens": 380,
+                "reasoning_tokens": 100
+            })
+        );
+    }
+
+    #[test]
+    fn claude_result_model_usage_emits_full_run_usage() {
+        let events = fixture(
+            ProviderId::Claude,
+            r#"{"type":"result","subtype":"success","result":"done","modelUsage":{"claude-sonnet-5-5":{"inputTokens":120,"cacheReadInputTokens":40000,"cacheCreationInputTokens":1500,"outputTokens":380}}}"#,
+        );
+        assert_eq!(
+            events,
+            [
+                json!({
+                    "type":"context_usage",
+                    "context_tokens":42000,
+                    "input_tokens":120,
+                    "output_tokens":380,
+                    "cache_read_tokens":40000,
+                    "cache_write_tokens":1500
+                }),
+                json!({
+                    "type":"usage",
+                    "input_tokens":41620,
+                    "cache_read_tokens":40000,
+                    "cache_creation_tokens":1500,
+                    "output_tokens":380
+                }),
+                json!({"type":"completed","final_text":"done"})
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_model_usage_growth_counts_steered_segments_once() {
+        let events = fixture(
+            ProviderId::Claude,
+            concat!(
+                r#"{"type":"result","subtype":"success","modelUsage":{"claude-sonnet-5-5":{"inputTokens":10,"outputTokens":2}}}"#,
+                "\n",
+                r#"{"type":"result","subtype":"success","modelUsage":{"claude-sonnet-5-5":{"inputTokens":30,"outputTokens":8}}}"#,
+            ),
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "usage")
+                .map(|event| (
+                    event["input_tokens"].as_u64(),
+                    event["output_tokens"].as_u64()
+                ))
+                .collect::<Vec<_>>(),
+            [(Some(10), Some(2)), (Some(20), Some(6))]
         );
     }
 

@@ -943,8 +943,9 @@ printf '%s\n' \
         assert!(matches!(
             receive(&mut rx).await,
             Some(StreamEvent::Usage {
-                input_tokens: 5,
-                output_tokens: 2
+                input_tokens: Some(5),
+                output_tokens: Some(2),
+                ..
             })
         ));
         assert!(
@@ -977,8 +978,9 @@ printf '%s\n' '{"type":"thread.started","thread_id":"fake-codex"}' '{"type":"tur
         assert!(matches!(
             receive(&mut rx).await,
             Some(StreamEvent::Usage {
-                input_tokens: 1,
-                output_tokens: 2
+                input_tokens: Some(1),
+                output_tokens: Some(2),
+                ..
             })
         ));
         assert!(matches!(
@@ -1012,8 +1014,9 @@ printf '%s\n' '{"type":"step_start","sessionID":"fake-opencode"}' '{"type":"step
         assert!(matches!(
             receive(&mut rx).await,
             Some(StreamEvent::Usage {
-                input_tokens: 3,
-                output_tokens: 4
+                input_tokens: Some(3),
+                output_tokens: Some(4),
+                ..
             })
         ));
         assert!(matches!(

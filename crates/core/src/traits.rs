@@ -127,6 +127,9 @@ pub trait Store: Send + Sync {
         provider_session_id: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_creation_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
         duration_ms: u64,
         error_message: Option<String>,
     ) -> CoreResult<()>;
