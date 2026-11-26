@@ -94,7 +94,6 @@ signature の計算で thread id を除き、末尾が ` ... ok` の行を捨て
 | 差分 | 内容 | 見送った理由 |
 | --- | --- | --- |
 | 完了と follow-up の登録が別 transaction | `finish_run` の後、`enqueue_with_meta` の前に落ちると、verify の修正 run や fallback run が失われる | 窓が短い。直すには `store/src/lib.rs` の `finish_run` を含めて 1 transaction にする（schema 変更は不要） |
-| 正常終了の再起動は再開しない | SIGTERM では `interrupt_all` が run を `Cancelled` にするため、再開の対象は異常終了だけ（`lib.rs` と `coordinator.rs` の読解による。実機では未確認） | 利用者の interrupt と区別する仕様判断が要る |
 | 出力まで見る stuck 判定、交互反復 | OpenHands の action-observation / alternating に相当 | `crates/providers` の担当範囲で、誤検知の計測が要る |
 | 停止前の nudge | OpenHands は同じ error の反復で 1 回指示を挟む | verify loop は `DEAD ENDS` を毎回渡しており効果が重なる |
 | 費用の予算 | SWE-agent は `cost_limit` で打ち切る | 試行回数の上限があり、費用の計上は provider ごとに欠ける |
