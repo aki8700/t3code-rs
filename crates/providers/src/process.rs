@@ -18,7 +18,7 @@ use std::{
 use t3_core::{
     protocol::StreamEvent,
     traits::{CoreError, CoreResult},
-    types::{PendingResponse, ProviderId},
+    types::{PendingResponse, ProviderId, TurnItemKind},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -534,6 +534,22 @@ async fn run_turn_with_idle_timeout(
 
     let terminal = match terminal {
         ReadOutcome::Terminal(terminal) => terminal,
+        // The turn already finished; t3d only cleaned up a process that lingered,
+        // so the SIGKILL exit status must not turn the result into a failure.
+        ReadOutcome::StoppedAfterCompleted(completed) if !interrupted.load(Ordering::Acquire) => {
+            let notice = format!(
+                "t3d stopped the provider process: it stayed alive with no stdout output for {}s after the turn result",
+                idle_timeout.as_secs()
+            );
+            let _ = tx.send(StreamEvent::Item {
+                kind: TurnItemKind::SystemNotice,
+                summary: Some(notice.clone()),
+                payload: json!({ "message": notice }),
+            });
+            let _ = tx.send(completed);
+            return Ok(());
+        }
+        ReadOutcome::StoppedAfterCompleted(completed) => Some(completed),
         ReadOutcome::Stopped(message) => {
             let _ = tx.send(StreamEvent::Failed {
                 message: message.into(),
@@ -630,6 +646,8 @@ fn redact_value(value: &mut serde_json::Value, secret: &str) {
 
 enum ReadOutcome {
     Terminal(Option<StreamEvent>),
+    /// t3d stopped a process that had already sent `Completed`.
+    StoppedAfterCompleted(StreamEvent),
     Stopped(Cow<'static, str>),
 }
 
@@ -667,9 +685,9 @@ async fn read_events(
                 continue;
             }
             Err(_) => {
-                let _ = stop_process.send(());
-                if terminal.is_some() {
-                    return Ok(ReadOutcome::Terminal(terminal));
+                let stopped = stop_process.send(()).is_ok();
+                if let Some(event) = terminal {
+                    return Ok(after_stop(stopped, event));
                 }
                 return Ok(ReadOutcome::Stopped(match in_flight.oldest() {
                     Some(tool) => format!(
@@ -781,16 +799,25 @@ async fn read_events(
         .await
         .is_err()
         && stop_process.send(()).is_ok()
-        && !matches!(
-            terminal,
-            Some(StreamEvent::Failed { .. } | StreamEvent::RateLimited { .. })
-        )
     {
-        return Ok(ReadOutcome::Stopped(
-            "provider stdout closed but the process did not exit before the idle timeout".into(),
-        ));
+        return Ok(match terminal {
+            Some(event) => after_stop(true, event),
+            None => ReadOutcome::Stopped(
+                "provider stdout closed but the process did not exit before the idle timeout"
+                    .into(),
+            ),
+        });
     }
     Ok(ReadOutcome::Terminal(terminal.or_else(|| parser.finish())))
+}
+
+/// Outcome when the provider already emitted a terminal event and t3d may have
+/// had to stop the process afterwards.
+fn after_stop(stopped: bool, terminal: StreamEvent) -> ReadOutcome {
+    match terminal {
+        StreamEvent::Completed { .. } if stopped => ReadOutcome::StoppedAfterCompleted(terminal),
+        terminal => ReadOutcome::Terminal(Some(terminal)),
+    }
 }
 
 async fn read_tail(mut input: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
@@ -1633,6 +1660,92 @@ printf '%s\n' '{"event":"step_update","step_update":{"step_index":2,"step_type":
         .await;
         assert!(
             matches!(events.last(), Some(StreamEvent::Completed { final_text: Some(text) }) if text == "done"),
+            "{events:?}"
+        );
+    }
+
+    async fn run_claude_fixture(script: &str, idle: Duration) -> Vec<StreamEvent> {
+        let fixture = Fixture::new(script);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_turn_with_idle_timeout(
+                &ActiveRunMap::default(),
+                Uuid::new_v4(),
+                ProviderId::Claude,
+                command(&fixture.binary()),
+                Input::None,
+                None,
+                tx,
+                idle,
+            ),
+        )
+        .await
+        .expect("idle timeout must end the run")
+        .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = receive(&mut rx).await {
+            events.push(event);
+        }
+        events
+    }
+
+    fn assert_completed_after_t3d_stop(events: &[StreamEvent]) {
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Completed { final_text: Some(text) }) if text == "ok"),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::Item { kind: TurnItemKind::SystemNotice, summary: Some(summary), .. }
+                    if summary.contains("t3d stopped")
+            )),
+            "{events:?}"
+        );
+    }
+
+    // A CLI can emit its turn result and then stay alive (e.g. waiting on a
+    // background task). Killing it is t3d's cleanup, not a provider failure.
+    #[tokio::test]
+    async fn completed_result_survives_idle_kill() {
+        let events = run_claude_fixture(
+            r#"
+printf '%s\n' '{"type":"result","subtype":"success","result":"ok"}'
+exec /bin/sleep 60
+"#,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_completed_after_t3d_stop(&events);
+    }
+
+    #[tokio::test]
+    async fn completed_result_survives_kill_after_stdout_closes() {
+        let events = run_claude_fixture(
+            r#"
+printf '%s\n' '{"type":"result","subtype":"success","result":"ok"}'
+exec 1>&-
+exec /bin/sleep 60
+"#,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_completed_after_t3d_stop(&events);
+    }
+
+    #[tokio::test]
+    async fn provider_exit_failure_after_result_still_fails() {
+        let events = run_claude_fixture(
+            r#"
+printf '%s\n' '{"type":"result","subtype":"success","result":"ok"}'
+exit 3
+"#,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Failed { message, .. }) if message.contains("exit status: 3")),
             "{events:?}"
         );
     }
