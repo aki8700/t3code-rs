@@ -4779,6 +4779,13 @@ function notifyUser(title, body, threadId) {
   }
 }
 
+// Run outcomes raise OS notifications for top-level threads only; swarm workers, delegated tasks and forks stay in-app.
+async function notifyRunOutcome(title, threadId) {
+  // a just-spawned child may not be in the thread list yet
+  const t = threadById(threadId) || (await api(`/api/threads/${threadId}`).catch(() => null))?.thread;
+  if (!t?.parent_thread_id) notifyUser(title, cleanTitle(t?.title) || threadId, threadId);
+}
+
 function handleWs(m) {
   const cur = S.threadId;
   switch (m.type) {
@@ -4790,7 +4797,7 @@ function handleWs(m) {
       const prev = threadById(m.thread_id)?.status;
       setThreadStatus(m.thread_id, m.status);
       syncSubscriptions(); renderSidebarSoon();
-      if (m.status === 'rate-limited') { loadUsageLimitsSoon(); notifyUser('制限中', cleanTitle(threadById(m.thread_id)?.title) || m.thread_id, m.thread_id); }
+      if (m.status === 'rate-limited') { loadUsageLimitsSoon(); notifyRunOutcome('制限中', m.thread_id); }
       if (m.thread_id === cur) {
         renderHeader(); renderComposer(); renderLive();
         if (isBusy(prev) && !isBusy(m.status)) { loadDetailSoon(); refreshDiffSoon(); }
@@ -4818,7 +4825,7 @@ function handleWs(m) {
       if (TERMINAL_RUN.has(m.status)) {
         S.live.delete(m.thread_id);
         S.liveUsage.delete(m.thread_id);
-        if (m.status === 'completed' || m.status === 'failed') notifyUser(m.status === 'completed' ? '実行完了' : '実行失敗', cleanTitle(threadById(m.thread_id)?.title) || m.thread_id, m.thread_id);
+        if (m.status === 'completed' || m.status === 'failed') notifyRunOutcome(m.status === 'completed' ? '実行完了' : '実行失敗', m.thread_id);
         if (m.status === 'failed' && m.error) toast(`実行失敗: ${m.error}`, 'err', 6000);
         if (m.thread_id === cur) { loadDetailSoon(); refreshDiffSoon(); loadSwarm(cur); }
         loadThreadsSoon(); loadDbStatsSoon(); loadUsageSoon(); loadUsageLimitsSoon();

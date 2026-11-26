@@ -568,6 +568,13 @@ async fn rest_delegation_respects_runtime_and_plan_permissions() {
     .await;
     assert_eq!(child["thread"]["runtime_mode"], "approval-required");
     assert_eq!(child["thread"]["interaction_mode"], "plan");
+    // the web client suppresses OS notifications for threads that list a parent
+    let listed = json_req(&app, Method::GET, "/api/threads", None).await;
+    for thread in listed.as_array().unwrap() {
+        let is_child = thread["id"] == child["thread"]["id"];
+        let expected = if is_child { json!(id) } else { Value::Null };
+        assert_eq!(thread["parent_thread_id"], expected);
+    }
     wait_for_thread(
         &mut events,
         serde_json::from_value(child["thread"]["id"].clone()).unwrap(),
