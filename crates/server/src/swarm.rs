@@ -70,7 +70,11 @@ impl SwarmTurn {
                 writeln!(instructions, "{marker} {example}").expect("write to String");
             }
             instructions.push_str("Members: ");
-            for member in &board.members {
+            for member in board
+                .members
+                .iter()
+                .filter(|member| member.state != "killed")
+            {
                 write!(instructions, "{} ({}), ", member.name, member.state)
                     .expect("write to String");
             }
@@ -861,6 +865,57 @@ mod tests {
         let next_turn =
             SwarmTurn::prepare(&board, thread_id, ProviderId::Codex, &mut next_prompt).unwrap();
         assert_eq!(turn.marker, next_turn.marker);
+    }
+
+    #[test]
+    fn killed_history_does_not_change_live_only_prompt() {
+        let board_id = Uuid::new_v4();
+        let coordinator_id = Uuid::new_v4();
+        let mut live = member("coordinator", "coordinator", "working");
+        live.thread_id = coordinator_id;
+        let reviewer = member("reviewer", "worker", "working");
+        let old_history = (0..64)
+            .map(|i| member(&format!("old{i}"), "worker", "killed"))
+            .collect::<Vec<_>>();
+        let short_board = SwarmBoardSnapshot {
+            board_id,
+            coordinator_thread_id: coordinator_id,
+            title: "long lived board".into(),
+            members: vec![live.clone(), reviewer.clone()],
+            messages: vec![message(1, "old0", Utc::now())],
+            head_seq: 1,
+        };
+        let mut long_board = short_board.clone();
+        long_board.members.extend(old_history);
+        long_board
+            .messages
+            .extend((2..102).map(|seq| message(seq, "old0", Utc::now())));
+        long_board.head_seq = 101;
+
+        let mut short_prompt = "same user request".to_owned();
+        let mut long_prompt = short_prompt.clone();
+        SwarmTurn::prepare(
+            &short_board,
+            coordinator_id,
+            ProviderId::Codex,
+            &mut short_prompt,
+        )
+        .unwrap();
+        SwarmTurn::prepare(
+            &long_board,
+            coordinator_id,
+            ProviderId::Codex,
+            &mut long_prompt,
+        )
+        .unwrap();
+
+        assert_eq!(short_prompt.as_bytes(), long_prompt.as_bytes());
+        assert!(long_prompt.contains("coordinator (working), reviewer (working)"));
+        assert!(!long_prompt.contains("old0 (killed)"));
+        // The explicit status board remains complete even though prompt roster context is live-only.
+        assert_eq!(long_board.members.len(), 66);
+        assert_eq!(long_board.messages.len(), 101);
+        assert_eq!(long_board.head_seq, 101);
     }
 
     fn member(name: &str, role: &str, state: &str) -> SwarmMember {
