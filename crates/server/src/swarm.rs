@@ -47,13 +47,12 @@ impl SwarmTurn {
         let member = live_member(board, thread_id)?;
         let coordinator = member.role == "coordinator";
         let report = format!(
-            "Work on the assigned brief. When finished or blocked, call swarm_post_message once with text starting with @coordinator [done] followed by result:, verified: (commands run and their outcome, or not verified), blockers: and files:. Send one post of at most {MAX_MESSAGE_BYTES} bytes; write longer details to a file and list its path. End your turn after posting. Reply to subsequent updates only when you have new information."
+            "Work on the assigned brief. When finished or blocked, call swarm_post_message once with text starting with @coordinator [done] followed by result:, verified: (commands run and their outcome, or not verified), blockers: and files:. Send one post within the limit of {MAX_MESSAGE_BYTES} bytes (about 1300 Japanese characters); write longer details to a file and list its path. End your turn after posting. Reply to subsequent updates only when you have new information."
         );
-        let instructions = if coordinator {
-            "Coordinate work using swarm_status, swarm_add_worker, swarm_post_message, swarm_read_board and swarm_kill_worker. Run independent slices in parallel with separate worker contexts. Each brief states the objective, the output expected, boundaries (files or scope the worker owns), an effort budget and a stop condition. When a worker ends without reporting or repeats a result, change the brief or model, or stop it, instead of resending the same request. Keep passed work frozen, and escalate no-undo merges (migrations/secrets/deploy) to the human. Mentions wake the named member. After assigning work, end your turn and wait for results addressed to @coordinator."
-        } else {
-            &report
-        };
+        let lead = format!(
+            "Coordinate work using swarm_status, swarm_add_worker, swarm_post_message, swarm_read_board and swarm_kill_worker. Run independent slices in parallel with separate worker contexts. Each brief states the objective, the output expected, boundaries (files or scope the worker owns), an effort budget and a stop condition. When a worker ends without reporting or repeats a result, change the brief or model, or stop it, instead of resending the same request. Keep passed work frozen, and escalate no-undo merges (migrations/secrets/deploy) to the human. Mentions wake the named member. After assigning work, end your turn and wait for results addressed to @coordinator. Each brief and post has a limit of {MAX_MESSAGE_BYTES} bytes (about 1300 Japanese characters); put a longer brief in a file and send its path."
+        );
+        let instructions = if coordinator { lead } else { report };
         let marker =
             (provider != ProviderId::Mock).then(|| format!("T3_SWARM_ACTION {}", board.board_id));
         let mut instructions = format!(
@@ -947,6 +946,11 @@ mod tests {
         }
         assert!(report.contains("one post"), "{report}");
         assert!(report.contains(&MAX_MESSAGE_BYTES.to_string()), "{report}");
+        // Briefs and posts share the limit, and Japanese text reaches it at a third of the count.
+        for prompt in [&lead, &report] {
+            assert!(prompt.contains("4096 bytes"), "{prompt}");
+            assert!(prompt.contains("1300 Japanese characters"), "{prompt}");
+        }
     }
 
     #[test]
