@@ -658,8 +658,14 @@ async fn read_events(
             Some(_) => idle_timeout * IN_FLIGHT_TOOL_IDLE_FACTOR,
             None => idle_timeout,
         };
+        // A CLI waiting for the user's approval is silent by design, so an unanswered
+        // request (or one answered during this wait) re-arms the idle limit.
+        let awaiting_approval = !control_requests.lock().unwrap().is_empty();
         let chunk = match tokio::time::timeout(wait, lines.fill_buf()).await {
             Ok(result) => result?,
+            Err(_) if awaiting_approval || !control_requests.lock().unwrap().is_empty() => {
+                continue;
+            }
             Err(_) => {
                 let _ = stop_process.send(());
                 if terminal.is_some() {
@@ -1681,6 +1687,10 @@ printf '{"type":"result","subtype":"success","result":"done"}\n'
     async fn answer_control_request(approved: bool, payload: Value) -> Value {
         let fixture = Fixture::new(
             r#"
+case " $* " in
+    *" --permission-mode default --permission-prompt-tool stdio "*) ;;
+    *) exit 9 ;;
+esac
 IFS= read -r first
 printf '%s\n' '{"type":"control_request","request_id":"cli-req-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls -la"}}}'
 IFS= read -r answer
@@ -1760,6 +1770,53 @@ fi
                 }
             })
         );
+    }
+
+    #[tokio::test]
+    async fn pending_approval_outlasts_the_idle_timeout() {
+        let fixture = Fixture::new(
+            r#"
+IFS= read -r first
+printf '%s\n' '{"type":"control_request","request_id":"cli-req-1","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/w/a"}}}'
+IFS= read -r answer
+printf '%s\n' '{"type":"result","result":"ok"}'
+"#,
+        );
+        let active = ActiveRunMap::default();
+        let run_id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let running = Arc::clone(&active);
+        let binary = fixture.binary();
+        let task = tokio::spawn(async move {
+            run_turn_with_idle_timeout(
+                &running,
+                run_id,
+                ProviderId::Claude,
+                command(&binary),
+                Input::StreamJson(json!("write a")),
+                None,
+                tx,
+                Duration::from_millis(800),
+            )
+            .await
+        });
+        let Some(StreamEvent::PendingApproval { request }) = receive(&mut rx).await else {
+            panic!("expected a pending approval");
+        };
+        // The user takes several idle periods to answer.
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        let resp = PendingResponse {
+            request_id: request.id,
+            approved: true,
+            payload: json!({}),
+        };
+        assert!(send_control_response(&active, run_id, &resp));
+        let event = receive(&mut rx).await;
+        assert!(
+            matches!(&event, Some(StreamEvent::Completed { final_text: Some(text) }) if text == "ok"),
+            "{event:?}"
+        );
+        task.await.unwrap().unwrap();
     }
 
     #[test]

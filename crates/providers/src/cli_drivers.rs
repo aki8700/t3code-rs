@@ -240,12 +240,33 @@ fn claude_args(cmd: &mut Command, req: &TurnRequest) -> Input {
     if let Some(session) = &req.resume_session_id {
         cmd.args(["--resume", session]);
     }
-    match (req.interaction_mode, req.runtime_mode) {
-        (InteractionMode::Plan, _) => cmd.args(["--permission-mode", "plan"]),
-        (_, RuntimeMode::FullAccess) => cmd.arg("--dangerously-skip-permissions"),
-        (_, RuntimeMode::AutoAcceptEdits) => cmd.args(["--permission-mode", "acceptEdits"]),
-        (_, RuntimeMode::ApprovalRequired) => cmd.args(["--permission-mode", "default"]),
+    // Plan stays without the stdio prompt: approving ExitPlanMode would leave plan mode
+    // inside a run whose thread is still capped at Plan.
+    let relay = match (req.interaction_mode, req.runtime_mode) {
+        (InteractionMode::Plan, _) => {
+            cmd.args(["--permission-mode", "plan"]);
+            None
+        }
+        (_, RuntimeMode::FullAccess) => {
+            cmd.arg("--dangerously-skip-permissions");
+            None
+        }
+        (_, RuntimeMode::AutoAcceptEdits) => Some("acceptEdits"),
+        (_, RuntimeMode::ApprovalRequired) => Some("default"),
     };
+    if let Some(mode) = relay {
+        // Without a prompt tool, `-p` denies every gated call silently instead of asking.
+        cmd.args([
+            "--permission-mode",
+            mode,
+            "--permission-prompt-tool",
+            "stdio",
+        ]);
+        if req.mcp_injection.is_some() {
+            cmd.arg("--allowedTools")
+                .args(preapproved_t3rs_tools(req.runtime_mode));
+        }
+    }
     if let Some(spec) = &req.mcp_injection {
         cmd.env("T3_MCP_TOKEN", &spec.internal_token);
         cmd.arg("--mcp-config").arg(
@@ -274,6 +295,40 @@ fn claude_args(cmd: &mut Command, req: &TurnRequest) -> Input {
         _ => json!(prompt_with_paths(&req.prompt, &req.attachments, false)),
     };
     Input::StreamJson(content)
+}
+
+/// Internal tools that run without a prompt when approvals are relayed. The server caps
+/// delegated children at the caller's modes, so these cannot raise a child above its parent.
+/// `task_merge` writes into the parent workspace, so it is pre-approved only with edits.
+fn preapproved_t3rs_tools(mode: RuntimeMode) -> Vec<String> {
+    const TOOLS: [&str; 20] = [
+        "orchestrator_capabilities",
+        "swarm_status",
+        "swarm_add_worker",
+        "swarm_post_message",
+        "swarm_read_board",
+        "swarm_kill_worker",
+        "delegate_task",
+        "task_status",
+        "task_cancel",
+        "task_diff",
+        "thread_list",
+        "thread_read",
+        "thread_send",
+        "thread_fork",
+        "orch_stats",
+        "code_index",
+        "code_slice",
+        "code_grep",
+        "code_diff",
+        "compaction_econ",
+    ];
+    let merge = (mode == RuntimeMode::AutoAcceptEdits).then_some("task_merge");
+    TOOLS
+        .into_iter()
+        .chain(merge)
+        .map(|tool| format!("mcp__t3rs__{tool}"))
+        .collect()
 }
 
 fn codex_args(cmd: &mut Command, req: &TurnRequest) -> Input {
@@ -498,8 +553,15 @@ mod tests {
                 "existing session",
                 "--permission-mode",
                 "acceptEdits",
-                "--mcp-config"
+                "--permission-prompt-tool",
+                "stdio",
+                "--allowedTools",
             ]
+            .into_iter()
+            .map(str::to_owned)
+            .chain(preapproved_t3rs_tools(RuntimeMode::AutoAcceptEdits))
+            .chain(["--mcp-config".to_owned()])
+            .collect::<Vec<_>>()
         );
         let mcp: serde_json::Value = serde_json::from_str(args.last().unwrap()).unwrap();
         assert_eq!(
@@ -525,6 +587,98 @@ mod tests {
         let mut cmd = ClaudeDriver::new("claude").0.command();
         claude_args(&mut cmd, &req);
         assert_eq!(&args(&cmd)[9..], ["--permission-mode", "plan"]);
+    }
+
+    #[tokio::test]
+    async fn claude_relays_approvals_only_for_gated_modes() {
+        for (interaction, runtime, permissions, merge) in [
+            (
+                InteractionMode::Default,
+                RuntimeMode::ApprovalRequired,
+                &[
+                    "--permission-mode",
+                    "default",
+                    "--permission-prompt-tool",
+                    "stdio",
+                ][..],
+                Some(false),
+            ),
+            (
+                InteractionMode::Default,
+                RuntimeMode::AutoAcceptEdits,
+                &[
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--permission-prompt-tool",
+                    "stdio",
+                ][..],
+                Some(true),
+            ),
+            (
+                InteractionMode::Default,
+                RuntimeMode::FullAccess,
+                &["--dangerously-skip-permissions"][..],
+                None,
+            ),
+            (
+                InteractionMode::Plan,
+                RuntimeMode::ApprovalRequired,
+                &["--permission-mode", "plan"][..],
+                None,
+            ),
+            (
+                InteractionMode::Plan,
+                RuntimeMode::FullAccess,
+                &["--permission-mode", "plan"][..],
+                None,
+            ),
+        ] {
+            for injected in [false, true] {
+                let mut req = request(ProviderId::Claude);
+                req.interaction_mode = interaction;
+                req.runtime_mode = runtime;
+                if !injected {
+                    req.mcp_injection = None;
+                }
+                let mut cmd = ClaudeDriver::new("claude").0.command();
+                claude_args(&mut cmd, &req);
+                let args = args(&cmd);
+                let start = args
+                    .iter()
+                    .position(|arg| arg == "existing session")
+                    .unwrap()
+                    + 1;
+                let end = args
+                    .iter()
+                    .position(|arg| arg == "--allowedTools" || arg == "--mcp-config")
+                    .unwrap_or(args.len());
+                assert_eq!(
+                    &args[start..end],
+                    permissions,
+                    "{interaction:?} {runtime:?}"
+                );
+                let allowed: Vec<_> = args
+                    .iter()
+                    .skip_while(|arg| *arg != "--allowedTools")
+                    .skip(1)
+                    .take_while(|arg| !arg.starts_with("--"))
+                    .cloned()
+                    .collect();
+                match merge.filter(|_| injected) {
+                    None => assert!(!args.contains(&"--allowedTools".to_owned())),
+                    Some(merge) => {
+                        assert!(allowed.iter().all(|tool| tool.starts_with("mcp__t3rs__")));
+                        assert!(allowed.contains(&"mcp__t3rs__swarm_post_message".to_owned()));
+                        assert!(allowed.contains(&"mcp__t3rs__delegate_task".to_owned()));
+                        assert_eq!(
+                            allowed.contains(&"mcp__t3rs__task_merge".to_owned()),
+                            merge,
+                            "{runtime:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
