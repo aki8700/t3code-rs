@@ -3557,3 +3557,144 @@ exit 0
     assert!(prompts.contains("EXPECTED  exit_code=0, timed_out=false"));
     assert!(prompts.contains("SAW       exit_code=Some(1), timed_out=false"));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resumed_antigravity_runs_store_their_own_share_of_session_usage() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new();
+    let driver = tmp.0.join("fixture-agy");
+    let calls = tmp.0.join("agy-calls");
+    // agy reports the conversation's running total in `result.usage`.
+    std::fs::write(
+        &driver,
+        format!(
+            r#"#!/bin/sh
+echo x >> '{calls}'
+n=$(wc -l < '{calls}' | tr -d ' ')
+if [ "$n" = 1 ]; then input=100; output=10; else input=250; output=30; fi
+printf '%s\n' '{{"event":"init","conversation_id":"agy-cumulative-1","init":{{"model":"fixture"}}}}'
+printf '{{"event":"result","result":{{"conversation_id":"agy-cumulative-1","status":"SUCCESS","response":"ok","usage":{{"input_tokens":%s,"output_tokens":%s}}}}}}\n' "$input" "$output"
+"#,
+            calls = calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut config = ServerConfig {
+        data_dir: tmp.0.join("server"),
+        enabled_providers: vec![ProviderId::Mock, ProviderId::Antigravity],
+        ..Default::default()
+    };
+    config.providers.antigravity_bin = driver;
+    let state = ServerState::new(config, "http://127.0.0.1:3774".into()).unwrap();
+    let store = state.store.clone();
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let id = create_parent(&app, &tmp.0).await;
+    for prompt in ["first", "second"] {
+        json_req(
+            &app,
+            Method::POST,
+            &format!("/api/threads/{id}/messages"),
+            Some(json!({
+                "prompt": prompt,
+                "model_selection": {"provider": "antigravity", "model": "fixture"}
+            })),
+        )
+        .await;
+        wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+    }
+    let runs = store.list_runs(id).await.unwrap();
+    let usage: Vec<_> = runs
+        .iter()
+        .filter(|run| run.provider == ProviderId::Antigravity)
+        .map(|run| {
+            (
+                run.provider_session_id.as_deref(),
+                run.input_tokens,
+                run.output_tokens,
+            )
+        })
+        .collect();
+    assert_eq!(
+        usage,
+        [
+            (Some("agy-cumulative-1"), Some(100), Some(10)),
+            (Some("agy-cumulative-1"), Some(150), Some(20)),
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resumed_codex_runs_store_the_session_file_delta_not_turn_totals() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new();
+    let home = tmp.0.join("home");
+    let sessions = home.join(".codex/sessions/2026/11/26");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let rollout = sessions.join("rollout-2026-11-26T10-00-00-codex-cumulative-1.jsonl");
+    let driver = tmp.0.join("fixture-codex");
+    // `turn.completed` carries the session's running total, as live codex does on resume.
+    std::fs::write(
+        &driver,
+        format!(
+            r#"#!/bin/sh
+cat > /dev/null
+if [ -f '{rollout}' ]; then input=1000; output=100; else input=400; output=40;
+  printf '%s\n' '{{"type":"session_meta","payload":{{"id":"codex-cumulative-1"}}}}' > '{rollout}'; fi
+printf '{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":%s,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":%s,"reasoning_output_tokens":0,"total_tokens":0}}}}}}}}\n' "$input" "$output" >> '{rollout}'
+printf '%s\n' '{{"type":"thread.started","thread_id":"codex-cumulative-1"}}'
+printf '{{"type":"turn.completed","usage":{{"input_tokens":%s,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":%s,"reasoning_output_tokens":0}}}}\n' "$input" "$output"
+"#,
+            rollout = rollout.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut config = ServerConfig {
+        data_dir: tmp.0.join("server"),
+        enabled_providers: vec![ProviderId::Mock, ProviderId::Codex],
+        ..Default::default()
+    };
+    config.providers.codex_bin = driver;
+    let state = ServerState::new(config, "http://127.0.0.1:3774".into()).unwrap();
+    state.coordinator.set_session_home(Some(home));
+    let store = state.store.clone();
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let id = create_parent(&app, &tmp.0).await;
+    for prompt in ["first", "second"] {
+        json_req(
+            &app,
+            Method::POST,
+            &format!("/api/threads/{id}/messages"),
+            Some(json!({
+                "prompt": prompt,
+                "model_selection": {"provider": "codex", "model": "fixture"}
+            })),
+        )
+        .await;
+        wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+    }
+    let runs = store.list_runs(id).await.unwrap();
+    let usage: Vec<_> = runs
+        .iter()
+        .filter(|run| run.provider == ProviderId::Codex)
+        .map(|run| {
+            (
+                run.provider_session_id.as_deref(),
+                run.input_tokens,
+                run.output_tokens,
+            )
+        })
+        .collect();
+    assert_eq!(
+        usage,
+        [
+            (Some("codex-cumulative-1"), Some(400), Some(40)),
+            (Some("codex-cumulative-1"), Some(600), Some(60)),
+        ]
+    );
+}

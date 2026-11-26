@@ -186,7 +186,7 @@ impl RunCoordinator {
         }))
     }
 
-    /// Points the pre-resume session check at another home directory.
+    /// Points the pre-resume session check and the Codex usage reads at another home directory.
     pub fn set_session_home(&self, home: Option<std::path::PathBuf>) {
         *self
             .0
@@ -1104,7 +1104,12 @@ impl RunCoordinator {
         let current_selection = request.model_selection.clone();
         let codex_usage_before = if request.model_selection.provider == ProviderId::Codex {
             if let Some(session_id) = request.resume_session_id.clone() {
-                let home = std::env::home_dir();
+                let home = self
+                    .0
+                    .session_home
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 tokio::task::spawn_blocking(move || {
                     crate::usage::codex_session_usage_snapshot(home.as_deref(), &session_id)
                 })
@@ -1570,41 +1575,64 @@ impl RunCoordinator {
                 outcome.reset_at.as_deref(),
             ));
         }
-        if outcome.provider == ProviderId::Codex
-            && (outcome.input.is_none()
-                || outcome.output.is_none()
-                || (outcome.input == Some(0) && outcome.output == Some(0))
-                || outcome.cache_read.is_none()
-                || outcome.cache_creation.is_none()
-                || outcome.reasoning_tokens.is_none())
-            && let Some(session_id) = outcome.session.clone()
-        {
-            let home = std::env::home_dir();
-            let before = codex_usage_before;
-            let usage = tokio::task::spawn_blocking(move || {
-                let after =
-                    crate::usage::codex_session_usage_snapshot(home.as_deref(), &session_id);
-                crate::usage::codex_run_usage_since(before, after)
-            })
-            .await
-            .ok()
-            .flatten();
-            if let Some(usage) = usage {
-                if outcome.input.is_none() || outcome.input == Some(0) {
-                    outcome.input = Some(usage.input_tokens);
-                }
-                if outcome.output.is_none() || outcome.output == Some(0) {
-                    outcome.output = Some(usage.output_tokens);
-                }
-                outcome.cache_read.get_or_insert(usage.cache_read_tokens);
-                outcome
-                    .cache_creation
-                    .get_or_insert(usage.cache_creation_tokens);
-                outcome
-                    .reasoning_tokens
-                    .get_or_insert(usage.reasoning_tokens);
+        // Codex and Antigravity report the resumed session's running total, not this run's share.
+        let reported = crate::database::RunTokens {
+            input: outcome.input,
+            output: outcome.output,
+            cache_read: outcome.cache_read,
+            cache_creation: outcome.cache_creation,
+            reasoning: outcome.reasoning_tokens,
+        };
+        let tokens = match (outcome.provider, outcome.session.clone()) {
+            (ProviderId::Codex, Some(session_id)) => {
+                let home = self
+                    .0
+                    .session_home
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let before = codex_usage_before;
+                tokio::task::spawn_blocking(move || {
+                    let after =
+                        crate::usage::codex_session_usage_snapshot(home.as_deref(), &session_id);
+                    crate::usage::codex_run_usage_since(before, after)
+                })
+                .await
+                .ok()
+                .flatten()
+                .map_or(reported, |usage| crate::database::RunTokens {
+                    input: Some(usage.input_tokens),
+                    output: Some(usage.output_tokens),
+                    cache_read: Some(usage.cache_read_tokens),
+                    cache_creation: Some(usage.cache_creation_tokens),
+                    reasoning: Some(usage.reasoning_tokens),
+                })
             }
-        }
+            (ProviderId::Antigravity, Some(session_id))
+                if reported != crate::database::RunTokens::default() =>
+            {
+                match crate::database::session_tokens_except(
+                    &self.0.cfg,
+                    outcome.provider,
+                    session_id,
+                    run_id,
+                )
+                .await
+                {
+                    Ok(stored) => reported.since(stored),
+                    Err(error) => {
+                        tracing::warn!(%run_id, %error, "Keeping the session total as run usage");
+                        reported
+                    }
+                }
+            }
+            _ => reported,
+        };
+        outcome.input = tokens.input;
+        outcome.output = tokens.output;
+        outcome.cache_read = tokens.cache_read;
+        outcome.cache_creation = tokens.cache_creation;
+        outcome.reasoning_tokens = tokens.reasoning;
         let thread_status = match status {
             RunStatus::Completed => ThreadStatus::Completed,
             RunStatus::Cancelled => ThreadStatus::Interrupted,
