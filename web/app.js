@@ -2794,7 +2794,7 @@ async function settingsDialog() {
   const origBehavior = orig.follow_up_behavior === 'queue' ? 'queue' : 'steer';
   const origFixes = normNum(orig.verify_max_auto_fixes, 2);
   const origResume = orig.auto_resume_limited_threads !== false;
-  const origRetries = normNum(orig.rate_limit_max_retries, 3);
+  const origRetries = Math.min(2, normNum(orig.rate_limit_max_retries, 2));
   const origMcp = orig.antigravity_mcp_enabled === true;
   const origProbe = orig.antigravity_quota_probe === true;
 
@@ -2807,7 +2807,7 @@ async function settingsDialog() {
     ['queue', 'キュー', '現在のターン終了後に送る'],
   ], behavior, (v) => { behavior = v; }, { label: '実行中メッセージの既定動作' });
   const fixesInp = h('input', { class: 'inp num', type: 'number', min: 0, max: 10, step: 1, inputmode: 'numeric', value: String(origFixes), 'aria-label': '検証失敗時の自動修正上限' });
-  const retriesInp = h('input', { class: 'inp num', type: 'number', min: 0, max: 10, step: 1, inputmode: 'numeric', value: String(origRetries), 'aria-label': '最大リトライ回数' });
+  const retriesInp = h('input', { class: 'inp num', type: 'number', min: 0, max: 2, step: 1, inputmode: 'numeric', value: String(origRetries), 'aria-label': '容量エラー時の最大リトライ回数' });
   const resumeChk = h('input', { type: 'checkbox', checked: origResume, 'aria-label': 'レート制限時の自動再開' });
   const mcpChk = h('input', { type: 'checkbox', checked: origMcp, 'aria-label': 'Antigravity ネイティブ MCP 注入' });
   const probeChk = h('input', { type: 'checkbox', checked: origProbe, 'aria-label': 'Antigravity クォータ直接照会' });
@@ -2852,7 +2852,7 @@ async function settingsDialog() {
         const fixes = normNum(fixesInp.value, origFixes);
         if (fixes !== origFixes) patch.verify_max_auto_fixes = fixes;
         if (resumeChk.checked !== origResume) patch.auto_resume_limited_threads = resumeChk.checked;
-        const retries = normNum(retriesInp.value, origRetries);
+        const retries = Math.min(2, normNum(retriesInp.value, origRetries));
         if (retries !== origRetries) patch.rate_limit_max_retries = retries;
         if (JSON.stringify(fallbacks) !== JSON.stringify(origFallbacks)) patch.fallback_models = fallbacks;
         if (mcpChk.checked !== origMcp) patch.antigravity_mcp_enabled = mcpChk.checked;
@@ -2878,7 +2878,7 @@ async function settingsDialog() {
     field('実行中メッセージの既定動作', behaviorSeg, '実行中に新しいメッセージを送ったときの動作。割り込みは現在のターンを止めて指示を送り、キューはターン終了後に送ります。'),
     field('検証失敗時の自動修正上限', fixesInp, '検証が失敗したときに自動で修正を試みる回数の上限（0〜10）。'),
     field('レート制限時の自動再開', h('label', { class: 'switch' }, resumeChk, h('i'), h('span', { text: 'レート制限で停止したスレッドを自動で再開する' }))),
-    field('最大リトライ回数', retriesInp, 'レート制限時の自動再開の回数上限（0〜10）。'),
+    field('容量エラー時の最大リトライ回数', retriesInp, '一時的な容量制限だけを同じプロバイダで最大 2 回再試行します。アカウントのクォータ上限は再試行しません。'),
     field('クォータ枯渇時のフォールバックモデル', h('div', { class: 'stack' }, fbList, h('div', { class: 'fb-add' }, fbProv, fbModel, fbAdd)), 'プロバイダのクォータが枯渇したときに上から順に試します。'),
     field('Antigravity MCP', h('label', { class: 'switch' }, mcpChk, h('i'), h('span', { text: 'ネイティブ MCP 注入を有効にする' })), '有効にする前に `t3d setup-agy-mcp` で MCP 連携を設定してください。'),
     field('Antigravity クォータ照会', h('label', { class: 'switch' }, probeChk, h('i'), h('span', { text: 'Antigravity のクォータを直接照会する' }))),

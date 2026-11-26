@@ -29,6 +29,10 @@ pub enum StreamEvent {
     RateLimited {
         retry_after_secs: u64,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reset_at: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_code: Option<String>,
     },
     Usage {
         input_tokens: u64,
@@ -46,6 +50,10 @@ pub enum StreamEvent {
     },
     Failed {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reset_at: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_code: Option<String>,
     },
 }
 

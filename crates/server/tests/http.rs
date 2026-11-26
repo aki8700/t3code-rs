@@ -44,7 +44,6 @@ impl TempDir {
             ServerConfig {
                 data_dir: self.0.join("server"),
                 enabled_providers: vec![ProviderId::Mock],
-                rate_limit_initial_backoff_secs: 0,
                 auth,
                 ..Default::default()
             },
@@ -477,7 +476,16 @@ async fn wait_for_thread(
     thread_id: Uuid,
     status: ThreadStatus,
 ) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    wait_for_thread_timeout(events, thread_id, status, Duration::from_secs(5)).await;
+}
+
+async fn wait_for_thread_timeout(
+    events: &mut tokio::sync::broadcast::Receiver<WsServerMessage>,
+    thread_id: Uuid,
+    status: ThreadStatus,
+    timeout: Duration,
+) {
+    tokio::time::timeout(timeout, async {
         loop {
             let event = events.recv().await.unwrap();
             if matches!(event, WsServerMessage::ThreadStatusChanged { thread_id: id, status: seen } if id == thread_id && seen == status) {
@@ -729,7 +737,13 @@ async fn mock_rest_mcp_worktrees_handoff_search_compression_and_attachments() {
     )
     .await;
     assert!(result["run_id"].is_string());
-    wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+    wait_for_thread_timeout(
+        &mut events,
+        id,
+        ThreadStatus::Completed,
+        Duration::from_secs(12),
+    )
+    .await;
     let stats = json_req(&app, Method::GET, "/api/stats/db", None).await;
     assert!(stats["raw_payload_bytes"].as_u64().unwrap() > 100 * 1024);
     assert!(stats["compression_ratio"].as_f64().unwrap() < 0.1);
@@ -780,10 +794,11 @@ async fn mock_rest_mcp_worktrees_handoff_search_compression_and_attachments() {
         Some(json!({"prompt":"continue fork"})),
     )
     .await;
-    wait_for_thread(
+    wait_for_thread_timeout(
         &mut events,
         fork_id.parse().unwrap(),
         ThreadStatus::Completed,
+        Duration::from_secs(12),
     )
     .await;
     let fork_detail = json_req(&app, Method::GET, &fork_path, None).await;
@@ -828,6 +843,28 @@ async fn mock_rest_mcp_worktrees_handoff_search_compression_and_attachments() {
             .unwrap()
             .iter()
             .any(|item| item["kind"] == "subagent" && item["summary"] == "child result")
+    );
+
+    json_req(
+        &app,
+        Method::PATCH,
+        "/api/settings",
+        Some(json!({"auto_resume_limited_threads": false})),
+    )
+    .await;
+    let limited_child = mcp_tool(
+        &app,
+        "delegate_task",
+        json!({
+            "parent_thread_id": id, "title":"Limited child","task":"[rate-limit-once]",
+            "provider":"mock", "model":"mock", "mode":"wait"
+        }),
+    )
+    .await;
+    assert_eq!(limited_child["status"], "rate-limited");
+    assert_eq!(
+        limited_child["summary"],
+        "capacity: provider=mock model=mock reset_at=unknown; re-run on another provider. mock limit"
     );
 
     let content = format!(
@@ -897,7 +934,7 @@ async fn mock_rest_mcp_worktrees_handoff_search_compression_and_attachments() {
     );
 
     let models = json_req(&app, Method::GET, "/api/stats/orch", None).await;
-    assert_eq!(models[0]["total_runs"], 3);
+    assert_eq!(models[0]["total_runs"], 4);
     assert_eq!(models[0]["completed_runs"], 3);
     assert_eq!(models[0]["total_output_tokens"], 3);
 
@@ -2404,7 +2441,7 @@ IFS= read -r line
 printf 'run\n' >> "{count}"
 case "$line" in
   *quota-trigger*)
-    printf '%s\n' '{{"type":"result","is_error":true,"result":"You have hit your weekly usage limit"}}'
+    printf '%s\n' '{{"type":"error","error":{{"type":"usage_limit","message":"You have hit your weekly usage limit","reset_at":"2026-11-27T03:00:00Z"}}}}'
     exit 0
     ;;
   *"verify command"*)
@@ -2437,7 +2474,6 @@ esac
             effort: None,
             agent: None,
         }],
-        rate_limit_initial_backoff_secs: 0,
         ..Default::default()
     };
     cfg.providers.claude_bin = fake_claude;
@@ -2530,6 +2566,10 @@ esac
     let fb_runs = fb_detail["runs"].as_array().unwrap();
     assert_eq!(fb_runs.len(), 2);
     assert_eq!(fb_runs[0]["status"], "rate-limited");
+    assert_eq!(
+        fb_runs[0]["error_message"],
+        "usage_limit: You have hit your weekly usage limit (reset_at: 2026-11-27T03:00:00Z)"
+    );
     assert_eq!(fb_runs[1]["provider"], "mock");
     assert_eq!(fb_runs[1]["status"], "completed");
 }
@@ -2596,8 +2636,7 @@ async fn tier5_settings_get_patch_persistence_validation_and_live_meta() {
                 "default_model": {"provider": "claude", "model": "claude-sonnet-5-5", "effort": "medium"},
                 "follow_up_behavior": "queue",
                 "auto_resume_limited_threads": false,
-                "rate_limit_max_retries": 5,
-                "rate_limit_initial_backoff_secs": 30,
+                "rate_limit_max_retries": 2,
                 "fallback_models": [{"provider": "mock", "model": "mock-fallback"}],
                 "verify_max_auto_fixes": 4,
                 "antigravity_mcp_enabled": true,
@@ -2612,8 +2651,7 @@ async fn tier5_settings_get_patch_persistence_validation_and_live_meta() {
         );
         assert_eq!(patched["settings"]["follow_up_behavior"], "queue");
         assert_eq!(patched["settings"]["auto_resume_limited_threads"], false);
-        assert_eq!(patched["settings"]["rate_limit_max_retries"], 5);
-        assert_eq!(patched["settings"]["rate_limit_initial_backoff_secs"], 30);
+        assert_eq!(patched["settings"]["rate_limit_max_retries"], 2);
         assert_eq!(patched["settings"]["verify_max_auto_fixes"], 4);
         assert_eq!(patched["settings"]["antigravity_mcp_enabled"], true);
         assert_eq!(patched["settings"]["antigravity_quota_probe"], true);
@@ -2658,8 +2696,7 @@ async fn tier5_settings_get_patch_persistence_validation_and_live_meta() {
         );
         assert_eq!(persisted["settings"]["follow_up_behavior"], "queue");
         assert_eq!(persisted["settings"]["auto_resume_limited_threads"], false);
-        assert_eq!(persisted["settings"]["rate_limit_max_retries"], 5);
-        assert_eq!(persisted["settings"]["rate_limit_initial_backoff_secs"], 30);
+        assert_eq!(persisted["settings"]["rate_limit_max_retries"], 2);
         assert_eq!(persisted["settings"]["verify_max_auto_fixes"], 4);
         assert_eq!(persisted["settings"]["antigravity_mcp_enabled"], true);
         assert_eq!(persisted["settings"]["antigravity_quota_probe"], true);

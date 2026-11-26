@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::{collections::HashMap, fmt::Write, path::Path};
 use t3_core::*;
-use t3_providers::ProviderRegistry;
+use t3_providers::{ProviderRegistry, format_delegated_error};
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -408,7 +408,7 @@ impl RunCoordinator {
         {
             return Ok(());
         }
-        let text = silent_end_text(&member.name, status, error);
+        let text = silent_end_text(member, status, error);
         self.post_locked(active, board.coordinator_thread_id, Some("system"), text)
             .await?;
         Ok(())
@@ -640,15 +640,21 @@ fn posted_since(messages: &[SwarmMessage], sender: &str, since: DateTime<Utc>) -
 }
 
 /// The notice names the worker without an `@` so that posting it does not wake the ended worker.
-fn silent_end_text(name: &str, status: RunStatus, error: Option<&str>) -> String {
-    let suffix = match error.map(str::trim).filter(|error| !error.is_empty()) {
-        Some(error) => {
-            let error: String = error.chars().take(ENDED_ERROR_CHARS).collect();
-            format!(": {}", error.replace('@', "(at)"))
-        }
-        None => String::new(),
-    };
-    format!("@coordinator [system] worker {name} ended ({status:?}) without posting{suffix}")
+fn silent_end_text(member: &SwarmMember, status: RunStatus, error: Option<&str>) -> String {
+    let name = &member.name;
+    let error = error.map(str::trim).filter(|error| !error.is_empty());
+    if matches!(status, RunStatus::Failed | RunStatus::RateLimited)
+        && let Some(error) = error
+    {
+        let delegated = format_delegated_error(member.provider, &member.model, error);
+        let delegated: String = delegated.chars().take(ENDED_ERROR_CHARS).collect();
+        format!(
+            "{}\n@coordinator [system] worker {name} ended ({status:?}) without posting",
+            delegated.replace('@', "(at)")
+        )
+    } else {
+        format!("@coordinator [system] worker {name} ended ({status:?}) without posting")
+    }
 }
 
 fn can_dispatch(caller: &Thread, target: &Thread) -> bool {
@@ -832,20 +838,21 @@ mod tests {
 
     #[test]
     fn silent_end_notice_does_not_mention_the_ended_worker() {
-        let text = silent_end_text("coder", RunStatus::Failed, Some("boom @coder"));
+        let member = member("coder", "worker", "working");
+        let text = silent_end_text(&member, RunStatus::Failed, Some("boom @coder"));
         assert_eq!(
             text,
-            "@coordinator [system] worker coder ended (Failed) without posting: boom (at)coder"
+            "provider_error: provider=codex model=test reset_at=unknown; re-run on another provider. boom (at)coder\n@coordinator [system] worker coder ended (Failed) without posting"
         );
         assert_eq!(mentions_in(&text), vec!["coordinator".to_owned()]);
         assert_eq!(
-            silent_end_text("coder", RunStatus::Completed, None),
+            silent_end_text(&member, RunStatus::Completed, None),
             "@coordinator [system] worker coder ended (Completed) without posting"
         );
         assert!(
             validate_text(&silent_end_text(
-                "coder",
-                RunStatus::Cancelled,
+                &member,
+                RunStatus::Failed,
                 Some(&"x".repeat(10_000))
             ))
             .is_ok()

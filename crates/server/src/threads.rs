@@ -19,7 +19,7 @@ use t3_mcp::{
     Capabilities, DelegateMode, DelegatedTask, ForkOptions, OrchestratorBackend, TaskMergeResult,
     ThreadRead,
 };
-use t3_providers::ProviderRegistry;
+use t3_providers::{ProviderRegistry, format_delegated_error};
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -1084,10 +1084,23 @@ impl OrchestratorBackend for RunCoordinator {
             .into_iter()
             .find(|run| run.ordinal > 0)
             .ok_or_else(|| CoreError::NotFound("delegated run".into()))?;
-        let summary = self
-            .latest_assistant(thread.id)
-            .await?
-            .or(run.error_message);
+        let summary = match run.status {
+            RunStatus::Failed | RunStatus::RateLimited => run
+                .error_message
+                .as_deref()
+                .map(|error| {
+                    format_delegated_error(
+                        thread.model_selection.provider,
+                        &thread.model_selection.model,
+                        error,
+                    )
+                })
+                .or(self.latest_assistant(thread.id).await?),
+            _ => self
+                .latest_assistant(thread.id)
+                .await?
+                .or(run.error_message),
+        };
         Ok(DelegatedTask {
             task_id,
             child_thread_id: thread.id,
