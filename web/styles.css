@@ -1442,6 +1442,15 @@ body.resizing-rail { cursor: col-resize !important; user-select: none; -webkit-u
 .dp-parent-banner .iw { flex: none; }
 .dp-parent-label { font-weight: 600; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 
+/* Undo-price ゲートバナー（#diff-panel 上部） */
+.dp-risk-banner { display: flex; flex-direction: column; gap: 3px; margin: 10px 12px 0; padding: 8px 10px; border-radius: 8px; font-size: 11.5px; line-height: 1.45; }
+.dp-risk-banner.no-undo { border: 1px solid color-mix(in srgb, var(--error) 45%, transparent); background: var(--error-surface); color: var(--text); }
+.dp-risk-banner.no-undo .dp-risk-head { color: var(--error); font-weight: 600; }
+.dp-risk-banner.cleanup { border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent); background: var(--warning-surface); color: var(--text); }
+.dp-risk-banner.cleanup .dp-risk-head { color: var(--warning); font-weight: 600; }
+.dp-risk-text { color: var(--text-muted); }
+.dp-risk-paths { font-size: 11px; color: var(--text); word-break: break-all; }
+
 /* コンパクション推奨カード */
 .ctx-compact-card { gap: 8px; }
 .ctx-compact-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--text-muted); }

@@ -1164,8 +1164,35 @@ impl OrchestratorBackend for RunCoordinator {
         commit_message: Option<String>,
         cleanup: bool,
     ) -> CoreResult<TaskMergeResult> {
-        self.merge_child_worktree(caller_id, child_thread_id, commit_message, cleanup)
-            .await
+        // Undo-price gate for autonomous agent merges: `no-undo` changes (migrations, secrets,
+        // deploy/infra, destructive SQL) require explicit human sign-off via the UI or `t3d merge`.
+        let diff = self
+            .child_worktree_diff(caller_id, child_thread_id, false)
+            .await?;
+        let risk = diff
+            .risk
+            .unwrap_or_else(|| classify_diff_risk(&diff.files));
+        if risk.tier == UndoTier::NoUndo {
+            let paths = if risk.flagged_paths.is_empty() {
+                "sensitive changes".to_owned()
+            } else {
+                risk.flagged_paths.join(", ")
+            };
+            let reasons = risk.reasons.join("; ");
+            return Err(CoreError::Auth(format!(
+                "undo-gate (no-undo): autonomous agent merge is blocked for [{paths}] ({reasons}). Escalate to the human to review and merge via the UI or `t3d merge`."
+            )));
+        }
+        let mut merged = self
+            .merge_child_worktree(caller_id, child_thread_id, commit_message, cleanup)
+            .await?;
+        if merged.merged && risk.tier == UndoTier::Cleanup && !risk.flagged_paths.is_empty() {
+            merged.summary.push_str(&format!(
+                " [undo-gate: cleanup — second-opinion review recommended for: {}]",
+                risk.flagged_paths.join(", ")
+            ));
+        }
+        Ok(merged)
     }
 
     async fn thread_list(
@@ -1592,6 +1619,75 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("merge in progress"));
         assert!(GitManager::has_merge_in_progress(&repo).await.unwrap());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn task_merge_blocks_no_undo_for_agents_while_human_merge_succeeds() {
+        let (root, _repo, coordinator, project) = test_coordinator().await;
+        let parent = coordinator
+            .create_thread(CreateThread {
+                project_id: project.id,
+                title: "Parent".into(),
+                model_selection: None,
+                runtime_mode: RuntimeMode::FullAccess,
+                interaction_mode: InteractionMode::Default,
+                isolation: IsolationMode::Shared,
+                base_ref: None,
+            })
+            .await
+            .unwrap();
+        let child = coordinator
+            .new_thread(
+                CreateThread {
+                    project_id: project.id,
+                    title: "Migration worker".into(),
+                    model_selection: None,
+                    runtime_mode: RuntimeMode::FullAccess,
+                    interaction_mode: InteractionMode::Default,
+                    isolation: IsolationMode::Worktree,
+                    base_ref: None,
+                },
+                Some((&parent, "delegated")),
+            )
+            .await
+            .unwrap();
+        let child_wt = child.worktree_path.clone().unwrap();
+
+        std::fs::create_dir_all(child_wt.join("migrations")).unwrap();
+        std::fs::write(
+            child_wt.join("migrations/001_init.sql"),
+            "CREATE TABLE t(id INTEGER);\n",
+        )
+        .unwrap();
+        run_git_cmd(&child_wt, &["add", "migrations/001_init.sql"]).await;
+        run_git_cmd(&child_wt, &["commit", "-m", "add migration"]).await;
+
+        // Diff reports NoUndo tier.
+        let diff = coordinator
+            .child_worktree_diff(parent.id, child.id, false)
+            .await
+            .unwrap();
+        let risk = diff.risk.expect("risk report populated");
+        assert_eq!(risk.tier, UndoTier::NoUndo);
+        assert_eq!(risk.flagged_paths, vec!["migrations/001_init.sql"]);
+
+        // Autonomous agent MCP `task_merge` is blocked by the no-undo gate.
+        let err = OrchestratorBackend::task_merge(&coordinator, parent.id, child.id, None, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Auth(_)), "got: {err:?}");
+        assert!(err.to_string().contains("no-undo"));
+        assert!(err.to_string().contains("migrations/001_init.sql"));
+
+        // Explicit human merge via `merge_child_worktree` still succeeds.
+        let merged = coordinator
+            .merge_child_worktree(parent.id, child.id, Some("Human approved".into()), true)
+            .await
+            .unwrap();
+        assert!(merged.merged);
+        assert!(merged.cleaned_up);
 
         let _ = std::fs::remove_dir_all(&root);
     }

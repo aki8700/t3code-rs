@@ -1015,6 +1015,7 @@ mod tests {
                     deletions: 1,
                     patch: "+fn hi() {}\n".into(),
                 }],
+                risk: None,
             })
         }
 

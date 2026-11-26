@@ -16,6 +16,7 @@ mod shell;
 mod swarm;
 mod threads;
 mod usage;
+mod verify;
 mod workspace_meta;
 mod ws;
 

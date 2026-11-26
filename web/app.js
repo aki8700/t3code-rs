@@ -4321,11 +4321,32 @@ function renderDiffView(d) {
   }
   const add = files.reduce((a, f) => a + (Number(f.additions) || 0), 0);
   const del = files.reduce((a, f) => a + (Number(f.deletions) || 0), 0);
+  const risk = d.risk && !d.clean && files.length ? d.risk : null;
+  const riskMeta = risk?.tier === 'no-undo'
+    ? { cls: 'bad', label: 'No Undo · 人間承認必須', bannerCls: 'no-undo', text: '取り消し困難な変更（マイグレーション・機密設定・デプロイ等）を含みます。エージェントによる自動マージはブロックされます。人間が確認のうえマージしてください。' }
+    : risk?.tier === 'cleanup'
+      ? { cls: 'warn', label: 'Cleanup · 要レビュー', bannerCls: 'cleanup', text: '認証・スキーマ・依存設定または広範な変更を含みます。テスト緑＋別視点レビューを推奨します。' }
+      : risk?.tier === 'one-click'
+        ? { cls: 'good', label: 'One-Click', bannerCls: null, text: '' }
+        : null;
+  const riskTitle = risk
+    ? [...(risk.reasons || []), ...(risk.flagged_paths?.length ? [`対象: ${risk.flagged_paths.join(', ')}`] : [])].join('\n')
+    : '';
   sum.replaceChildren(
-    h('span', { class: 'sbadge plus', text: `+${add}` }),
-    h('span', { class: 'sbadge minus', text: `−${del}` }),
-    h('span', { class: 'muted', text: `${files.length} ファイル` }),
+    ...[
+      h('span', { class: 'sbadge plus', text: `+${add}` }),
+      h('span', { class: 'sbadge minus', text: `−${del}` }),
+      h('span', { class: 'muted', text: `${files.length} ファイル` }),
+      riskMeta ? h('span', { class: `sbadge ${riskMeta.cls}`, text: riskMeta.label, title: riskTitle || riskMeta.label }) : null,
+    ].filter(Boolean),
   );
+  const riskBanner = riskMeta?.bannerCls ? h('div', { class: `dp-risk-banner ${riskMeta.bannerCls}` },
+    h('div', { class: 'dp-risk-head', text: riskMeta.label }),
+    h('div', { class: 'dp-risk-text', text: riskMeta.text }),
+    risk.flagged_paths?.length
+      ? h('div', { class: 'dp-risk-paths mono', text: risk.flagged_paths.join(', ') })
+      : null,
+  ) : null;
   if (d.clean || !d.files.length) {
     body.replaceChildren(...[banner, h('div', { class: 'dp-empty' }, iconEl('check'), h('span', { text: '変更はありません（クリーン）' }))].filter(Boolean));
     return;
@@ -4338,7 +4359,7 @@ function renderDiffView(d) {
     return;
   }
   const top = body.scrollTop;
-  body.replaceChildren(...[banner, ...files.map(diffFile)].filter(Boolean));
+  body.replaceChildren(...[banner, riskBanner, ...files.map(diffFile)].filter(Boolean));
   if (!pd) body.append(diffCommitForm(t));
   body.scrollTop = top;
 }

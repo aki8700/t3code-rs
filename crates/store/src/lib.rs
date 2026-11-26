@@ -39,6 +39,15 @@ pub struct RecoveredRuns {
     pub cancelled: Vec<Uuid>,
 }
 
+const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE projects ADD COLUMN instructions TEXT",
+    "ALTER TABLE projects ADD COLUMN verify_command TEXT",
+    "ALTER TABLE runs ADD COLUMN cache_read_tokens INTEGER",
+    "ALTER TABLE runs ADD COLUMN cache_creation_tokens INTEGER",
+    "ALTER TABLE runs ADD COLUMN reasoning_tokens INTEGER",
+    "ALTER TABLE runs ADD COLUMN restart_resumes INTEGER NOT NULL DEFAULT 0",
+];
+
 const PREVIEW_BYTES: usize = 64 * 1024;
 const READER_COUNT: usize = 4;
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
@@ -48,7 +57,7 @@ const ORPHAN_BLOBS: &str = "NOT EXISTS (
 
 mod queue;
 mod swarm;
-pub use queue::{QueuedRun, QueuedRunInput};
+pub use queue::{QueuedRun, QueuedRunInput, VerifyDeadEnd};
 mod history;
 mod prune;
 
@@ -482,13 +491,7 @@ impl SqliteStore {
         transaction
             .execute_batch(include_str!("schema.sql"))
             .map_err(storage_error)?;
-        for migration in [
-            "ALTER TABLE projects ADD COLUMN instructions TEXT",
-            "ALTER TABLE projects ADD COLUMN verify_command TEXT",
-            "ALTER TABLE runs ADD COLUMN cache_read_tokens INTEGER",
-            "ALTER TABLE runs ADD COLUMN cache_creation_tokens INTEGER",
-            "ALTER TABLE runs ADD COLUMN reasoning_tokens INTEGER",
-        ] {
+        for migration in MIGRATIONS {
             if let Err(error) = transaction.execute_batch(migration)
                 && !matches!(
                     &error,

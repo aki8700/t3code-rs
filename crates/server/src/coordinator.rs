@@ -17,7 +17,7 @@ use t3_providers::{
     FailureClass, ProviderRegistry, classify_harness_failure, classify_provider_failure,
     classify_rate_limit, format_delegated_error, format_run_error, run_turn_with_retry,
 };
-use t3_store::{INTERRUPTED_BY_RESTART, QueuedRun, QueuedRunInput, SqliteStore};
+use t3_store::{INTERRUPTED_BY_RESTART, QueuedRun, QueuedRunInput, SqliteStore, VerifyDeadEnd};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use uuid::Uuid;
 
@@ -583,6 +583,7 @@ impl RunCoordinator {
                     .then_some((thread.runtime_mode, thread.interaction_mode)),
                 verify_fix_depth: 0,
                 last_verify_signature: None,
+                verify_dead_ends: Vec::new(),
                 fallback_attempts: 0,
             },
             busy,
@@ -635,6 +636,7 @@ impl RunCoordinator {
                     mode_ceiling: meta.mode_ceiling,
                     verify_fix_depth: meta.verify_fix_depth,
                     last_verify_signature: meta.last_verify_signature,
+                    verify_dead_ends: meta.verify_dead_ends,
                     fallback_attempts: meta.fallback_attempts,
                 },
             )
@@ -953,6 +955,7 @@ impl RunCoordinator {
             mode_ceiling: queued.input.mode_ceiling,
             verify_fix_depth: queued.input.verify_fix_depth,
             last_verify_signature: queued.input.last_verify_signature,
+            verify_dead_ends: queued.input.verify_dead_ends,
             fallback_attempts: queued.input.fallback_attempts,
             mcp_token,
             swarm,
@@ -1087,6 +1090,7 @@ impl RunCoordinator {
             mode_ceiling,
             verify_fix_depth,
             last_verify_signature,
+            verify_dead_ends,
             fallback_attempts,
             mcp_token,
             swarm,
@@ -1205,7 +1209,15 @@ impl RunCoordinator {
         };
         drop(mcp_token);
 
-        let mut verify_failure: Option<(String, String)> = None;
+        struct VerifyFailure {
+            command: String,
+            exit_code: Option<i32>,
+            timed_out: bool,
+            tail: String,
+            summary: String,
+            signature: String,
+        }
+        let mut verify_failure: Option<VerifyFailure> = None;
         let mut verify_cancelled = false;
         let mut verify_failed_error: Option<String> = None;
         if !*cancellation.borrow()
@@ -1282,18 +1294,25 @@ impl RunCoordinator {
                             verify_cancelled = true;
                         } else if out.timed_out || out.exit_code != Some(0) {
                             let tail = redact_and_tail(&combined, 4_000);
-                            let sig_input = format!(
-                                "{:?}|{}|{}",
+                            let signature = crate::verify::outcome_signature(
                                 out.exit_code,
-                                post_tree.as_deref().unwrap_or(""),
-                                tail
+                                out.timed_out,
+                                &tail,
                             );
-                            let sig = blake3::hash(sig_input.as_bytes()).to_hex().to_string();
-                            let prompt = format!(
-                                "The project verify command (`{}`) failed (exit_code={:?}, timed_out={}). Fix the reported issues so the verify command passes cleanly.\n\nDiagnostic output (redacted tail):\n```\n{}\n```",
-                                out.command, out.exit_code, out.timed_out, tail
+                            let summary = crate::verify::summarize_failure(
+                                &out.command,
+                                out.exit_code,
+                                out.timed_out,
+                                &tail,
                             );
-                            verify_failure = Some((prompt, sig));
+                            verify_failure = Some(VerifyFailure {
+                                command: out.command.clone(),
+                                exit_code: out.exit_code,
+                                timed_out: out.timed_out,
+                                tail,
+                                summary,
+                                signature,
+                            });
                             verify_failed_error = Some(if out.timed_out {
                                 format!("verify_command timed out: {}", out.command)
                             } else {
@@ -1343,13 +1362,35 @@ impl RunCoordinator {
         let mut scheduled_auto_followup: Option<(Message, QueuedMeta)> = None;
         let mut verify_passed = true;
         if status == RunStatus::Completed
-            && let Some((fix_prompt, sig)) = verify_failure
+            && let Some(failure) = verify_failure
         {
             verify_passed = false;
             let max_fixes = self.0.settings.get().verify_max_auto_fixes.min(10) as u8;
-            let made_progress = last_verify_signature.as_deref() != Some(sig.as_str());
-            if verify_fix_depth < max_fixes && made_progress {
+            let repeated = crate::verify::is_repeated_outcome(
+                &failure.signature,
+                last_verify_signature.as_deref(),
+                &verify_dead_ends,
+            );
+            if verify_fix_depth < max_fixes && !repeated {
                 let next_depth = verify_fix_depth + 1;
+                let fix_prompt = crate::verify::build_fix_prompt(
+                    &failure.command,
+                    failure.exit_code,
+                    failure.timed_out,
+                    &failure.summary,
+                    &failure.tail,
+                    next_depth,
+                    max_fixes,
+                    &verify_dead_ends,
+                );
+                let next_dead_ends = crate::verify::record_dead_end(
+                    verify_dead_ends,
+                    next_depth,
+                    failure.signature.clone(),
+                    failure.exit_code,
+                    failure.timed_out,
+                    failure.summary.clone(),
+                );
                 let notice = format!(
                     "verify_command が失敗したため自動修正を試行します ({next_depth}/{max_fixes})"
                 );
@@ -1363,6 +1404,8 @@ impl RunCoordinator {
                             "message": notice,
                             "verify_fix_depth": next_depth,
                             "verify_max_auto_fixes": max_fixes,
+                            "saw": failure.summary,
+                            "dead_ends_count": next_dead_ends.len(),
                         }),
                         searchable_text: None,
                     })
@@ -1381,13 +1424,55 @@ impl RunCoordinator {
                             mode_ceiling.unwrap_or((thread.runtime_mode, thread.interaction_mode)),
                         ),
                         verify_fix_depth: next_depth,
-                        last_verify_signature: Some(sig),
+                        last_verify_signature: Some(failure.signature),
+                        verify_dead_ends: next_dead_ends,
                         fallback_attempts,
                     },
                 ));
             } else {
+                let (reason, notice, err_msg) = if repeated {
+                    (
+                        "same_result_twice",
+                        format!(
+                            "verify_command が同じ失敗を繰り返したため自動修正を打ち切りエスカレーションします（{}）",
+                            failure.summary
+                        ),
+                        format!(
+                            "verify_command repeated the same failure (escalated): {}",
+                            failure.summary
+                        ),
+                    )
+                } else {
+                    (
+                        "max_attempts_reached",
+                        format!(
+                            "verify_command が自動修正上限（{max_fixes} 回）に達したためエスカレーションします（{}）",
+                            failure.summary
+                        ),
+                        verify_failed_error.unwrap_or_else(|| "verify_command failed".into()),
+                    )
+                };
+                if max_fixes > 0 {
+                    let _ = self
+                        .append(NewTurnItem {
+                            thread_id,
+                            run_id,
+                            kind: TurnItemKind::SystemNotice,
+                            summary: Some(notice.clone()),
+                            payload: json!({
+                                "message": notice,
+                                "reason": reason,
+                                "verify_fix_depth": verify_fix_depth,
+                                "verify_max_auto_fixes": max_fixes,
+                                "saw": failure.summary,
+                                "dead_ends": verify_dead_ends,
+                            }),
+                            searchable_text: None,
+                        })
+                        .await;
+                }
                 status = RunStatus::Failed;
-                error = verify_failed_error.or_else(|| Some("verify_command failed".into()));
+                error = Some(err_msg);
                 error_class = Some(FailureClass::HarnessError);
             }
         } else if status == RunStatus::RateLimited
@@ -1430,6 +1515,7 @@ impl RunCoordinator {
                     ),
                     verify_fix_depth,
                     last_verify_signature,
+                    verify_dead_ends,
                     fallback_attempts: next_fallback_idx,
                 },
             ));
@@ -2027,6 +2113,7 @@ struct QueuedMeta {
     mode_ceiling: Option<(RuntimeMode, InteractionMode)>,
     verify_fix_depth: u8,
     last_verify_signature: Option<String>,
+    verify_dead_ends: Vec<VerifyDeadEnd>,
     fallback_attempts: u8,
 }
 
@@ -2044,6 +2131,7 @@ struct RunningTurn {
     mode_ceiling: Option<(RuntimeMode, InteractionMode)>,
     verify_fix_depth: u8,
     last_verify_signature: Option<String>,
+    verify_dead_ends: Vec<VerifyDeadEnd>,
     fallback_attempts: u8,
     mcp_token: Option<RunMcpToken>,
     swarm: Option<SwarmTurn>,

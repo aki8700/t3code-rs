@@ -1761,6 +1761,7 @@ mod tests {
             total_additions: 0,
             total_deletions: 0,
             files: vec![],
+            risk: None,
         };
         assert_eq!(
             format_diff_output(&clean, false),
@@ -1789,6 +1790,7 @@ mod tests {
                     patch: String::new(),
                 },
             ],
+            risk: None,
         };
 
         let table_only = format_diff_output(&dirty, false);

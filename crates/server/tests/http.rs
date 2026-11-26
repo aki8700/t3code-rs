@@ -3411,3 +3411,149 @@ async fn tier5_thread_export_markdown_headers_and_credential_redaction() {
     .await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verify_auto_fix_escalates_on_same_result_twice_and_tracks_dead_ends() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new();
+    let workspace = tmp.0.join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&workspace)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    std::fs::write(workspace.join("a.txt"), "init\n").unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=T3",
+        "-c",
+        "user.email=t3@example.test",
+        "commit",
+        "-qm",
+        "init",
+    ]);
+
+    // Fake Claude CLI mutates `a.txt` differently on every run (so post_tree changes each time!),
+    // while the verify command emits the exact same error message (with a different elapsed duration).
+    // Even though verify_max_auto_fixes=4, the loop MUST escalate after run 2 (same-result-twice).
+    let fake_claude = tmp.0.join("fake-claude-same-err");
+    let count_file = tmp.0.join("runs.txt");
+    let prompts_file = tmp.0.join("prompts.log");
+    std::fs::write(
+        &fake_claude,
+        format!(
+            r#"#!/bin/sh
+IFS= read -r line
+printf 'run\n' >> "{count}"
+printf '%s\n' "$line" >> "{prompts}"
+n=$(wc -l < "{count}" | tr -d ' ')
+printf 'attempt-%s\n' "$n" > a.txt
+printf '%s\n' '{{"type":"system","session_id":"sess-repeat"}}'
+printf '%s\n' '{{"type":"result","subtype":"success","result":"tried fix"}}'
+exit 0
+"#,
+            count = count_file.display(),
+            prompts = prompts_file.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut cfg = ServerConfig {
+        data_dir: tmp.0.join("server"),
+        enabled_providers: vec![ProviderId::Claude],
+        verify_max_auto_fixes: 4,
+        ..Default::default()
+    };
+    cfg.providers.claude_bin = fake_claude;
+    let state = ServerState::new(cfg, "http://127.0.0.1:3774".into()).unwrap();
+    let app = router(state);
+
+    let proj = json_req(
+        &app,
+        Method::POST,
+        "/api/projects",
+        Some(json!({"title": "SameResult Proj", "workspace_root": workspace})),
+    )
+    .await;
+    let pid = proj["id"].as_str().unwrap();
+    // Emit identical error message with varying elapsed duration (`0.1s` vs `0.2s` etc.)
+    let verify_cmd = format!(
+        "n=$(wc -l < \"{}\" | tr -d ' '); echo \"error[E0308]: mismatched types in 0.${{n}}s\" >&2; exit 1",
+        count_file.display()
+    );
+    json_req(
+        &app,
+        Method::PATCH,
+        &format!("/api/projects/{pid}"),
+        Some(json!({"verify_command": verify_cmd})),
+    )
+    .await;
+
+    let thread = json_req(
+        &app,
+        Method::POST,
+        "/api/threads",
+        Some(json!({
+            "project_id": pid,
+            "title": "SameResult Thread",
+            "model_selection": {"provider": "claude", "model": "claude-sonnet-4-5"},
+            "runtime_mode": "full-access"
+        })),
+    )
+    .await;
+    let tid: Uuid = thread["id"].as_str().unwrap().parse().unwrap();
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{tid}/messages"),
+        Some(json!({"prompt": "edit a.txt"})),
+    )
+    .await;
+
+    let mut detail = Value::Null;
+    for _ in 0..80 {
+        detail = json_req(&app, Method::GET, &format!("/api/threads/{tid}"), None).await;
+        if detail["thread"]["status"] == "failed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(detail["thread"]["status"], "failed");
+    // Run 1 fails verify -> schedules auto-fix attempt 1 (Run 2).
+    // Run 2 mutates a.txt differently but hits the same normalized verify error -> escalates immediately!
+    // Total runs must be 2 (NOT 5).
+    let runs = detail["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2, "expected same-result-twice escalation at run 2, got {} runs", runs.len());
+    assert!(
+        runs[1]["error_message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("repeated the same failure"),
+        "expected escalation error message, got: {:?}",
+        runs[1]["error_message"]
+    );
+    let items = detail["items"].as_array().unwrap();
+    assert!(
+        items.iter().any(|it| {
+            it["kind"] == "system_notice" && it["payload"]["reason"] == "same_result_twice"
+        }),
+        "expected same_result_twice system_notice"
+    );
+    let prompts = std::fs::read_to_string(&prompts_file).unwrap();
+    assert!(prompts.contains("EXPECTED  exit_code=0, timed_out=false"));
+    assert!(prompts.contains("SAW       exit_code=Some(1), timed_out=false"));
+}

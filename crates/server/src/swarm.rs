@@ -47,7 +47,7 @@ impl SwarmTurn {
         let member = live_member(board, thread_id)?;
         let coordinator = member.role == "coordinator";
         let instructions = if coordinator {
-            "Coordinate work using swarm_status, swarm_add_worker, swarm_post_message, swarm_read_board and swarm_kill_worker. Mentions wake the named member. After assigning work, end your turn and wait for results addressed to @coordinator."
+            "Coordinate work using swarm_status, swarm_add_worker, swarm_post_message, swarm_read_board and swarm_kill_worker. Run independent slices in parallel with separate worker contexts, keep passed work frozen, and escalate no-undo merges (migrations/secrets/deploy) to the human. Mentions wake the named member. After assigning work, end your turn and wait for results addressed to @coordinator."
         } else {
             "Work on the assigned brief. When finished, call swarm_post_message with text starting with @coordinator [done] and include your result and any blocker. End your turn after posting. Reply to subsequent updates only when you have new information."
         };

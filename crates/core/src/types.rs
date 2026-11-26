@@ -333,6 +333,230 @@ pub struct SearchHit {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UndoTier {
+    /// Docs, tests, or localized changes that can ship on green.
+    OneClick,
+    /// Shared helpers, auth, schema/config, or wide diffs — green + trace + second opinion recommended.
+    Cleanup,
+    /// Migrations, secrets, deploy/infra, or destructive SQL — requires explicit human sign-off.
+    NoUndo,
+}
+
+impl UndoTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OneClick => "one-click",
+            Self::Cleanup => "cleanup",
+            Self::NoUndo => "no-undo",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffRiskReport {
+    pub tier: UndoTier,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default)]
+    pub flagged_paths: Vec<String>,
+}
+
+/// Deterministic Undo-price classification for a set of changed files.
+pub fn classify_diff_risk(files: &[DiffFile]) -> DiffRiskReport {
+    if files.is_empty() {
+        return DiffRiskReport {
+            tier: UndoTier::OneClick,
+            reasons: Vec::new(),
+            flagged_paths: Vec::new(),
+        };
+    }
+
+    let mut tier = UndoTier::OneClick;
+    let mut reasons = Vec::new();
+    let mut flagged_paths = Vec::new();
+    let mut push_reason = |reason: &str| {
+        if !reasons.iter().any(|existing: &String| existing == reason) {
+            reasons.push(reason.to_owned());
+        }
+    };
+    let mut push_path = |path: &str| {
+        if !flagged_paths.iter().any(|existing: &String| existing == path) {
+            flagged_paths.push(path.to_owned());
+        }
+    };
+
+    let mut non_doc_lines: usize = 0;
+    for file in files {
+        let norm = file.path.replace('\\', "/");
+        let lower = norm.to_ascii_lowercase();
+        let file_name = lower.rsplit('/').next().unwrap_or(&lower);
+        let is_test_or_doc = is_doc_or_test_path(&lower, file_name);
+
+        if is_no_undo_path(&lower, file_name) {
+            tier = UndoTier::NoUndo;
+            push_reason("migration / secrets / deploy-infra path touched (human sign-off required)");
+            push_path(&norm);
+            continue;
+        }
+        if !is_test_or_doc && lower.ends_with(".sql") && has_destructive_sql_addition(&file.patch) {
+            tier = UndoTier::NoUndo;
+            push_reason("destructive SQL statement added (human sign-off required)");
+            push_path(&norm);
+            continue;
+        }
+        if is_cleanup_path(&lower, file_name) {
+            if tier < UndoTier::Cleanup {
+                tier = UndoTier::Cleanup;
+            }
+            push_reason("auth / schema / manifest / store boundary changed (second-opinion review recommended)");
+            push_path(&norm);
+        } else if !is_test_or_doc && file.status.trim().eq_ignore_ascii_case("D")
+            || (!is_test_or_doc && file.status.trim().eq_ignore_ascii_case("deleted"))
+        {
+            if tier < UndoTier::Cleanup {
+                tier = UndoTier::Cleanup;
+            }
+            push_reason("non-test source file deleted");
+            push_path(&norm);
+        }
+
+        if !is_test_or_doc {
+            non_doc_lines = non_doc_lines
+                .saturating_add(file.additions)
+                .saturating_add(file.deletions);
+        }
+    }
+
+    if tier < UndoTier::Cleanup && (files.len() >= 8 || non_doc_lines >= 400) {
+        tier = UndoTier::Cleanup;
+        push_reason("broad multi-file or large diff (second-opinion review recommended)");
+    }
+
+    DiffRiskReport {
+        tier,
+        reasons,
+        flagged_paths,
+    }
+}
+
+fn has_path_segment(lower: &str, needle: &str) -> bool {
+    lower.split('/').any(|seg| seg == needle)
+}
+
+fn is_doc_or_test_path(lower: &str, file_name: &str) -> bool {
+    lower.ends_with(".md")
+        || lower.ends_with(".txt")
+        || has_path_segment(lower, "docs")
+        || has_path_segment(lower, "tests")
+        || has_path_segment(lower, "__tests__")
+        || file_name.starts_with("test_")
+        || file_name.ends_with("_test.rs")
+        || file_name.ends_with(".test.ts")
+        || file_name.ends_with(".test.js")
+        || file_name.ends_with(".spec.ts")
+        || file_name.ends_with(".spec.js")
+        || file_name == "tests.rs"
+}
+
+fn is_no_undo_path(lower: &str, file_name: &str) -> bool {
+    // Migrations
+    if has_path_segment(lower, "migrations")
+        || lower.contains("alembic/versions/")
+        || lower.contains("prisma/migrations/")
+        || (file_name.starts_with("migration") && file_name.ends_with(".sql"))
+        || file_name.contains(".migration.")
+    {
+        return true;
+    }
+    // Secrets / keys / env files (excluding templates)
+    let is_env_template = file_name.ends_with(".example")
+        || file_name.ends_with(".sample")
+        || file_name.ends_with(".template");
+    if (!is_env_template && (file_name == ".env" || file_name.starts_with(".env.")))
+        || file_name.ends_with(".pem")
+        || file_name.ends_with(".key")
+        || file_name.ends_with(".p12")
+        || file_name.starts_with("id_rsa")
+        || file_name.starts_with("id_ed25519")
+        || file_name.starts_with("secrets.")
+        || file_name.starts_with("credentials.")
+    {
+        return true;
+    }
+    // Deploy / infra / system install hooks
+    if has_path_segment(lower, "terraform")
+        || has_path_segment(lower, "k8s")
+        || has_path_segment(lower, "helm")
+        || has_path_segment(lower, "deploy")
+        || has_path_segment(lower, "launchagents")
+        || lower.starts_with(".github/workflows/")
+        || lower.contains("/.github/workflows/")
+        || file_name.ends_with(".tf")
+        || file_name.ends_with(".plist")
+        || file_name == "dockerfile"
+        || file_name.starts_with("docker-compose")
+        || lower.starts_with("scripts/install-")
+        || lower.starts_with("scripts/deploy")
+        || lower.starts_with("scripts/release")
+    {
+        return true;
+    }
+    false
+}
+
+fn is_cleanup_path(lower: &str, file_name: &str) -> bool {
+    if is_doc_or_test_path(lower, file_name) {
+        return false;
+    }
+    let sensitive_stem = ["auth", "security", "privacy", "permission", "oauth", "jwt", "crypto", "rbac"];
+    if sensitive_stem
+        .iter()
+        .any(|kw| file_name.contains(kw) || has_path_segment(lower, kw))
+    {
+        return true;
+    }
+    if file_name == "schema.sql"
+        || file_name == "schema.prisma"
+        || lower.starts_with("crates/store/")
+        || has_path_segment(lower, "db")
+    {
+        return true;
+    }
+    matches!(
+        file_name,
+        "cargo.toml"
+            | "cargo.lock"
+            | "package.json"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "pyproject.toml"
+            | "go.mod"
+            | "makefile"
+    )
+}
+
+fn has_destructive_sql_addition(patch: &str) -> bool {
+    for line in patch.lines() {
+        let Some(added) = line.strip_prefix('+') else {
+            continue;
+        };
+        if added.starts_with("++") {
+            continue;
+        }
+        let upper = added.to_ascii_uppercase();
+        if upper.contains("DROP TABLE")
+            || upper.contains("DROP COLUMN")
+            || upper.contains("TRUNCATE ")
+            || upper.contains("DELETE FROM")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffFile {
     pub path: String,
@@ -350,6 +574,8 @@ pub struct DiffSummary {
     pub total_additions: usize,
     pub total_deletions: usize,
     pub files: Vec<DiffFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<DiffRiskReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,6 +627,78 @@ mod tests {
             "\"open-code\""
         );
         assert_eq!(ProviderId::OpenCode.as_str(), "opencode");
+    }
+
+    #[test]
+    fn classify_diff_risk_tiers_by_undo_price() {
+        let one_click = classify_diff_risk(&[DiffFile {
+            path: "README.md".into(),
+            status: "M".into(),
+            additions: 5,
+            deletions: 2,
+            patch: String::new(),
+        }]);
+        assert_eq!(one_click.tier, UndoTier::OneClick);
+        assert!(one_click.flagged_paths.is_empty());
+
+        let cleanup_auth = classify_diff_risk(&[DiffFile {
+            path: "crates/server/src/auth.rs".into(),
+            status: "M".into(),
+            additions: 12,
+            deletions: 4,
+            patch: String::new(),
+        }]);
+        assert_eq!(cleanup_auth.tier, UndoTier::Cleanup);
+        assert_eq!(cleanup_auth.flagged_paths, vec!["crates/server/src/auth.rs"]);
+
+        let no_undo_migration = classify_diff_risk(&[
+            DiffFile {
+                path: "README.md".into(),
+                status: "M".into(),
+                additions: 1,
+                deletions: 0,
+                patch: String::new(),
+            },
+            DiffFile {
+                path: "db/migrations/0012_drop_legacy.sql".into(),
+                status: "A".into(),
+                additions: 3,
+                deletions: 0,
+                patch: "+DROP TABLE legacy_runs;\n".into(),
+            },
+        ]);
+        assert_eq!(no_undo_migration.tier, UndoTier::NoUndo);
+        assert_eq!(
+            no_undo_migration.flagged_paths,
+            vec!["db/migrations/0012_drop_legacy.sql"]
+        );
+
+        let no_undo_sql = classify_diff_risk(&[DiffFile {
+            path: "crates/store/src/schema.sql".into(),
+            status: "M".into(),
+            additions: 1,
+            deletions: 0,
+            patch: "+ALTER TABLE runs DROP COLUMN legacy;\n".into(),
+        }]);
+        assert_eq!(no_undo_sql.tier, UndoTier::NoUndo);
+
+        let env_example = classify_diff_risk(&[DiffFile {
+            path: ".env.example".into(),
+            status: "M".into(),
+            additions: 1,
+            deletions: 0,
+            patch: String::new(),
+        }]);
+        assert_eq!(env_example.tier, UndoTier::OneClick);
+
+        let real_env = classify_diff_risk(&[DiffFile {
+            path: ".env.production".into(),
+            status: "M".into(),
+            additions: 1,
+            deletions: 0,
+            patch: String::new(),
+        }]);
+        assert_eq!(real_env.tier, UndoTier::NoUndo);
     }
 }
 

@@ -1,6 +1,17 @@
 use super::*;
 use serde::Deserialize;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyDeadEnd {
+    pub attempt: u8,
+    pub signature: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+    pub summary: String,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct QueuedRunInput {
     pub model_selection: ModelSelection,
@@ -13,6 +24,8 @@ pub struct QueuedRunInput {
     pub verify_fix_depth: u8,
     #[serde(default)]
     pub last_verify_signature: Option<String>,
+    #[serde(default)]
+    pub verify_dead_ends: Vec<VerifyDeadEnd>,
     #[serde(default)]
     pub fallback_attempts: u8,
 }
@@ -403,6 +416,7 @@ mod tests {
                     mode_ceiling: Some((RuntimeMode::ApprovalRequired, InteractionMode::Plan)),
                     verify_fix_depth: 0,
                     last_verify_signature: None,
+                    verify_dead_ends: Vec::new(),
                     fallback_attempts: 0,
                 },
             )

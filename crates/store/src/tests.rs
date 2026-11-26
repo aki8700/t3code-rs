@@ -1321,3 +1321,135 @@ fn daemon_lock_is_exclusive_until_the_holder_is_dropped() {
     assert!(acquire_daemon_lock(&dir.0).is_ok());
     drop(inherited);
 }
+
+#[test]
+fn opening_a_database_from_before_restart_resumes_adds_the_column() {
+    let dir = TempDir::new();
+    let db_path = dir.0.join("state.sqlite");
+    drop(SqliteStore::open(&db_path, StorageConfig::default()).unwrap());
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch("ALTER TABLE runs DROP COLUMN restart_resumes")
+        .unwrap();
+    let store = SqliteStore::open(&db_path, StorageConfig::default()).unwrap();
+    store.recover_interrupted_runs().unwrap();
+}
+
+#[test]
+fn every_added_column_in_projects_and_runs_has_a_migration_and_matches_fresh_schema() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn table_columns(conn: &rusqlite::Connection, table: &str) -> BTreeMap<String, (String, i64, Option<String>)> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                (
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ),
+            ))
+        })
+        .unwrap()
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .unwrap()
+    }
+
+    let dir = TempDir::new();
+    let fresh_path = dir.0.join("fresh.sqlite");
+    drop(SqliteStore::open(&fresh_path, StorageConfig::default()).unwrap());
+    let fresh_conn = rusqlite::Connection::open(&fresh_path).unwrap();
+
+    // Baseline v0 columns that existed in the original schema before ALTER TABLE migrations.
+    let baseline: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::from([
+        (
+            "projects",
+            BTreeSet::from([
+                "id",
+                "title",
+                "workspace_root",
+                "default_model",
+                "created_at",
+                "updated_at",
+            ]),
+        ),
+        (
+            "runs",
+            BTreeSet::from([
+                "id",
+                "thread_id",
+                "ordinal",
+                "provider",
+                "model",
+                "effort",
+                "status",
+                "prompt",
+                "provider_session_id",
+                "input_tokens",
+                "output_tokens",
+                "duration_ms",
+                "error_message",
+                "started_at",
+                "completed_at",
+            ]),
+        ),
+    ]);
+
+    let migrated_pairs: BTreeSet<(String, String)> = MIGRATIONS
+        .iter()
+        .filter_map(|sql| {
+            let tokens: Vec<&str> = sql.split_whitespace().collect();
+            if tokens.len() >= 6
+                && tokens[0].eq_ignore_ascii_case("ALTER")
+                && tokens[1].eq_ignore_ascii_case("TABLE")
+                && tokens[3].eq_ignore_ascii_case("ADD")
+                && tokens[4].eq_ignore_ascii_case("COLUMN")
+            {
+                Some((tokens[2].to_owned(), tokens[5].to_owned()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Write-It-Twice guard: any column added to `projects` or `runs` in schema.sql must also
+    // appear in `MIGRATIONS` so existing databases upgrade cleanly on startup.
+    for (table, base_cols) in &baseline {
+        let fresh_cols = table_columns(&fresh_conn, table);
+        for col in fresh_cols.keys() {
+            if !base_cols.contains(col.as_str()) {
+                assert!(
+                    migrated_pairs.contains(&((*table).to_owned(), col.clone())),
+                    "column `{table}.{col}` exists in schema.sql but is missing from MIGRATIONS"
+                );
+            }
+        }
+    }
+
+    // Drop every migrated column from a copy of the database, reopen via SqliteStore::open,
+    // and assert full column parity (name, type, NOT NULL, default) with the fresh schema.
+    let legacy_path = dir.0.join("legacy.sqlite");
+    drop(SqliteStore::open(&legacy_path, StorageConfig::default()).unwrap());
+    {
+        let conn = rusqlite::Connection::open(&legacy_path).unwrap();
+        for (table, col) in &migrated_pairs {
+            conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {col}"))
+                .unwrap();
+        }
+    }
+    let upgraded = SqliteStore::open(&legacy_path, StorageConfig::default()).unwrap();
+    upgraded.recover_interrupted_runs().unwrap();
+    drop(upgraded);
+
+    let legacy_conn = rusqlite::Connection::open(&legacy_path).unwrap();
+    for table in baseline.keys() {
+        assert_eq!(
+            table_columns(&legacy_conn, table),
+            table_columns(&fresh_conn, table),
+            "upgraded table `{table}` schema diverged from fresh schema.sql"
+        );
+    }
+}

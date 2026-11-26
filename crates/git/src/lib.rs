@@ -5,7 +5,7 @@ use std::{
     process::{Output, Stdio},
 };
 
-use t3_core::{CoreError, CoreResult, DiffFile, DiffSummary};
+use t3_core::{CoreError, CoreResult, DiffFile, DiffSummary, classify_diff_risk};
 use tokio::{io::AsyncReadExt, process::Command};
 use uuid::Uuid;
 
@@ -440,6 +440,7 @@ impl GitManager {
             });
         }
 
+        let risk = Some(classify_diff_risk(&files));
         Ok(DiffSummary {
             workspace_path: dir.to_owned(),
             branch,
@@ -447,6 +448,7 @@ impl GitManager {
             total_additions: files.iter().map(|file| file.additions).sum(),
             total_deletions: files.iter().map(|file| file.deletions).sum(),
             files,
+            risk,
         })
     }
 
@@ -564,6 +566,7 @@ impl GitManager {
             });
         }
 
+        let risk = Some(classify_diff_risk(&files));
         Ok(DiffSummary {
             workspace_path: workspace.to_owned(),
             branch: Some(head_ref.to_owned()),
@@ -571,6 +574,7 @@ impl GitManager {
             total_additions: files.iter().map(|file| file.additions).sum(),
             total_deletions: files.iter().map(|file| file.deletions).sum(),
             files,
+            risk,
         })
     }
 }
