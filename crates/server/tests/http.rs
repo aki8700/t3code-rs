@@ -3199,6 +3199,143 @@ async fn tier4_streaming_shell_cancel_monitor_and_worktree_merge_routes() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn limited_provider_holds_queued_runs_until_reset_while_other_providers_dispatch() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new();
+    let workspace = tmp.0.join("repo");
+    std::fs::create_dir(&workspace).unwrap();
+    git(&workspace, &["init", "-q"]);
+    let reset_at = chrono::Utc::now().timestamp() + 6;
+    let fake_claude = tmp.0.join("fake-claude-hold");
+    let count_file = tmp.0.join("claude-runs.txt");
+    std::fs::write(
+        &fake_claude,
+        format!(
+            r#"#!/bin/sh
+IFS= read -r line
+printf 'run\n' >> "{count}"
+case "$line" in
+  *quota-trigger*)
+    printf '%s\n' '{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","resetsAt":{reset_at}}}}}'
+    exit 0
+    ;;
+  *)
+    printf '%s\n' '{{"type":"system","session_id":"sess-ok"}}'
+    printf '%s\n' '{{"type":"result","subtype":"success","result":"done"}}'
+    exit 0
+    ;;
+esac
+"#,
+            count = count_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let claude_runs = || {
+        std::fs::read_to_string(&count_file)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    let mut cfg = ServerConfig {
+        data_dir: tmp.0.join("server"),
+        enabled_providers: vec![ProviderId::Claude, ProviderId::Mock],
+        auto_resume_limited_threads: false,
+        ..Default::default()
+    };
+    cfg.providers.claude_bin = fake_claude;
+    let state = ServerState::new(cfg, "http://127.0.0.1:3774".into()).unwrap();
+    let app = router(state);
+    let proj = json_req(
+        &app,
+        Method::POST,
+        "/api/projects",
+        Some(json!({"title": "Hold Proj", "workspace_root": workspace})),
+    )
+    .await;
+    let pid = proj["id"].as_str().unwrap();
+    let thread = |title: &'static str, provider: &'static str, model: &'static str| {
+        let app = app.clone();
+        let pid = pid.to_owned();
+        async move {
+            let thread = json_req(
+                &app,
+                Method::POST,
+                "/api/threads",
+                Some(json!({
+                    "project_id": pid,
+                    "title": title,
+                    "model_selection": {"provider": provider, "model": model},
+                })),
+            )
+            .await;
+            thread["id"].as_str().unwrap().parse::<Uuid>().unwrap()
+        }
+    };
+    let send = |id: Uuid, prompt: &'static str| {
+        let app = app.clone();
+        async move {
+            json_req(
+                &app,
+                Method::POST,
+                &format!("/api/threads/{id}/messages"),
+                Some(json!({"prompt": prompt})),
+            )
+            .await;
+        }
+    };
+
+    let limited = thread("Limited", "claude", "claude-opus-5-5").await;
+    send(limited, "quota-trigger please").await;
+    let detail = wait_for_runs(&app, limited, 1).await;
+    assert_eq!(detail["runs"][0]["status"], "rate-limited");
+    assert_eq!(
+        detail["runs"][0]["error_message"],
+        format!("capacity: rate_limit_event (reset_at: {reset_at})")
+    );
+    assert_eq!(claude_runs(), 1);
+
+    let held = thread("Held", "claude", "claude-opus-5-5").await;
+    send(held, "next task").await;
+    let other = thread("Other provider", "mock", "mock").await;
+    send(other, "independent task").await;
+    let detail = wait_for_runs(&app, other, 1).await;
+    assert_eq!(detail["runs"][0]["status"], "completed");
+
+    let detail = json_req(&app, Method::GET, &format!("/api/threads/{held}"), None).await;
+    assert_eq!(detail["runs"][0]["status"], "queued");
+    assert_eq!(detail["thread"]["status"], "rate-limited");
+    let notices = detail["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["kind"] == "system_notice" && item["payload"]["held_until"].is_string())
+        .count();
+    assert_eq!(notices, 1, "the held run shows why it waits, once");
+    assert_eq!(claude_runs(), 1, "the held run must not reach the CLI");
+
+    let detail = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let detail = json_req(&app, Method::GET, &format!("/api/threads/{held}"), None).await;
+            if detail["runs"][0]["status"] == "completed" {
+                return detail;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("held run did not dispatch after reset_at");
+    assert!(chrono::Utc::now().timestamp() >= reset_at);
+    assert_eq!(detail["thread"]["status"], "completed");
+    assert_eq!(claude_runs(), 2);
+    let detail = json_req(&app, Method::GET, &format!("/api/threads/{limited}"), None).await;
+    assert_eq!(detail["runs"][0]["status"], "rate-limited");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn tier4_verify_autofix_loop_and_quota_fallback() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -3739,7 +3876,12 @@ exit 0
     // Run 2 mutates a.txt differently but hits the same normalized verify error -> escalates immediately!
     // Total runs must be 2 (NOT 5).
     let runs = detail["runs"].as_array().unwrap();
-    assert_eq!(runs.len(), 2, "expected same-result-twice escalation at run 2, got {} runs", runs.len());
+    assert_eq!(
+        runs.len(),
+        2,
+        "expected same-result-twice escalation at run 2, got {} runs",
+        runs.len()
+    );
     assert!(
         runs[1]["error_message"]
             .as_str()

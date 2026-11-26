@@ -1,4 +1,5 @@
 use crate::auth::{ActiveMcpToken, McpTokens, RunMcpToken};
+use crate::provider_hold::{ProviderHold, ProviderHolds, limited_until, model_scoped};
 use crate::swarm::{SwarmTurn, is_swarm_command};
 use chrono::Utc;
 use serde::Deserialize;
@@ -15,7 +16,8 @@ use t3_core::*;
 use t3_git::GitManager;
 use t3_providers::{
     FailureClass, ProviderRegistry, classify_harness_failure, classify_provider_failure,
-    classify_rate_limit, format_delegated_error, format_run_error, run_turn_with_retry,
+    classify_rate_limit, format_delegated_error, format_run_error, format_worker_error,
+    run_turn_with_retry,
 };
 use t3_store::{INTERRUPTED_BY_RESTART, QueuedRun, QueuedRunInput, SqliteStore, VerifyDeadEnd};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
@@ -40,6 +42,7 @@ pub(crate) struct Coordinator {
     injection: McpInjectionSpec,
     tokens: McpTokens,
     limits: Arc<crate::limits::UsageLimitsCache>,
+    holds: ProviderHolds,
 }
 
 const MAX_LIVE_CONTEXT_ENTRIES: usize = 256;
@@ -131,6 +134,7 @@ struct Outcome {
     had_side_effects: bool,
     hard_rate_limited: bool,
     reset_at: Option<String>,
+    limited_until: Option<chrono::DateTime<Utc>>,
     failure_class: Option<FailureClass>,
     assistant: String,
     reasoning: String,
@@ -177,6 +181,7 @@ impl RunCoordinator {
             injection,
             tokens,
             limits,
+            holds: ProviderHolds::default(),
             events,
             active: Mutex::new(HashMap::new()),
             latest_context: Mutex::new(HashMap::new()),
@@ -523,6 +528,19 @@ impl RunCoordinator {
     ) -> CoreResult<RunTicket> {
         self.ensure_accepting_runs()?;
         self.validate_message(&thread, &message).await?;
+        let selection = message
+            .model_selection
+            .as_ref()
+            .unwrap_or(&thread.model_selection);
+        if let Some((hold, _)) = self.0.holds.blocking(selection, None) {
+            return Err(CoreError::Provider(format_worker_error(
+                FailureClass::UsageLimit,
+                selection.provider,
+                &selection.model,
+                Some(&hold.until.to_rfc3339()),
+                &format!("provider is held until its limit resets: {}", hold.reason),
+            )));
+        }
         let id = self.enqueue(&thread, message, true, 0, false).await?;
         let (ticket, turn) = self
             .start_next(active, &thread, Some(id))
@@ -682,6 +700,16 @@ impl RunCoordinator {
         let store = &self.0.store;
         while let Some(queued) = store.next_queued_run(thread.id).await? {
             let run_id = queued.id;
+            if let Some((hold, announced)) = self
+                .0
+                .holds
+                .blocking(&queued.input.model_selection, Some(run_id))
+            {
+                if !announced {
+                    self.announce_hold(thread.id, run_id, &hold).await;
+                }
+                return Ok(None);
+            }
             match self.start(active, thread.clone(), queued).await {
                 Ok(Some(started)) => return Ok(Some(started)),
                 Ok(None) => {}
@@ -1163,6 +1191,7 @@ impl RunCoordinator {
             had_side_effects: false,
             hard_rate_limited: false,
             reset_at: None,
+            limited_until: None,
             failure_class: None,
             assistant: String::new(),
             reasoning: String::new(),
@@ -1718,6 +1747,19 @@ impl RunCoordinator {
         {
             tracing::error!(%error, %run_id, "Could not notify coordinator of silent worker exit");
         }
+        if let Some(until) = outcome.limited_until.filter(|until| *until > Utc::now())
+            && (status == RunStatus::RateLimited
+                || (status == RunStatus::Failed
+                    && outcome.failure_class == Some(FailureClass::UsageLimit)))
+        {
+            let reason = error.clone().unwrap_or_default();
+            self.hold_provider(ProviderHold {
+                provider: outcome.provider,
+                model: model_scoped(&outcome.model, &reason).then(|| outcome.model.clone()),
+                until,
+                reason,
+            });
+        }
         self.0.live_streams.lock().await.remove(&thread_id);
         self.emit(WsServerMessage::RunStatusChanged {
             thread_id,
@@ -1914,6 +1956,8 @@ impl RunCoordinator {
                 error_code,
             } => {
                 out.reset_at = reset_at.clone();
+                out.limited_until =
+                    limited_until(reset_at.as_deref(), retry_after_secs, Utc::now());
                 let class = classify_rate_limit(out.provider, &message, error_code.as_deref());
                 out.failure_class = Some(class);
                 out.hard_rate_limited = class == FailureClass::UsageLimit;
@@ -2043,6 +2087,7 @@ impl RunCoordinator {
                 reset_at,
                 error_code,
             } => {
+                out.limited_until = limited_until(reset_at.as_deref(), 0, Utc::now());
                 out.reset_at = reset_at;
                 out.failure_class = Some(classify_provider_failure(
                     out.provider,
@@ -2116,6 +2161,70 @@ impl RunCoordinator {
             },
         );
     }
+
+    /// Holds new runs for a limited provider and dispatches them again once the limit resets.
+    fn hold_provider(&self, hold: ProviderHold) {
+        let until = hold.until;
+        tracing::warn!(provider = hold.provider.as_str(), model = ?hold.model, %until, "Holding queued runs until the provider limit resets");
+        if !self.0.holds.record(hold) {
+            return;
+        }
+        let coordinator = Arc::downgrade(&self.0);
+        let wait =
+            (until - Utc::now()).to_std().unwrap_or_default() + std::time::Duration::from_secs(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            if let Some(coordinator) = coordinator.upgrade()
+                && let Err(error) = RunCoordinator(coordinator).resume_queued_runs().await
+            {
+                tracing::warn!(%error, "Could not resume runs held for a provider limit");
+            }
+        });
+    }
+
+    /// Releases a provider hold early, e.g. after its quota was reset by a credit.
+    pub(crate) async fn release_provider_hold(&self, provider: ProviderId) {
+        self.0.holds.release(provider);
+        if let Err(error) = self.resume_queued_runs().await {
+            tracing::warn!(%error, "Could not resume runs after releasing a provider hold");
+        }
+    }
+
+    async fn announce_hold(&self, thread_id: Uuid, run_id: Uuid, hold: &ProviderHold) {
+        let target = hold.model.as_deref().map_or_else(
+            || hold.provider.as_str().to_owned(),
+            |model| format!("{}/{model}", hold.provider.as_str()),
+        );
+        let until = hold.until.to_rfc3339();
+        let notice =
+            format!("{target} の利用上限が {until} に解除されるまで、この run は待機します");
+        let appended = self
+            .append(NewTurnItem {
+                thread_id,
+                run_id,
+                kind: TurnItemKind::SystemNotice,
+                summary: Some(notice.clone()),
+                payload: json!({
+                    "message": notice,
+                    "held_until": until,
+                    "provider": hold.provider,
+                    "model": hold.model,
+                    "reason": hold.reason,
+                }),
+                searchable_text: None,
+            })
+            .await;
+        if let Err(error) = async {
+            appended?;
+            self.thread_status(thread_id, ThreadStatus::RateLimited)
+                .await
+        }
+        .await
+        {
+            tracing::warn!(%error, %run_id, "Could not report a run held for a provider limit");
+        }
+    }
+
     fn pick_fallback_model(
         &self,
         current: &ModelSelection,
