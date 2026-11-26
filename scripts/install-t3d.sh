@@ -100,8 +100,15 @@ fi
 }
 mv -f -- "$staged" "$dest" >> "$log" 2>&1
 launchctl kickstart -k "$target" >> "$log" 2>&1
-sleep 3
-if "$dest" status >> "$log" 2>&1; then
+healthy=0
+for i in {1..15}; do
+    sleep 2
+    if "$dest" status > /dev/null 2>&1; then
+        healthy=1
+        break
+    fi
+done
+if [[ "$healthy" -eq 1 ]]; then
     print "$(date "+%F %T") $rev: restarted OK" >> "$log"
     osascript -e "display notification \"t3d を $rev で再起動しました\" with title \"t3code-rs\""
 else
