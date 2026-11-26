@@ -43,6 +43,7 @@ pub(crate) struct Coordinator {
     tokens: McpTokens,
     limits: Arc<crate::limits::UsageLimitsCache>,
     holds: ProviderHolds,
+    pub(crate) wake_deliveries: crate::swarm::WakeDeliveries,
 }
 
 const MAX_LIVE_CONTEXT_ENTRIES: usize = 256;
@@ -184,6 +185,7 @@ impl RunCoordinator {
             tokens,
             limits,
             holds: ProviderHolds::default(),
+            wake_deliveries: Default::default(),
             events,
             active: Mutex::new(HashMap::new()),
             latest_context: Mutex::new(HashMap::new()),
@@ -1725,6 +1727,9 @@ impl RunCoordinator {
         }
         if let Err(error) = store.update_thread_status(thread_id, thread_status).await {
             tracing::error!(%error, %run_id, "Could not persist thread status");
+        }
+        if let Err(error) = self.settle_wake(thread_id, run_id, status).await {
+            tracing::error!(%error, %run_id, "Could not acknowledge swarm wake posts");
         }
         if !defer_completion
             && (swarm.is_some() || thread.relationship.as_deref() == Some("swarm-worker"))
