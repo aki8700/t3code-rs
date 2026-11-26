@@ -2134,6 +2134,40 @@ async fn oversized_swarm_post_error_says_to_pass_a_file_reference() {
     );
 }
 
+// A worker that ends on a provider limit must record the hold before it wakes the
+// coordinator, so a coordinator on the same provider is held instead of run into it.
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_limit_holds_the_same_provider_coordinator_before_waking_it() {
+    let tmp = TempDir::new();
+    let (app, id) = swarm_fixture(
+        &tmp,
+        r#"#!/bin/sh
+IFS= read -r prompt
+echo x >> calls
+marker=$(printf '%s' "$prompt" | grep -o 'T3_SWARM_ACTION [0-9a-f-]*' | head -n 1)
+case "$prompt" in
+  *"You are coordinator."*)
+    text="$marker"' {\"tool\":\"swarm_add_worker\",\"name\":\"w1\",\"brief\":\"x\"}'
+    printf '{"type":"result","subtype":"success","result":"%s"}\n' "$text" ;;
+  *)
+    reset=$(( $(date +%s) + 3600 ))
+    printf '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":%s,"rateLimitType":"five_hour"}}\n' "$reset" ;;
+esac
+"#,
+    )
+    .await;
+    start_swarm(&app, id).await;
+    assert_eq!(
+        settled_calls(&tmp).await,
+        2,
+        "the woken coordinator ran into the limit"
+    );
+    let detail = wait_for_runs(&app, id, 2).await;
+    let runs = detail["runs"].as_array().unwrap();
+    assert_eq!(runs[1]["status"], "queued", "{}", runs[1]);
+}
+
 #[cfg(unix)]
 async fn settled_calls(tmp: &TempDir) -> usize {
     let mut last = 0;

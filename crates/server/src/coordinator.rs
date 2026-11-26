@@ -1697,6 +1697,20 @@ impl RunCoordinator {
         }
         self.settle_live_state(thread_id, run_id, outcome.session)
             .await;
+        // Before any wake below (parent, coordinator) so a woken run on this provider is held.
+        if let Some(until) = outcome.limited_until.filter(|until| *until > Utc::now())
+            && (status == RunStatus::RateLimited
+                || (status == RunStatus::Failed
+                    && outcome.failure_class == Some(FailureClass::UsageLimit)))
+        {
+            let reason = error.clone().unwrap_or_default();
+            self.hold_provider(ProviderHold {
+                provider: outcome.provider,
+                model: model_scoped(&outcome.model, &reason).then(|| outcome.model.clone()),
+                until,
+                reason,
+            });
+        }
         let mut enqueued_followup = false;
         if let Some((followup_msg, followup_meta)) = scheduled_auto_followup {
             match self
@@ -1747,19 +1761,6 @@ impl RunCoordinator {
                 .await
         {
             tracing::error!(%error, %run_id, "Could not notify coordinator of silent worker exit");
-        }
-        if let Some(until) = outcome.limited_until.filter(|until| *until > Utc::now())
-            && (status == RunStatus::RateLimited
-                || (status == RunStatus::Failed
-                    && outcome.failure_class == Some(FailureClass::UsageLimit)))
-        {
-            let reason = error.clone().unwrap_or_default();
-            self.hold_provider(ProviderHold {
-                provider: outcome.provider,
-                model: model_scoped(&outcome.model, &reason).then(|| outcome.model.clone()),
-                until,
-                reason,
-            });
         }
         self.emit(WsServerMessage::RunStatusChanged {
             thread_id,
