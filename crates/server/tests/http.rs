@@ -2276,6 +2276,7 @@ async fn project_patch_workspace_meta_and_instructions_injection() {
     std::fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
 
     let state = tmp.state(AuthConfig::LocalOnly);
+    let store = state.store.clone();
     let mut events = state.coordinator.subscribe();
     let app = router(state);
 
@@ -2355,6 +2356,96 @@ async fn project_patch_workspace_meta_and_instructions_injection() {
         .and_then(|item| item["payload"]["text"].as_str())
         .unwrap();
     assert!(reply.contains("Project instructions:\nAlways respond in Japanese."));
+
+    // Native resume should reuse provider context without sending the instructions again.
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{tid}/messages"),
+        Some(json!({"prompt": "continue naturally"})),
+    )
+    .await;
+    wait_for_thread(&mut events, tid, ThreadStatus::Completed).await;
+    let detail = json_req(&app, Method::GET, &format!("/api/threads/{tid}"), None).await;
+    let replies: Vec<_> = detail["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["kind"] == "assistant_message")
+        .filter_map(|item| item["payload"]["text"].as_str())
+        .collect();
+    assert_eq!(replies.len(), 2);
+    assert!(!replies[1].contains("Project instructions:"));
+    assert!(replies[1].contains("continue naturally"));
+
+    // A model switch starts a fresh provider session and must keep instructions
+    // ahead of the previous-run handoff and current request.
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{tid}/messages"),
+        Some(json!({
+            "prompt": "continue after switching models",
+            "model_selection": {"provider": "mock", "model": "mock-2"}
+        })),
+    )
+    .await;
+    wait_for_thread(&mut events, tid, ThreadStatus::Completed).await;
+    let detail = json_req(&app, Method::GET, &format!("/api/threads/{tid}"), None).await;
+    let reply = detail["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|item| item["kind"] == "assistant_message")
+        .and_then(|item| item["payload"]["text"].as_str())
+        .unwrap();
+    assert!(reply.starts_with("Project instructions:\nAlways respond in Japanese."));
+    assert!(reply.contains("Context from the previous run:"));
+    assert!(reply.contains("Current request:\ncontinue after switching models"));
+
+    // A prior completed run without a provider session also starts fresh.
+    store
+        .create_run(Run {
+            id: Uuid::new_v4(),
+            thread_id: tid,
+            ordinal: 4,
+            provider: ProviderId::Mock,
+            model: "mock-2".into(),
+            effort: None,
+            status: RunStatus::Completed,
+            prompt: "synthetic prior run without a session".into(),
+            provider_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
+            duration_ms: None,
+            error_message: None,
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+        })
+        .await
+        .unwrap();
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{tid}/messages"),
+        Some(json!({"prompt": "continue without a provider session"})),
+    )
+    .await;
+    wait_for_thread(&mut events, tid, ThreadStatus::Completed).await;
+    let detail = json_req(&app, Method::GET, &format!("/api/threads/{tid}"), None).await;
+    let reply = detail["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|item| item["kind"] == "assistant_message")
+        .and_then(|item| item["payload"]["text"].as_str())
+        .unwrap();
+    assert!(reply.starts_with("Project instructions:\nAlways respond in Japanese."));
+    assert!(reply.contains("Context from the previous run:"));
+    assert!(reply.contains("Current request:\ncontinue without a provider session"));
 }
 
 #[tokio::test]

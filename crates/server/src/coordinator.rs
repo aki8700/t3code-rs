@@ -740,7 +740,7 @@ impl RunCoordinator {
                 handoff.summary
             );
         }
-        if previous_run.is_none()
+        if resume_session_id.is_none()
             && let Some(instructions) = project
                 .instructions
                 .as_deref()
