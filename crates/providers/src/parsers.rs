@@ -755,14 +755,72 @@ fn error_event(event: &Value) -> StreamEvent {
     let retry = [error, &error["data"], event, info]
         .into_iter()
         .find_map(retry_after);
+    let reset_at = [error, &error["data"], event, info]
+        .into_iter()
+        .find_map(reset_at);
+    let error_code = [error, &error["data"], event, info]
+        .into_iter()
+        .filter_map(error_code)
+        .collect::<Vec<_>>();
+    let error_code = (!error_code.is_empty()).then(|| error_code.join(" "));
     if rate_limit || is_rate_limit(&message) {
         StreamEvent::RateLimited {
             retry_after_secs: retry.unwrap_or(0),
             message,
+            reset_at,
+            error_code,
         }
     } else {
-        StreamEvent::Failed { message }
+        StreamEvent::Failed {
+            message,
+            reset_at,
+            error_code,
+        }
     }
+}
+
+fn error_code(value: &Value) -> Option<String> {
+    let mut codes: Vec<_> = ["code", "name", "type"]
+        .into_iter()
+        .filter_map(|key| value[key].as_str())
+        .filter(|code| {
+            !matches!(
+                code.to_ascii_lowercase().as_str(),
+                "error"
+                    | "failed"
+                    | "result"
+                    | "turn.failed"
+                    | "turn.completed"
+                    | "rate_limit"
+                    | "rate_limited"
+            )
+        })
+        .map(str::to_owned)
+        .collect();
+    codes.extend(
+        ["statusCode", "status"]
+            .into_iter()
+            .filter_map(|key| value[key].as_i64().map(|status| status.to_string())),
+    );
+    (!codes.is_empty()).then(|| codes.join(" "))
+}
+
+fn reset_at(value: &Value) -> Option<String> {
+    [
+        "reset_at",
+        "resetAt",
+        "resets_at",
+        "resetsAt",
+        "reset_time",
+        "resetTime",
+    ]
+    .into_iter()
+    .find_map(|key| {
+        value[key]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| as_u64(&value[key]).map(|epoch| epoch.to_string()))
+    })
 }
 
 fn retry_after(value: &Value) -> Option<u64> {
@@ -791,29 +849,47 @@ fn is_rate_limit(message: &str) -> bool {
     matches!(
         normalized.as_str(),
         "429" | "resourceexhausted" | "ratelimiterror"
-    ) || [
-        "rate limit",
-        "usage limit",
-        "too many requests",
-        "quota exceeded",
-        "resource exhausted",
-        "overloaded",
-        "hit your limit",
-        "http 429",
-        "status 429",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
+    ) || normalized.contains(" 429")
+        || [
+            "rate limit",
+            "api error 429",
+            "turn rate limit exceeded",
+            "usage limit",
+            "usagelimitexceeded",
+            "too many requests",
+            "at capacity",
+            "capacity exceeded",
+            "individual quota",
+            "quota reached",
+            "quota exceeded",
+            "resource exhausted",
+            "overloaded",
+            "hit your limit",
+            "http 429",
+            "status 429",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle))
 }
 
-pub(crate) fn provider_error(message: String) -> StreamEvent {
-    if is_rate_limit(&message) {
+pub(crate) fn provider_error(
+    message: String,
+    reset_at: Option<String>,
+    error_code: Option<String>,
+) -> StreamEvent {
+    if is_rate_limit(&message) || error_code.as_deref().is_some_and(is_rate_limit) {
         StreamEvent::RateLimited {
             retry_after_secs: 0,
             message,
+            reset_at,
+            error_code,
         }
     } else {
-        StreamEvent::Failed { message }
+        StreamEvent::Failed {
+            message,
+            reset_at,
+            error_code,
+        }
     }
 }
 
@@ -1051,6 +1127,52 @@ mod tests {
                 [json!({"type":"failed","message":"fixture failure"})]
             );
         }
+    }
+
+    #[test]
+    fn antigravity_individual_quota_error_keeps_reset_time() {
+        let events = fixture(
+            ProviderId::Antigravity,
+            r#"{"type":"error","error":{"code":"USAGE_LIMIT_EXCEEDED","message":"Individual quota reached"},"reset_at":"2026-11-27T03:00:00Z"}"#,
+        );
+
+        assert_eq!(event_types(&events), ["rate_limited"]);
+        assert_eq!(events[0]["message"], "Individual quota reached");
+        assert_eq!(events[0]["reset_at"], "2026-11-27T03:00:00Z");
+        assert_eq!(events[0]["error_code"], "USAGE_LIMIT_EXCEEDED");
+    }
+
+    #[test]
+    fn claude_capacity_and_codex_usage_limit_codes_are_preserved() {
+        let claude = fixture(
+            ProviderId::Claude,
+            r#"{"type":"error","error":{"type":"api_error_429","message":"Service at capacity"}}"#,
+        );
+        assert_eq!(event_types(&claude), ["rate_limited"]);
+        assert_eq!(claude[0]["error_code"], "api_error_429");
+
+        let codex = fixture(
+            ProviderId::Codex,
+            r#"{"type":"turn.failed","error":{"code":"usageLimitExceeded","message":"Plan limit reached","reset_at":"2026-11-28T00:00:00Z"}}"#,
+        );
+        assert_eq!(event_types(&codex), ["rate_limited"]);
+        assert_eq!(codex[0]["error_code"], "usageLimitExceeded");
+        assert_eq!(codex[0]["reset_at"], "2026-11-28T00:00:00Z");
+
+        let auth = fixture(
+            ProviderId::Codex,
+            r#"{"type":"error","error":{"name":"APIError","data":{"message":"Request rejected","statusCode":401}}}"#,
+        );
+        assert_eq!(event_types(&auth), ["failed"]);
+        assert_eq!(auth[0]["error_code"], "APIError 401");
+        assert_eq!(
+            crate::classify_provider_failure(
+                ProviderId::Codex,
+                auth[0]["message"].as_str().unwrap(),
+                auth[0]["error_code"].as_str(),
+            ),
+            crate::FailureClass::Auth
+        );
     }
 
     #[test]

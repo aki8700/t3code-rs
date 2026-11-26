@@ -537,6 +537,8 @@ async fn run_turn_with_idle_timeout(
         ReadOutcome::Stopped(message) => {
             let _ = tx.send(StreamEvent::Failed {
                 message: message.into(),
+                reset_at: None,
+                error_code: None,
             });
             return Ok(());
         }
@@ -544,19 +546,31 @@ async fn run_turn_with_idle_timeout(
     let event = if interrupted.load(Ordering::Acquire) {
         StreamEvent::Failed {
             message: "interrupted".into(),
+            reset_at: None,
+            error_code: None,
         }
     } else if matches!(terminal, Some(StreamEvent::RateLimited { .. })) {
         terminal.expect("rate-limit event")
     } else if !status.success() {
         let stderr = redact_stderr(&String::from_utf8_lossy(&stderr), secret);
-        let detail = match &terminal {
-            Some(StreamEvent::Failed { message }) => Some(message.as_str()),
-            _ => None,
+        let (detail, reset_at, error_code) = match &terminal {
+            Some(StreamEvent::Failed {
+                message,
+                reset_at,
+                error_code,
+            }) => (Some(message.as_str()), reset_at.clone(), error_code.clone()),
+            _ => (None, None, None),
         };
-        provider_error(exit_message(status, stderr.trim(), detail))
+        provider_error(
+            exit_message(status, stderr.trim(), detail),
+            reset_at,
+            error_code,
+        )
     } else {
         terminal.unwrap_or_else(|| StreamEvent::Failed {
             message: format!("{} exited without a turn result", provider.display_name()),
+            reset_at: None,
+            error_code: None,
         })
     };
     let _ = tx.send(event);
@@ -1044,7 +1058,7 @@ exit 7
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
         driver.run_turn(req, tx).await.unwrap();
-        let Some(StreamEvent::Failed { message }) = receive(&mut rx).await else {
+        let Some(StreamEvent::Failed { message, .. }) = receive(&mut rx).await else {
             panic!("expected one terminal failure");
         };
         assert!(message.contains("exit status: 7"));
@@ -1108,7 +1122,7 @@ wait
             driver.interrupt(id).await.unwrap();
             let event = receive(&mut rx).await;
             assert!(
-                matches!(event, Some(StreamEvent::Failed { message }) if message == "interrupted")
+                matches!(event, Some(StreamEvent::Failed { message, .. }) if message == "interrupted")
             );
             task.await.unwrap().unwrap();
         } else {
@@ -1212,7 +1226,7 @@ wait
             assert_processes_exited(pid.parse().unwrap(), grandchild.parse().unwrap()).await;
             assert!(matches!(
                 receive(&mut rx).await,
-                Some(StreamEvent::Failed { message }) if message == "repetition loop detected — terminated runaway provider process to save tokens/battery"
+                Some(StreamEvent::Failed { message, .. }) if message == "repetition loop detected — terminated runaway provider process to save tokens/battery"
             ));
             assert!(receive(&mut rx).await.is_none());
             assert!(!driver.send_steer(id, "late".into()).await.unwrap());
@@ -1255,7 +1269,7 @@ wait
         .unwrap();
         assert!(matches!(
             receive(&mut rx).await,
-            Some(StreamEvent::Failed { message }) if message.contains("4 MiB")
+            Some(StreamEvent::Failed { message, .. }) if message.contains("4 MiB")
         ));
     }
 
@@ -1432,7 +1446,7 @@ wait
 
         let mut failed_message = None;
         while let Some(event) = receive(&mut rx).await {
-            if let StreamEvent::Failed { message } = event {
+            if let StreamEvent::Failed { message, .. } = event {
                 failed_message = Some(message);
             }
         }
@@ -1486,7 +1500,7 @@ printf '{{"type":"system","session_id":"%s:%s"}}\n' "$$" "$!"
         assert_processes_exited(pid.parse().unwrap(), grandchild.parse().unwrap()).await;
         assert!(matches!(
             receive(&mut rx).await,
-            Some(StreamEvent::Failed { message }) if message.contains(expected_failure)
+            Some(StreamEvent::Failed { message, .. }) if message.contains(expected_failure)
         ));
         assert!(receive(&mut rx).await.is_none());
         assert!(active.lock().unwrap().is_empty());
@@ -1524,7 +1538,7 @@ exit 37
         .unwrap();
         assert!(matches!(
             receive(&mut rx).await,
-            Some(StreamEvent::Failed { message }) if message.contains("37") && message.contains("fixture shutdown error")
+            Some(StreamEvent::Failed { message, .. }) if message.contains("37") && message.contains("fixture shutdown error")
         ));
     }
 
@@ -1614,7 +1628,7 @@ exec /bin/sleep 60
         )
         .await;
         assert!(
-            matches!(events.last(), Some(StreamEvent::Failed { message }) if message.contains("run_command")),
+            matches!(events.last(), Some(StreamEvent::Failed { message, .. }) if message.contains("run_command")),
             "{events:?}"
         );
     }

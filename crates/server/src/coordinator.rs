@@ -13,7 +13,10 @@ use std::{
 };
 use t3_core::*;
 use t3_git::GitManager;
-use t3_providers::{ProviderRegistry, is_hard_rate_limit, run_turn_with_retry};
+use t3_providers::{
+    FailureClass, ProviderRegistry, classify_harness_failure, classify_provider_failure,
+    classify_rate_limit, format_delegated_error, format_run_error, run_turn_with_retry,
+};
 use t3_store::{QueuedRun, QueuedRunInput, SqliteStore};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use uuid::Uuid;
@@ -125,6 +128,8 @@ struct Outcome {
     had_file_changes: bool,
     had_side_effects: bool,
     hard_rate_limited: bool,
+    reset_at: Option<String>,
+    failure_class: Option<FailureClass>,
     assistant: String,
     reasoning: String,
     terminal: Option<(RunStatus, Option<String>)>,
@@ -651,6 +656,8 @@ impl RunCoordinator {
             match self.start(active, thread.clone(), queued).await {
                 Ok(started) => return Ok(Some(started)),
                 Err(error) => {
+                    let message =
+                        format_run_error(FailureClass::HarnessError, &error.to_string(), None);
                     store
                         .finish_run(
                             run_id,
@@ -662,14 +669,14 @@ impl RunCoordinator {
                             None,
                             None,
                             0,
-                            Some(error.to_string()),
+                            Some(message.clone()),
                         )
                         .await?;
                     self.emit(WsServerMessage::RunStatusChanged {
                         thread_id: thread.id,
                         run_id,
                         status: RunStatus::Failed,
-                        error: Some(error.to_string()),
+                        error: Some(message),
                     });
                     if submitted_id == Some(run_id) {
                         return Err(error);
@@ -1006,6 +1013,8 @@ impl RunCoordinator {
             had_file_changes: false,
             had_side_effects: false,
             hard_rate_limited: false,
+            reset_at: None,
+            failure_class: None,
             assistant: String::new(),
             reasoning: String::new(),
             terminal: None,
@@ -1019,7 +1028,6 @@ impl RunCoordinator {
                 tx,
                 live.auto_resume_limited_threads,
                 live.rate_limit_max_retries,
-                live.rate_limit_initial_backoff_secs,
             );
             tokio::pin!(worker);
             loop {
@@ -1166,17 +1174,30 @@ impl RunCoordinator {
 
         let mut active = self.0.active.lock().await;
         let cancelled = *cancellation.borrow() || verify_cancelled;
+        let mut error_class = None;
         let (mut status, mut error) = if cancelled {
             (RunStatus::Cancelled, Some("Interrupted".into()))
         } else if let Err(error) = result {
-            (RunStatus::Failed, Some(error.to_string()))
+            let message = error.to_string();
+            error_class = Some(classify_harness_failure(
+                current_selection.provider,
+                &message,
+                None,
+            ));
+            (RunStatus::Failed, Some(message))
         } else {
             match outcome.terminal.take() {
-                Some(terminal) => terminal,
-                None => (
-                    RunStatus::Failed,
-                    Some("provider ended without a completion event".into()),
-                ),
+                Some(terminal) => {
+                    error_class = outcome.failure_class;
+                    terminal
+                }
+                None => {
+                    error_class = Some(FailureClass::HarnessError);
+                    (
+                        RunStatus::Failed,
+                        Some("provider ended without a completion event".into()),
+                    )
+                }
             }
         };
 
@@ -1228,6 +1249,7 @@ impl RunCoordinator {
             } else {
                 status = RunStatus::Failed;
                 error = verify_failed_error.or_else(|| Some("verify_command failed".into()));
+                error_class = Some(FailureClass::HarnessError);
             }
         } else if status == RunStatus::RateLimited
             && outcome.hard_rate_limited
@@ -1283,6 +1305,7 @@ impl RunCoordinator {
         {
             status = RunStatus::Failed;
             error = Some(failure.to_string());
+            error_class = Some(FailureClass::HarnessError);
         }
         let flush = async {
             self.flush_text(
@@ -1304,6 +1327,23 @@ impl RunCoordinator {
         if let Err(failure) = flush {
             status = RunStatus::Failed;
             error = Some(failure.to_string());
+            error_class = Some(FailureClass::HarnessError);
+        }
+        if matches!(status, RunStatus::Failed | RunStatus::RateLimited)
+            && let Some(message) = error.as_deref()
+        {
+            let class = error_class.unwrap_or_else(|| {
+                if status == RunStatus::RateLimited {
+                    classify_rate_limit(outcome.provider, message, None)
+                } else {
+                    classify_provider_failure(outcome.provider, message, None)
+                }
+            });
+            error = Some(format_run_error(
+                class,
+                message,
+                outcome.reset_at.as_deref(),
+            ));
         }
         if outcome.provider == ProviderId::Codex
             && (outcome.input.is_none()
@@ -1388,13 +1428,16 @@ impl RunCoordinator {
             }
         }
         let defer_completion = enqueued_followup && !self.0.shutting_down.load(Ordering::Relaxed);
-        if notify_parent
-            && !defer_completion
-            && let Err(error) = self
-                .record_child_completion(&thread, thread_status, error.as_deref())
+        if notify_parent && !defer_completion {
+            let child_error = error
+                .as_deref()
+                .map(|error| format_delegated_error(outcome.provider, &outcome.model, error));
+            if let Err(error) = self
+                .record_child_completion(&thread, thread_status, child_error.as_deref())
                 .await
-        {
-            tracing::error!(%error, %run_id, "Could not record delegated task completion");
+            {
+                tracing::error!(%error, %run_id, "Could not record delegated task completion");
+            }
         }
         if let Err(error) = store.update_thread_status(thread_id, thread_status).await {
             tracing::error!(%error, %run_id, "Could not persist thread status");
@@ -1604,7 +1647,13 @@ impl RunCoordinator {
             StreamEvent::RateLimited {
                 retry_after_secs,
                 message,
+                reset_at,
+                error_code,
             } => {
+                out.reset_at = reset_at.clone();
+                let class = classify_rate_limit(out.provider, &message, error_code.as_deref());
+                out.failure_class = Some(class);
+                out.hard_rate_limited = class == FailureClass::UsageLimit;
                 if let Some(provider) = self
                     .0
                     .active
@@ -1634,9 +1683,6 @@ impl RunCoordinator {
                     status: RunStatus::RateLimited,
                     error: Some(message.clone()),
                 });
-                if is_hard_rate_limit(retry_after_secs, &message) {
-                    out.hard_rate_limited = true;
-                }
                 out.terminal = Some((RunStatus::RateLimited, Some(message)));
             }
             StreamEvent::Usage {
@@ -1729,7 +1775,17 @@ impl RunCoordinator {
                 }
                 out.terminal = Some((RunStatus::Completed, None));
             }
-            StreamEvent::Failed { message } => {
+            StreamEvent::Failed {
+                message,
+                reset_at,
+                error_code,
+            } => {
+                out.reset_at = reset_at;
+                out.failure_class = Some(classify_provider_failure(
+                    out.provider,
+                    &message,
+                    error_code.as_deref(),
+                ));
                 out.terminal = Some((RunStatus::Failed, Some(message)));
             }
         }

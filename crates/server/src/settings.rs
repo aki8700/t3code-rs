@@ -120,9 +120,6 @@ fn merge_patch(target: &mut RuntimeSettingsPatch, update: RuntimeSettingsPatch) 
     if update.rate_limit_max_retries.is_some() {
         target.rate_limit_max_retries = update.rate_limit_max_retries;
     }
-    if update.rate_limit_initial_backoff_secs.is_some() {
-        target.rate_limit_initial_backoff_secs = update.rate_limit_initial_backoff_secs;
-    }
     if update.fallback_models.is_some() {
         target.fallback_models = update.fallback_models;
     }
@@ -327,11 +324,11 @@ mod tests {
             .unwrap();
 
         let mut edited_cfg = cfg.clone();
-        edited_cfg.rate_limit_max_retries = 9;
+        edited_cfg.rate_limit_max_retries = 2;
         let reloaded = SettingsStore::load_or_init(&edited_cfg);
 
         assert_eq!(reloaded.get().verify_max_auto_fixes, 4);
-        assert_eq!(reloaded.get().rate_limit_max_retries, 9);
+        assert_eq!(reloaded.get().rate_limit_max_retries, 2);
     }
 
     #[test]
@@ -431,7 +428,7 @@ mod tests {
             second
                 .patch(
                     RuntimeSettingsPatch {
-                        rate_limit_max_retries: Some(8),
+                        rate_limit_max_retries: Some(2),
                         ..Default::default()
                     },
                     &second_providers,
@@ -443,10 +440,10 @@ mod tests {
 
         let current = store.get();
         assert_eq!(current.verify_max_auto_fixes, 4);
-        assert_eq!(current.rate_limit_max_retries, 8);
+        assert_eq!(current.rate_limit_max_retries, 2);
         let reloaded = SettingsStore::load_or_init(&cfg).get();
         assert_eq!(reloaded.verify_max_auto_fixes, 4);
-        assert_eq!(reloaded.rate_limit_max_retries, 8);
+        assert_eq!(reloaded.rate_limit_max_retries, 2);
     }
 
     #[test]
@@ -466,8 +463,7 @@ mod tests {
                     }),
                     follow_up_behavior: Some(FollowUpBehavior::Queue),
                     auto_resume_limited_threads: Some(false),
-                    rate_limit_max_retries: Some(5),
-                    rate_limit_initial_backoff_secs: Some(30),
+                    rate_limit_max_retries: Some(2),
                     fallback_models: Some(vec![ModelSelection {
                         provider: ProviderId::Antigravity,
                         model: "gemini-4-neon".into(),
@@ -613,7 +609,7 @@ mod tests {
     fn load_or_init_overlays_partial_persisted_json_on_config() {
         let dir = TempDir::new("partial");
         let mut cfg = test_config(dir.path().to_path_buf());
-        cfg.rate_limit_max_retries = 6;
+        cfg.rate_limit_max_retries = 2;
         fs::write(
             cfg.runtime_settings_path(),
             r#"{"antigravity_mcp_enabled": true}"#,
@@ -623,14 +619,14 @@ mod tests {
         let store = SettingsStore::load_or_init(&cfg);
         let current = store.get();
         assert!(current.antigravity_mcp_enabled);
-        assert_eq!(current.rate_limit_max_retries, 6);
+        assert_eq!(current.rate_limit_max_retries, 2);
     }
 
     #[test]
     fn load_or_init_preserves_legacy_full_persisted_json_meaning() {
         let dir = TempDir::new("legacy-full");
         let mut cfg = test_config(dir.path().to_path_buf());
-        cfg.rate_limit_max_retries = 9;
+        cfg.rate_limit_max_retries = 2;
         cfg.fallback_models = vec![ModelSelection {
             provider: ProviderId::Mock,
             model: "config-fallback".into(),
@@ -638,7 +634,7 @@ mod tests {
             agent: None,
         }];
         let legacy_full = RuntimeSettings {
-            rate_limit_max_retries: 5,
+            rate_limit_max_retries: 2,
             fallback_models: Vec::new(),
             ..cfg.runtime_settings()
         };
@@ -649,7 +645,7 @@ mod tests {
         .unwrap();
 
         let current = SettingsStore::load_or_init(&cfg).get();
-        assert_eq!(current.rate_limit_max_retries, 5);
+        assert_eq!(current.rate_limit_max_retries, 2);
         assert!(current.fallback_models.is_empty());
     }
 
@@ -659,13 +655,13 @@ mod tests {
         let updated = store
             .patch(
                 RuntimeSettingsPatch {
-                    rate_limit_max_retries: Some(8),
+                    rate_limit_max_retries: Some(2),
                     ..Default::default()
                 },
                 &[ProviderId::Claude],
             )
             .unwrap();
-        assert_eq!(updated.rate_limit_max_retries, 8);
+        assert_eq!(updated.rate_limit_max_retries, 2);
         assert_eq!(store.get(), updated);
     }
 

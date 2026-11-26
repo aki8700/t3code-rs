@@ -112,6 +112,8 @@ impl ProviderDriver for MockDriver {
             emit(StreamEvent::RateLimited {
                 retry_after_secs: 0,
                 message: "mock limit".into(),
+                reset_at: None,
+                error_code: None,
             });
             return Ok(());
         }
@@ -148,7 +150,11 @@ impl ProviderDriver for MockDriver {
                     tokio::select! {
                         biased;
                         _ = interrupt.notified() => {
-                            emit(StreamEvent::Failed { message: "interrupted".into() });
+                            emit(StreamEvent::Failed {
+                                message: "interrupted".into(),
+                                reset_at: None,
+                                error_code: None,
+                            });
                             return Ok(());
                         }
                         _ = tx.closed() => return Ok(()),
@@ -325,7 +331,7 @@ mod tests {
             .unwrap();
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
-            matches!(events.last(), Some(StreamEvent::Failed { message }) if message == "interrupted")
+            matches!(events.last(), Some(StreamEvent::Failed { message, .. }) if message == "interrupted")
         );
         assert!(
             !events
@@ -335,15 +341,15 @@ mod tests {
         assert!(!driver.send_steer(id, "late".into()).await.unwrap());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rate_limit_once_retries_and_completes() {
         let driver = Arc::new(MockDriver::new());
         let mut req = test_request(ProviderId::Mock);
         req.prompt = "[rate-limit-once]".into();
         let (tx, mut rx) = mpsc::unbounded_channel();
         timeout(
-            Duration::from_secs(2),
-            run_turn_with_retry(driver, req, tx, true, 1, 0),
+            Duration::from_secs(30),
+            run_turn_with_retry(driver, req, tx, true, 1),
         )
         .await
         .unwrap()

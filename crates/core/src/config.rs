@@ -96,8 +96,7 @@ impl Default for StorageConfig {
 }
 
 pub const MAX_VERIFY_AUTO_FIXES: u32 = 10;
-pub const MAX_RATE_LIMIT_RETRIES: u32 = 10;
-pub const MAX_RATE_LIMIT_INITIAL_BACKOFF_SECS: u64 = 3600;
+pub const MAX_RATE_LIMIT_RETRIES: u32 = 2;
 
 fn default_verify_max_auto_fixes() -> u32 {
     2
@@ -113,7 +112,6 @@ pub struct RuntimeSettings {
     pub follow_up_behavior: FollowUpBehavior,
     pub auto_resume_limited_threads: bool,
     pub rate_limit_max_retries: u32,
-    pub rate_limit_initial_backoff_secs: u64,
     pub fallback_models: Vec<ModelSelection>,
     pub verify_max_auto_fixes: u32,
     pub antigravity_mcp_enabled: bool,
@@ -126,8 +124,7 @@ impl Default for RuntimeSettings {
             default_model: ModelSelection::default(),
             follow_up_behavior: FollowUpBehavior::Steer,
             auto_resume_limited_threads: true,
-            rate_limit_max_retries: 3,
-            rate_limit_initial_backoff_secs: 15,
+            rate_limit_max_retries: 2,
             fallback_models: Vec::new(),
             verify_max_auto_fixes: default_verify_max_auto_fixes(),
             antigravity_mcp_enabled: false,
@@ -147,8 +144,6 @@ pub struct RuntimeSettingsPatch {
     pub auto_resume_limited_threads: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_max_retries: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rate_limit_initial_backoff_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_models: Option<Vec<ModelSelection>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -187,12 +182,6 @@ impl RuntimeSettings {
                 reason: format!("must be <= {MAX_RATE_LIMIT_RETRIES}"),
             });
         }
-        if self.rate_limit_initial_backoff_secs > MAX_RATE_LIMIT_INITIAL_BACKOFF_SECS {
-            return Err(ConfigError::InvalidRuntimeSetting {
-                field: "rate_limit_initial_backoff_secs",
-                reason: format!("must be <= {MAX_RATE_LIMIT_INITIAL_BACKOFF_SECS}"),
-            });
-        }
         Ok(())
     }
 
@@ -211,9 +200,6 @@ impl RuntimeSettings {
         }
         if let Some(rate_limit_max_retries) = patch.rate_limit_max_retries {
             candidate.rate_limit_max_retries = rate_limit_max_retries;
-        }
-        if let Some(rate_limit_initial_backoff_secs) = patch.rate_limit_initial_backoff_secs {
-            candidate.rate_limit_initial_backoff_secs = rate_limit_initial_backoff_secs;
         }
         if let Some(fallback_models) = patch.fallback_models {
             candidate.fallback_models = fallback_models;
@@ -245,7 +231,6 @@ pub struct ServerConfig {
     pub follow_up_behavior: FollowUpBehavior,
     pub auto_resume_limited_threads: bool,
     pub rate_limit_max_retries: u32,
-    pub rate_limit_initial_backoff_secs: u64,
     pub enabled_providers: Vec<ProviderId>,
     /// Opt-in direct Antigravity Cloud Code quota query (`retrieveUserQuotaSummary`).
     #[serde(default)]
@@ -277,8 +262,7 @@ impl Default for ServerConfig {
             default_model: ModelSelection::default(),
             follow_up_behavior: FollowUpBehavior::Steer,
             auto_resume_limited_threads: true,
-            rate_limit_max_retries: 3,
-            rate_limit_initial_backoff_secs: 15,
+            rate_limit_max_retries: 2,
             enabled_providers: vec![
                 ProviderId::Claude,
                 ProviderId::Codex,
@@ -316,7 +300,6 @@ impl ServerConfig {
             follow_up_behavior: self.follow_up_behavior,
             auto_resume_limited_threads: self.auto_resume_limited_threads,
             rate_limit_max_retries: self.rate_limit_max_retries,
-            rate_limit_initial_backoff_secs: self.rate_limit_initial_backoff_secs,
             fallback_models: self.fallback_models.clone(),
             verify_max_auto_fixes: self.verify_max_auto_fixes,
             antigravity_mcp_enabled: self.antigravity_mcp_enabled,
@@ -329,7 +312,6 @@ impl ServerConfig {
         self.follow_up_behavior = s.follow_up_behavior;
         self.auto_resume_limited_threads = s.auto_resume_limited_threads;
         self.rate_limit_max_retries = s.rate_limit_max_retries;
-        self.rate_limit_initial_backoff_secs = s.rate_limit_initial_backoff_secs;
         self.fallback_models = s.fallback_models.clone();
         self.verify_max_auto_fixes = s.verify_max_auto_fixes;
         self.antigravity_mcp_enabled = s.antigravity_mcp_enabled;
@@ -597,8 +579,7 @@ mod tests {
             }),
             follow_up_behavior: Some(FollowUpBehavior::Queue),
             auto_resume_limited_threads: Some(false),
-            rate_limit_max_retries: Some(10),
-            rate_limit_initial_backoff_secs: Some(0),
+            rate_limit_max_retries: Some(2),
             fallback_models: Some(vec![ModelSelection {
                 provider: ProviderId::Antigravity,
                 model: "gemini-4-neon".into(),
@@ -647,7 +628,7 @@ mod tests {
         ));
         assert_eq!(rt, initial);
 
-        // rate_limit_max_retries > 10 rejected atomically
+        // rate_limit_max_retries > 2 rejected atomically
         let err = rt
             .apply_patch(RuntimeSettingsPatch {
                 rate_limit_max_retries: Some(MAX_RATE_LIMIT_RETRIES + 1),
@@ -659,22 +640,6 @@ mod tests {
             err,
             ConfigError::InvalidRuntimeSetting {
                 field: "rate_limit_max_retries",
-                ..
-            }
-        ));
-        assert_eq!(rt, initial);
-
-        // rate_limit_initial_backoff_secs > max rejected
-        let err = rt
-            .apply_patch(RuntimeSettingsPatch {
-                rate_limit_initial_backoff_secs: Some(MAX_RATE_LIMIT_INITIAL_BACKOFF_SECS + 1),
-                ..Default::default()
-            })
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::InvalidRuntimeSetting {
-                field: "rate_limit_initial_backoff_secs",
                 ..
             }
         ));
