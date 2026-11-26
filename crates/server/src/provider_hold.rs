@@ -177,6 +177,11 @@ mod tests {
             "Claude usage limit reached"
         ));
         assert!(!model_scoped("gpt-6-luna", "You've hit your usage limit"));
+        // The run error a real Claude limit leaves (five_hour / seven_day are account-wide).
+        assert!(!model_scoped(
+            "sonnet",
+            "capacity: rate_limit_event (reset_at: 1795702200)"
+        ));
         assert!(model_scoped(
             "gemini-4-hydrogen",
             "Individual quota reached for gemini-4-hydrogen"
