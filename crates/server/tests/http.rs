@@ -1717,11 +1717,9 @@ async fn coordinator_wake_prompt_excludes_posts_from_the_coordinator() {
 // a git repository) followed by a plain post.
 #[cfg(unix)]
 async fn swarm_text_action_fixture(tmp: &TempDir, failing_turns: u32) -> (Router, Uuid) {
-    use std::os::unix::fs::PermissionsExt;
-    let driver = tmp.0.join("fixture-claude");
-    std::fs::write(
-        &driver,
-        format!(
+    swarm_fixture(
+        tmp,
+        &format!(
             r#"#!/bin/sh
 IFS= read -r prompt
 n=$(cat calls 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > calls
@@ -1735,7 +1733,14 @@ printf '{{"type":"result","subtype":"success","result":"%s"}}\n' "$text"
 "#
         ),
     )
-    .unwrap();
+    .await
+}
+
+#[cfg(unix)]
+async fn swarm_fixture(tmp: &TempDir, script: &str) -> (Router, Uuid) {
+    use std::os::unix::fs::PermissionsExt;
+    let driver = tmp.0.join("fixture-claude");
+    std::fs::write(&driver, script).unwrap();
     std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut config = ServerConfig {
         data_dir: tmp.0.join("server"),
@@ -1823,6 +1828,113 @@ async fn repeated_failing_swarm_action_stops_at_the_wake_depth_limit() {
         last = calls;
     }
     assert!((2..=10).contains(&last), "coordinator woken {last} times");
+}
+
+// A coordinator that keeps re-waking a worker which never reports must stop at the
+// wake depth limit, and the held-back wake must be visible on the board.
+#[cfg(unix)]
+#[tokio::test]
+async fn silent_worker_retry_loop_stops_at_the_wake_depth_limit_and_says_so() {
+    let tmp = TempDir::new();
+    let (app, id) = swarm_fixture(
+        &tmp,
+        r#"#!/bin/sh
+IFS= read -r prompt
+echo x >> calls
+marker=$(printf '%s' "$prompt" | grep -o 'T3_SWARM_ACTION [0-9a-f-]*' | head -n 1)
+case "$prompt" in
+  *"You are coordinator."*)
+    if [ -f added ]; then
+      text="$marker"' {\"tool\":\"swarm_post_message\",\"text\":\"@w1 retry\"}'
+    else
+      touch added
+      text="$marker"' {\"tool\":\"swarm_add_worker\",\"name\":\"w1\",\"brief\":\"x\"}'
+    fi ;;
+  *) text="nothing to report" ;;
+esac
+printf '{"type":"result","subtype":"success","result":"%s"}\n' "$text"
+"#,
+    )
+    .await;
+    start_swarm(&app, id).await;
+    let calls = settled_calls(&tmp).await;
+    assert!((3..=10).contains(&calls), "providers ran {calls} times");
+    let messages = mcp_tool(
+        &app,
+        "swarm_read_board",
+        json!({"thread_id":id,"since_seq":0,"limit":200}),
+    )
+    .await;
+    let held = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| {
+            m["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("wake depth limit"))
+        })
+        .unwrap_or_else(|| panic!("{messages}"));
+    assert_eq!(held["sender"], "system");
+    assert_eq!(held["mentions"], json!([]));
+    assert!(
+        held["text"].as_str().unwrap().contains("not woken: w1"),
+        "{held}"
+    );
+}
+
+#[tokio::test]
+async fn oversized_swarm_post_error_says_to_pass_a_file_reference() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let app = router(state);
+    let id = create_parent(&app, &tmp.0).await;
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({"prompt":"/swarm inspect board"})),
+    )
+    .await;
+    let response = json_req(
+        &app,
+        Method::POST,
+        "/mcp",
+        Some(json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                "name":"swarm_post_message","arguments":{"thread_id":id,"text":"x".repeat(4_097)}
+            }
+        })),
+    )
+    .await;
+    assert_eq!(response["result"]["isError"], true);
+    assert!(
+        response["result"]
+            .to_string()
+            .contains("write the details to a file"),
+        "{response}"
+    );
+}
+
+#[cfg(unix)]
+async fn settled_calls(tmp: &TempDir) -> usize {
+    let mut last = 0;
+    let mut stable = 0;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let calls =
+            std::fs::read_to_string(tmp.0.join("calls")).map_or(0, |calls| calls.lines().count());
+        stable = if calls == last && calls > 1 {
+            stable + 1
+        } else {
+            0
+        };
+        last = calls;
+        if stable == 4 {
+            break;
+        }
+    }
+    last
 }
 
 #[cfg(unix)]

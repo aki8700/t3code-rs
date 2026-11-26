@@ -46,10 +46,13 @@ impl SwarmTurn {
     ) -> CoreResult<Self> {
         let member = live_member(board, thread_id)?;
         let coordinator = member.role == "coordinator";
+        let report = format!(
+            "Work on the assigned brief. When finished or blocked, call swarm_post_message once with text starting with @coordinator [done] followed by result:, verified: (commands run and their outcome, or not verified), blockers: and files:. Send one post of at most {MAX_MESSAGE_BYTES} bytes; write longer details to a file and list its path. End your turn after posting. Reply to subsequent updates only when you have new information."
+        );
         let instructions = if coordinator {
-            "Coordinate work using swarm_status, swarm_add_worker, swarm_post_message, swarm_read_board and swarm_kill_worker. Run independent slices in parallel with separate worker contexts, keep passed work frozen, and escalate no-undo merges (migrations/secrets/deploy) to the human. Mentions wake the named member. After assigning work, end your turn and wait for results addressed to @coordinator."
+            "Coordinate work using swarm_status, swarm_add_worker, swarm_post_message, swarm_read_board and swarm_kill_worker. Run independent slices in parallel with separate worker contexts. Each brief states the objective, the output expected, boundaries (files or scope the worker owns), an effort budget and a stop condition. When a worker ends without reporting or repeats a result, change the brief or model, or stop it, instead of resending the same request. Keep passed work frozen, and escalate no-undo merges (migrations/secrets/deploy) to the human. Mentions wake the named member. After assigning work, end your turn and wait for results addressed to @coordinator."
         } else {
-            "Work on the assigned brief. When finished, call swarm_post_message with text starting with @coordinator [done] and include your result and any blocker. End your turn after posting. Reply to subsequent updates only when you have new information."
+            &report
         };
         let marker =
             (provider != ProviderId::Mock).then(|| format!("T3_SWARM_ACTION {}", board.board_id));
@@ -63,7 +66,7 @@ impl SwarmTurn {
 {"tool":"swarm_post_message","text":"@reviewer Focus on error handling"}
 {"tool":"swarm_kill_worker","name":"reviewer"}"#
             } else {
-                r#"{"tool":"swarm_post_message","text":"@coordinator [done] Result and any blocker"}"#
+                r#"{"tool":"swarm_post_message","text":"@coordinator [done] result: ... verified: ... blockers: none files: ..."}"#
             };
             instructions.push_str("When swarm MCP is unavailable or requires approval, return plain action lines at the end of your response. The daemon runs those actions after the turn. Use only the lines needed, with your own arguments, and only one method per action.\n");
             for example in examples.lines() {
@@ -307,28 +310,30 @@ impl RunCoordinator {
         text: String,
     ) -> CoreResult<(SwarmBoardSnapshot, SwarmPostResult)> {
         let mut active = self.0.active.lock().await;
-        self.post_locked(&mut active, caller_id, sender_override, text)
+        let depth = wake_depth(&active, caller_id);
+        self.post_locked(&mut active, caller_id, sender_override, text, depth)
             .await
     }
 
+    /// `depth` is the wake depth of the run that caused the post. System notices pass the
+    /// depth of the run they report on, so notices cannot wake members forever.
     async fn post_locked(
         &self,
         active: &mut HashMap<Uuid, ActiveRun>,
         caller_id: Uuid,
         sender_override: Option<&str>,
         text: String,
+        depth: u8,
     ) -> CoreResult<(SwarmBoardSnapshot, SwarmPostResult)> {
         validate_text(&text)?;
         let board = self.require_board(caller_id).await?;
-        let (sender, caller, depth) = if let Some(sender) = sender_override {
-            // Inherit the caller's depth so system notices cannot wake members forever.
-            (sender.to_owned(), None, wake_depth(active, caller_id))
+        let (sender, caller) = if let Some(sender) = sender_override {
+            (sender.to_owned(), None)
         } else {
             let member = live_member(&board, caller_id)?;
             (
                 member.name.clone(),
                 Some(self.effective_thread(active, caller_id).await?),
-                wake_depth(active, caller_id),
             )
         };
         let mentions = mentions_in(&text);
@@ -340,17 +345,22 @@ impl RunCoordinator {
         let board = self.require_board(caller_id).await?;
         self.emit_board(&board);
         let mut woken = Vec::new();
-        if depth < MAX_WAKE_DEPTH && !post.mentions.is_empty() {
-            for member in &board.members {
-                if member.state == "killed"
-                    || member.name == sender
-                    || !post
-                        .mentions
-                        .iter()
-                        .any(|name| name == "all" || name == &member.name)
-                {
-                    continue;
-                }
+        let targets = mentioned_members(&board, &sender, &post.mentions);
+        if depth >= MAX_WAKE_DEPTH {
+            if !targets.is_empty() {
+                // No mention in the notice: it must not wake anyone itself.
+                self.0
+                    .store
+                    .append_swarm_message(
+                        board.board_id,
+                        "system".into(),
+                        held_wake_text(post.seq, &targets),
+                        Vec::new(),
+                    )
+                    .await?;
+            }
+        } else {
+            for member in targets {
                 match self
                     .wake_member(active, member, caller.as_ref(), depth + 1)
                     .await
@@ -455,7 +465,11 @@ impl RunCoordinator {
             return Ok(());
         }
         let text = silent_end_text(member, status, error);
-        self.post_locked(active, board.coordinator_thread_id, Some("system"), text)
+        // The ended run is still registered, so a coordinator that keeps re-waking a
+        // silent worker accumulates depth even though it is idle between its turns.
+        let coordinator = board.coordinator_thread_id;
+        let depth = wake_depth(active, thread_id).max(wake_depth(active, coordinator));
+        self.post_locked(active, coordinator, Some("system"), text, depth)
             .await?;
         Ok(())
     }
@@ -643,12 +657,15 @@ impl RunCoordinator {
                         .await
                         .map(drop),
                 ),
-                Action::Post { text } => (
-                    "swarm_post_message".to_owned(),
-                    self.post_locked(active, thread_id, None, text)
-                        .await
-                        .map(drop),
-                ),
+                Action::Post { text } => {
+                    let depth = wake_depth(active, thread_id);
+                    (
+                        "swarm_post_message".to_owned(),
+                        self.post_locked(active, thread_id, None, text, depth)
+                            .await
+                            .map(drop),
+                    )
+                }
                 Action::Kill { name } => (
                     format!("swarm_kill_worker {name}"),
                     self.kill_worker_locked(active, thread_id, &name, true)
@@ -667,7 +684,8 @@ impl RunCoordinator {
         let text = format!(
             "@coordinator Swarm action(s) from your last turn failed:\n{failures}Fix the action and emit it again."
         );
-        self.post_locked(active, thread_id, Some("system"), text)
+        let depth = wake_depth(active, thread_id);
+        self.post_locked(active, thread_id, Some("system"), text, depth)
             .await
             .map(drop)
     }
@@ -709,6 +727,35 @@ fn live_member(board: &SwarmBoardSnapshot, thread_id: Uuid) -> CoreResult<&Swarm
         return Err(CoreError::InvalidArgument("swarm worker is killed".into()));
     }
     Ok(member)
+}
+
+fn mentioned_members<'a>(
+    board: &'a SwarmBoardSnapshot,
+    sender: &str,
+    mentions: &[String],
+) -> Vec<&'a SwarmMember> {
+    board
+        .members
+        .iter()
+        .filter(|member| {
+            member.state != "killed"
+                && member.name != sender
+                && mentions
+                    .iter()
+                    .any(|name| name == "all" || name == &member.name)
+        })
+        .collect()
+}
+
+fn held_wake_text(seq: i64, targets: &[&SwarmMember]) -> String {
+    let names = targets
+        .iter()
+        .map(|member| member.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "[system] wake depth limit {MAX_WAKE_DEPTH} reached at post #{seq}; not woken: {names}. A user message resumes the swarm."
+    )
 }
 
 fn wake_depth(active: &HashMap<Uuid, ActiveRun>, id: Uuid) -> u8 {
@@ -779,7 +826,7 @@ fn worker_model(default: &ModelSelection, spec: &SwarmWorkerSpec) -> ModelSelect
 fn validate_text(text: &str) -> CoreResult<()> {
     if text.trim().is_empty() || text.len() > MAX_MESSAGE_BYTES {
         return Err(CoreError::InvalidArgument(format!(
-            "swarm message must contain 1 to {MAX_MESSAGE_BYTES} bytes"
+            "swarm message must contain 1 to {MAX_MESSAGE_BYTES} bytes; write the details to a file and post a summary with its path"
         )));
     }
     Ok(())
@@ -865,6 +912,41 @@ mod tests {
         let next_turn =
             SwarmTurn::prepare(&board, thread_id, ProviderId::Codex, &mut next_prompt).unwrap();
         assert_eq!(turn.marker, next_turn.marker);
+    }
+
+    #[test]
+    fn prompts_state_the_brief_and_report_contract() {
+        let coordinator = member("coordinator", "coordinator", "working");
+        let worker = member("coder", "worker", "working");
+        let board = SwarmBoardSnapshot {
+            board_id: Uuid::nil(),
+            coordinator_thread_id: coordinator.thread_id,
+            title: "test".into(),
+            members: vec![coordinator.clone(), worker.clone()],
+            messages: Vec::new(),
+            head_seq: 0,
+        };
+        let prompt_for = |thread_id| {
+            let mut prompt = String::new();
+            SwarmTurn::prepare(&board, thread_id, ProviderId::Codex, &mut prompt).unwrap();
+            prompt
+        };
+        let lead = prompt_for(coordinator.thread_id);
+        for field in [
+            "objective",
+            "output",
+            "boundaries",
+            "effort budget",
+            "stop condition",
+        ] {
+            assert!(lead.contains(field), "missing {field}: {lead}");
+        }
+        let report = prompt_for(worker.thread_id);
+        for field in ["result:", "verified:", "blockers:", "files:"] {
+            assert!(report.contains(field), "missing {field}: {report}");
+        }
+        assert!(report.contains("one post"), "{report}");
+        assert!(report.contains(&MAX_MESSAGE_BYTES.to_string()), "{report}");
     }
 
     #[test]

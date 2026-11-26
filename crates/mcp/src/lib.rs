@@ -774,14 +774,14 @@ fn tools() -> Vec<Value> {
         ),
         make(
             "swarm_add_worker",
-            "Start a named worker and return its member record with brief_chars (not the brief text).",
+            "Start a named worker and return its member record with brief_chars (not the brief text). The brief states the objective, expected output, boundaries, effort budget and stop condition.",
             json!({"thread_id": uuid, "name": string, "brief": string, "provider": provider,
                 "model": string, "effort": string, "isolation": {"enum": ["shared", "worktree"]}}),
             &["name", "brief"],
         ),
         make(
             "swarm_post_message",
-            "Post to this swarm and return seq, board_id, and names of members woken. @name, @all, and @coordinator wake addressed members.",
+            "Post to this swarm and return seq, board_id, and names of members woken. @name, @all, and @coordinator wake addressed members, up to a wake depth limit. At most 4096 bytes: report once and pass longer details as a file path.",
             json!({"thread_id": uuid, "text": string}),
             &["text"],
         ),

@@ -275,6 +275,20 @@ async fn handshake_discovery_batches_and_protocol_errors() {
     assert!(properties.get("since").is_none());
     assert_eq!(properties["limit"]["default"], 20);
     assert!(properties.get("seq").is_some());
+    let description = |name: &str| {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        tool["description"].as_str().unwrap()
+    };
+    for field in [
+        "objective",
+        "output",
+        "boundaries",
+        "effort budget",
+        "stop condition",
+    ] {
+        assert!(description("swarm_add_worker").contains(field), "{field}");
+    }
+    assert!(description("swarm_post_message").contains("4096 bytes"));
 }
 
 #[tokio::test]
