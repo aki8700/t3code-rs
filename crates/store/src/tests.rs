@@ -720,9 +720,8 @@ async fn japanese_fts_trigram_short_query_and_title_updates() {
 }
 
 #[tokio::test]
-async fn orchestration_aggregates_by_provider_and_model() {
+async fn finished_runs_keep_session_and_error() {
     let store = SqliteStore::open_in_memory(StorageConfig::default()).unwrap();
-    assert!(store.orch_stats().await.unwrap().is_empty());
     let succeeded = seed(&store, "Statistics").await;
     let failed = store
         .create_run(run(succeeded.thread_id, 2, ProviderId::Mock))
@@ -773,33 +772,6 @@ async fn orchestration_aggregates_by_provider_and_model() {
         )
         .await
         .unwrap();
-    let rows = store.orch_stats().await.unwrap();
-    assert_eq!(rows.len(), 3);
-    let mock = &rows[0];
-    assert_eq!(
-        (mock.provider, mock.model.as_str()),
-        (ProviderId::Mock, "model")
-    );
-    assert_eq!(
-        (mock.total_runs, mock.completed_runs, mock.failed_runs),
-        (3, 1, 1)
-    );
-    assert!((mock.success_rate - 1.0 / 3.0).abs() < f64::EPSILON);
-    assert_eq!(mock.avg_duration_ms, 200.0);
-    assert_eq!(
-        (mock.total_input_tokens, mock.total_output_tokens),
-        (87, 15)
-    );
-    assert_eq!(
-        (
-            mock.total_cache_read_tokens,
-            mock.total_cache_creation_tokens,
-            mock.total_reasoning_tokens
-        ),
-        (9, 2, 4)
-    );
-    assert!(rows.iter().any(|row| row.provider == ProviderId::OpenCode));
-    assert!(rows.iter().any(|row| row.model == "other-model"));
     let runs = store.list_runs(succeeded.thread_id).await.unwrap();
     assert_eq!(runs[0].provider_session_id.as_deref(), Some("resumed"));
     assert_eq!(runs[1].error_message.as_deref(), Some("failure"));

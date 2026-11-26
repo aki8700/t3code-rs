@@ -1,8 +1,8 @@
 use crate::protocol::StreamEvent;
 use crate::types::{
     Attachment, ContextHandoff, DbStats, InteractionMode, McpInjectionSpec, ModelSelection,
-    OrchModelStat, PendingResponse, Project, ProviderHealth, ProviderId, Run, RunStatus,
-    RuntimeMode, SearchHit, Thread, ThreadStatus, TurnItem, TurnItemKind,
+    PendingResponse, Project, ProviderHealth, ProviderId, Run, RunStatus, RuntimeMode, SearchHit,
+    Thread, ThreadStatus, TurnItem, TurnItemKind,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -161,6 +161,5 @@ pub trait Store: Send + Sync {
     async fn list_attachments(&self, thread_id: Uuid) -> CoreResult<Vec<Attachment>>;
 
     async fn search_fts(&self, query: &str, limit: usize) -> CoreResult<Vec<SearchHit>>;
-    async fn orch_stats(&self) -> CoreResult<Vec<OrchModelStat>>;
     async fn db_stats(&self) -> CoreResult<DbStats>;
 }

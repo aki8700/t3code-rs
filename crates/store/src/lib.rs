@@ -23,8 +23,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use t3_core::{
     Attachment, ContextHandoff, CoreError, CoreResult, DbStats, InteractionMode, ModelSelection,
-    NewTurnItem, OrchModelStat, Project, ProviderId, Run, RunStatus, RuntimeMode, SearchHit,
-    StorageConfig, Store, Thread, ThreadStatus, TurnItem,
+    NewTurnItem, Project, ProviderId, Run, RunStatus, RuntimeMode, SearchHit, StorageConfig, Store,
+    Thread, ThreadStatus, TurnItem,
 };
 use uuid::Uuid;
 
@@ -1135,38 +1135,6 @@ impl Store for SqliteStore {
                     search_row,
                 )
             }
-        })
-        .await
-    }
-
-    async fn orch_stats(&self) -> CoreResult<Vec<OrchModelStat>> {
-        self.with_reader(|connection| {
-            query_all(
-                connection,
-                "SELECT provider, model, count(*), sum(status = ?1), sum(status = ?2),
-                    avg(status = ?1), coalesce(avg(duration_ms), 0.0),
-                    coalesce(sum(input_tokens), 0), coalesce(sum(output_tokens), 0),
-                    coalesce(sum(cache_read_tokens), 0), coalesce(sum(cache_creation_tokens), 0),
-                    coalesce(sum(reasoning_tokens), 0)
-                 FROM runs GROUP BY provider, model ORDER BY count(*) DESC, provider, model",
-                params![encode(&RunStatus::Completed)?, encode(&RunStatus::Failed)?],
-                |row| {
-                    Ok(OrchModelStat {
-                        provider: decode(row, 0)?,
-                        model: row.get(1)?,
-                        total_runs: row.get(2)?,
-                        completed_runs: row.get(3)?,
-                        failed_runs: row.get(4)?,
-                        success_rate: row.get(5)?,
-                        avg_duration_ms: row.get(6)?,
-                        total_input_tokens: row.get(7)?,
-                        total_output_tokens: row.get(8)?,
-                        total_cache_read_tokens: row.get(9)?,
-                        total_cache_creation_tokens: row.get(10)?,
-                        total_reasoning_tokens: row.get(11)?,
-                    })
-                },
-            )
         })
         .await
     }
