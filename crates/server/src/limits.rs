@@ -105,6 +105,12 @@ pub(crate) async fn consume_reset_credit(
             state.usage_home.as_deref(),
         )
         .await?;
+    if response.outcome == "reset" {
+        state
+            .coordinator
+            .release_provider_hold(ProviderId::Codex)
+            .await;
+    }
     Ok(Json(response))
 }
 
