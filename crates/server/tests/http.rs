@@ -22,7 +22,7 @@ use t3_core::{
     TurnItemKind, WsServerMessage,
 };
 use t3_server::{ServerState, router};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::broadcast};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -1111,6 +1111,134 @@ fn restart_resumes_an_interrupted_run_with_its_session() {
                     .as_str()
                     .is_some_and(|p| p == reply)
         }));
+    });
+}
+
+/// Starts a slow run on a new thread and returns once the provider is replying.
+async fn start_slow_run(
+    app: &Router,
+    events: &mut broadcast::Receiver<WsServerMessage>,
+    workspace: &Path,
+) -> Uuid {
+    let id = create_parent(app, workspace).await;
+    json_req(
+        app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({"prompt": "[slow] original request"})),
+    )
+    .await;
+    wait_for_delta(events, id).await;
+    id
+}
+
+async fn wait_for_delta(events: &mut broadcast::Receiver<WsServerMessage>, id: Uuid) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(
+            events.recv().await.unwrap(),
+            WsServerMessage::Delta { thread_id, channel, .. }
+                if thread_id == id && channel == "assistant"
+        ) {}
+    })
+    .await
+    .unwrap();
+}
+
+/// A graceful shutdown leaves the run in flight, so the next server resumes it once, as after a
+/// crash. A second shutdown during the resumed run cancels it.
+#[test]
+fn graceful_shutdown_resumes_the_interrupted_run_only_once() {
+    let tmp = TempDir::new();
+    let first = tokio::runtime::Runtime::new().unwrap();
+    let thread_id = first.block_on(async {
+        let state = tmp.state(AuthConfig::LocalOnly);
+        let coordinator = state.coordinator.clone();
+        let mut events = coordinator.subscribe();
+        let app = router(state);
+        let id = start_slow_run(&app, &mut events, &tmp.0).await;
+        coordinator.interrupt_all().await;
+        let path = format!("/api/threads/{id}");
+        let detail = json_req(&app, Method::GET, &path, None).await;
+        assert_eq!(detail["runs"][0]["status"], "running");
+        assert!(detail["runs"][0]["completed_at"].is_null());
+        // The partial reply is kept.
+        assert!(
+            detail["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["kind"] == "assistant_message")
+        );
+        id
+    });
+    drop(first);
+
+    let second = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    second.block_on(async {
+        let state = tmp.state(AuthConfig::LocalOnly);
+        let coordinator = state.coordinator.clone();
+        let app = router(state);
+        let path = format!("/api/threads/{thread_id}");
+        let detail = json_req(&app, Method::GET, &path, None).await;
+        assert_eq!(detail["runs"][0]["status"], "queued");
+        // The resumed turn ends at once. On this single-threaded runtime it has not run yet
+        // when the shutdown arrives.
+        coordinator.resume_queued_runs().await.unwrap();
+        coordinator.interrupt_all().await;
+        let detail = json_req(&app, Method::GET, &path, None).await;
+        assert_eq!(detail["runs"][0]["status"], "running");
+    });
+    drop(second);
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let state = tmp.state(AuthConfig::LocalOnly);
+        let app = router(state);
+        let path = format!("/api/threads/{thread_id}");
+        let detail = json_req(&app, Method::GET, &path, None).await;
+        assert_eq!(detail["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["runs"][0]["status"], "cancelled");
+        assert_eq!(
+            detail["runs"][0]["error_message"],
+            "Interrupted by server restart"
+        );
+    });
+}
+
+/// A run the user cancelled stays cancelled, even when the shutdown arrives before it settles.
+#[test]
+fn user_cancelled_run_is_not_resumed_after_shutdown() {
+    let tmp = TempDir::new();
+    let first = tokio::runtime::Runtime::new().unwrap();
+    let threads = first.block_on(async {
+        let state = tmp.state(AuthConfig::LocalOnly);
+        let coordinator = state.coordinator.clone();
+        let mut events = coordinator.subscribe();
+        let app = router(state);
+        let settled = start_slow_run(&app, &mut events, &tmp.0).await;
+        coordinator.interrupt(settled).await.unwrap();
+        let racing = start_slow_run(&app, &mut events, &tmp.0).await;
+        let (cancelled, ()) =
+            tokio::join!(coordinator.interrupt(racing), coordinator.interrupt_all());
+        cancelled.unwrap();
+        [settled, racing]
+    });
+    drop(first);
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let state = tmp.state(AuthConfig::LocalOnly);
+        let coordinator = state.coordinator.clone();
+        let app = router(state);
+        coordinator.resume_queued_runs().await.unwrap();
+        for id in threads {
+            let path = format!("/api/threads/{id}");
+            let detail = json_req(&app, Method::GET, &path, None).await;
+            assert_eq!(detail["thread"]["status"], "interrupted");
+            assert_eq!(detail["runs"][0]["status"], "cancelled");
+            assert_eq!(detail["runs"][0]["error_message"], "Interrupted");
+        }
     });
 }
 

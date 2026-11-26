@@ -207,7 +207,7 @@ async fn gc_counts_live_wal_data_and_excludes_apply_while_the_store_is_open() {
 }
 
 #[tokio::test]
-async fn sigterm_stops_the_provider_group_and_persists_cancellation() {
+async fn sigterm_stops_the_provider_group_and_leaves_the_run_to_restart_recovery() {
     let fixture = Fixture::new();
     let (mut daemon, url, config) = fixture.start().await;
     let client = Client::builder()
@@ -289,13 +289,17 @@ async fn sigterm_stops_the_provider_group_and_persists_cancellation() {
             .all(|line| line.trim().starts_with('Z'))
     );
     let store = SqliteStore::open(config.db_path(), config.storage).unwrap();
+    let run = store.list_runs(thread_id).await.unwrap().remove(0);
+    assert_eq!(run.status, t3_core::RunStatus::Running);
+    assert!(run.completed_at.is_none());
+    // This provider never named a session, so the next start cannot resume the run.
+    assert_eq!(
+        store.recover_interrupted_runs().unwrap().cancelled,
+        vec![run.id]
+    );
     assert_eq!(
         store.get_thread(thread_id).await.unwrap().status,
         t3_core::ThreadStatus::Interrupted
-    );
-    assert_eq!(
-        store.list_runs(thread_id).await.unwrap()[0].status,
-        t3_core::RunStatus::Cancelled
     );
 }
 

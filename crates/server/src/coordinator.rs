@@ -80,6 +80,8 @@ pub(crate) struct ActiveRun {
     model: ModelSelection,
     driver: Arc<dyn ProviderDriver>,
     cancel: watch::Sender<bool>,
+    /// Set when someone asked to stop this run, as opposed to the server shutting down.
+    stop_requested: bool,
     done: watch::Receiver<bool>,
     pub(crate) wake_depth: u8,
     pub(crate) runtime_mode: RuntimeMode,
@@ -926,6 +928,7 @@ impl RunCoordinator {
                 model: selection.clone(),
                 driver: driver.clone(),
                 cancel,
+                stop_requested: false,
                 done: completion.clone(),
                 wake_depth: queued.input.wake_depth,
                 runtime_mode: thread.runtime_mode,
@@ -1048,7 +1051,10 @@ impl RunCoordinator {
         active: &mut HashMap<Uuid, ActiveRun>,
         id: Uuid,
     ) -> CoreResult<Option<watch::Receiver<bool>>> {
-        let done = active.get_mut(&id).map(|run| self.cancel(run));
+        let done = active.get_mut(&id).map(|run| {
+            run.stop_requested = true;
+            self.cancel(run)
+        });
         for run_id in self.0.store.cancel_queued_runs(id).await? {
             self.emit(WsServerMessage::RunStatusChanged {
                 thread_id: id,
@@ -1367,6 +1373,25 @@ impl RunCoordinator {
 
         let mut active = self.0.active.lock().await;
         let cancelled = *cancellation.borrow() || verify_cancelled;
+        // A server shutdown leaves the run in flight, as a crash would, so that
+        // `recover_interrupted_runs` resumes it on the next start.
+        if cancelled
+            && active
+                .get(&thread_id)
+                .is_some_and(|run| !run.stop_requested)
+        {
+            if let Err(error) = self.flush_output(thread_id, run_id, &mut outcome).await {
+                tracing::error!(%error, %run_id, "Could not keep the interrupted output");
+            }
+            self.settle_live_state(thread_id, run_id, outcome.session)
+                .await;
+            active.remove(&thread_id);
+            done.send_replace(true);
+            for waiter in chained_dones {
+                waiter.send_replace(true);
+            }
+            return None;
+        }
         let mut error_class = None;
         let (mut status, mut error) = if cancelled {
             (RunStatus::Cancelled, Some("Interrupted".into()))
@@ -1567,24 +1592,7 @@ impl RunCoordinator {
             error = Some(failure.to_string());
             error_class = Some(FailureClass::HarnessError);
         }
-        let flush = async {
-            self.flush_text(
-                thread_id,
-                run_id,
-                TurnItemKind::Reasoning,
-                &mut outcome.reasoning,
-            )
-            .await?;
-            self.flush_text(
-                thread_id,
-                run_id,
-                TurnItemKind::AssistantMessage,
-                &mut outcome.assistant,
-            )
-            .await
-        }
-        .await;
-        if let Err(failure) = flush {
+        if let Err(failure) = self.flush_output(thread_id, run_id, &mut outcome).await {
             status = RunStatus::Failed;
             error = Some(failure.to_string());
             error_class = Some(FailureClass::HarnessError);
@@ -1687,15 +1695,8 @@ impl RunCoordinator {
         {
             tracing::error!(%error, %run_id, "Could not persist run completion");
         }
-        if let Some(mut snap) = self.live_context(thread_id).await
-            && snap.run_id == run_id
-        {
-            if snap.session_id.is_none() {
-                snap.session_id = outcome.session;
-                self.record_live_context(thread_id, snap.clone()).await;
-            }
-            self.persist_context(thread_id, &snap).await;
-        }
+        self.settle_live_state(thread_id, run_id, outcome.session)
+            .await;
         let mut enqueued_followup = false;
         if let Some((followup_msg, followup_meta)) = scheduled_auto_followup {
             match self
@@ -1760,7 +1761,6 @@ impl RunCoordinator {
                 reason,
             });
         }
-        self.0.live_streams.lock().await.remove(&thread_id);
         self.emit(WsServerMessage::RunStatusChanged {
             thread_id,
             run_id,
@@ -1819,6 +1819,43 @@ impl RunCoordinator {
                 None
             }
         }
+    }
+
+    /// Stores the reasoning and reply text still buffered when a turn ends.
+    async fn flush_output(
+        &self,
+        thread_id: Uuid,
+        run_id: Uuid,
+        outcome: &mut Outcome,
+    ) -> CoreResult<()> {
+        self.flush_text(
+            thread_id,
+            run_id,
+            TurnItemKind::Reasoning,
+            &mut outcome.reasoning,
+        )
+        .await?;
+        self.flush_text(
+            thread_id,
+            run_id,
+            TurnItemKind::AssistantMessage,
+            &mut outcome.assistant,
+        )
+        .await
+    }
+
+    /// Persists the run's last context usage and drops its live stream.
+    async fn settle_live_state(&self, thread_id: Uuid, run_id: Uuid, session: Option<String>) {
+        if let Some(mut snap) = self.live_context(thread_id).await
+            && snap.run_id == run_id
+        {
+            if snap.session_id.is_none() {
+                snap.session_id = session;
+                self.record_live_context(thread_id, snap.clone()).await;
+            }
+            self.persist_context(thread_id, &snap).await;
+        }
+        self.0.live_streams.lock().await.remove(&thread_id);
     }
 
     async fn event(
