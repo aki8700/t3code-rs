@@ -2108,6 +2108,126 @@ printf '{"type":"result","subtype":"success","result":"%s"}\n' "$text"
     );
 }
 
+// A wake run that fails must leave its posts unread so the next wake redelivers them,
+// and a wake that completes must not deliver its posts again.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_wake_run_redelivers_its_posts_on_the_next_wake() {
+    let tmp = TempDir::new();
+    let (app, id) = swarm_fixture(
+        &tmp,
+        r#"#!/bin/sh
+IFS= read -r prompt
+case "$prompt" in
+  *"Unread swarm board posts"*)
+    if [ ! -f failed ]; then touch failed; echo "boom" >&2; exit 1; fi ;;
+esac
+printf '{"type":"result","subtype":"success","result":"noted"}\n'
+"#,
+    )
+    .await;
+    start_swarm(&app, id).await;
+    wait_for_runs(&app, id, 1).await;
+    let worker = mcp_tool(
+        &app,
+        "swarm_add_worker",
+        json!({
+            "thread_id":id,"name":"w1","brief":"check","provider":"mock","model":"mock",
+        }),
+    )
+    .await;
+    let worker_id = worker["thread_id"].clone();
+    let post = |text: &'static str| {
+        let app = app.clone();
+        let worker_id = worker_id.clone();
+        async move {
+            mcp_tool(
+                &app,
+                "swarm_post_message",
+                json!({"thread_id":worker_id,"text":text}),
+            )
+            .await
+        }
+    };
+    post("@coordinator [done] first").await;
+    let detail = wait_for_runs(&app, id, 2).await;
+    assert_ne!(
+        detail["runs"][1]["status"], "completed",
+        "{}",
+        detail["runs"][1]
+    );
+    post("@coordinator second").await;
+    let detail = wait_for_runs(&app, id, 3).await;
+    let run = &detail["runs"][2];
+    assert_eq!(run["status"], "completed", "{run}");
+    let prompt = run["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains("[done] first") && prompt.contains("second"),
+        "{prompt}"
+    );
+    let third = post("@coordinator third").await;
+    let detail = wait_for_runs(&app, id, 4).await;
+    let prompt = detail["runs"][3]["prompt"].as_str().unwrap();
+    assert!(prompt.contains("third"), "{prompt}");
+    assert!(
+        !prompt.contains("first") && !prompt.contains("second"),
+        "{prompt}"
+    );
+    let board = json_req(&app, Method::GET, &format!("/api/threads/{id}/swarm"), None).await;
+    assert_eq!(board["members"][0]["last_read_seq"], third["seq"]);
+}
+
+// A wake queued behind a running wake gets only the posts the running one lacks.
+#[cfg(unix)]
+#[tokio::test]
+async fn wake_queued_behind_a_running_wake_skips_its_posts() {
+    let tmp = TempDir::new();
+    let (app, id) = swarm_fixture(
+        &tmp,
+        r#"#!/bin/sh
+IFS= read -r prompt
+case "$prompt" in *"first"*) sleep 1 ;; esac
+printf '{"type":"result","subtype":"success","result":"noted"}\n'
+"#,
+    )
+    .await;
+    start_swarm(&app, id).await;
+    wait_for_runs(&app, id, 1).await;
+    let worker = mcp_tool(
+        &app,
+        "swarm_add_worker",
+        json!({
+            "thread_id":id,"name":"w1","brief":"check","provider":"mock","model":"mock",
+        }),
+    )
+    .await;
+    for text in ["@coordinator first", "@coordinator second"] {
+        mcp_tool(
+            &app,
+            "swarm_post_message",
+            json!({"thread_id":worker["thread_id"],"text":text}),
+        )
+        .await;
+    }
+    let detail = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let detail = wait_for_runs(&app, id, 3).await;
+            if detail["runs"][2]["status"] == "completed" {
+                return detail;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("queued wake did not complete");
+    assert_eq!(detail["runs"][1]["status"], "completed");
+    let prompt = detail["runs"][2]["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains("second") && !prompt.contains("first"),
+        "{prompt}"
+    );
+}
+
 #[tokio::test]
 async fn oversized_swarm_post_error_says_to_pass_a_file_reference() {
     let tmp = TempDir::new();

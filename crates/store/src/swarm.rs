@@ -98,13 +98,25 @@ impl SqliteStore {
         .await
     }
 
-    pub async fn update_swarm_member_read_seq(&self, thread_id: Uuid, seq: i64) -> CoreResult<()> {
+    /// Marks posts `(from, to]` read. The cursor moves only when it already covers `from`,
+    /// so an earlier range that was never acknowledged stays unread.
+    pub async fn ack_swarm_member_read_seq(
+        &self,
+        thread_id: Uuid,
+        from: i64,
+        to: i64,
+    ) -> CoreResult<bool> {
         self.with_writer(move |connection| {
-            require_change(connection.execute(
-                "UPDATE swarm_members SET last_read_seq = max(last_read_seq, ?2) WHERE thread_id = ?1",
-                params![thread_id.to_string(), seq],
-            ), "swarm member", thread_id)
-        }).await
+            connection
+                .execute(
+                    "UPDATE swarm_members SET last_read_seq = ?3
+                     WHERE thread_id = ?1 AND last_read_seq >= ?2 AND last_read_seq < ?3",
+                    params![thread_id.to_string(), from, to],
+                )
+                .map(|changed| changed != 0)
+                .map_err(storage_error)
+        })
+        .await
     }
 
     pub async fn append_swarm_message(

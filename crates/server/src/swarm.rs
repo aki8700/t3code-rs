@@ -18,6 +18,18 @@ const WAKE_BATCH: usize = 16;
 const ENDED_ERROR_CHARS: usize = 200;
 const READ_MESSAGE_MAX_CHARS: usize = 2_000;
 
+/// Board posts `(from, to]` handed to a run that has not finished yet, per member thread.
+/// The member's `last_read_seq` advances only when that run completes, so a failed or
+/// cancelled run leaves its posts unread for the next wake (at-least-once delivery).
+/// Lost on restart, which can only cause a duplicate delivery.
+pub(crate) type WakeDeliveries = std::sync::Mutex<HashMap<Uuid, Vec<WakeDelivery>>>;
+
+pub(crate) struct WakeDelivery {
+    run_id: Uuid,
+    from: i64,
+    to: i64,
+}
+
 pub(crate) fn is_swarm_command(prompt: &str) -> bool {
     prompt.split_whitespace().next() == Some("/swarm")
 }
@@ -234,7 +246,7 @@ impl RunCoordinator {
                 Some((&parent, "swarm-worker")),
             )
             .await?;
-        let mut member = SwarmMember {
+        let member = SwarmMember {
             board_id: board.board_id,
             name: spec.name,
             thread_id: worker.id,
@@ -257,12 +269,11 @@ impl RunCoordinator {
                 )
                 .await?;
             let prompt = format!("Your swarm brief from {}:\n{}", actor.name, spec.brief);
-            self.send_locked(active, worker.clone(), queued_message(prompt), depth + 1)
+            let run_id = self
+                .send_locked(active, worker.clone(), queued_message(prompt), depth + 1)
                 .await?;
-            member.last_read_seq = post.seq;
-            store
-                .update_swarm_member_read_seq(worker.id, post.seq)
-                .await
+            self.record_delivery(worker.id, run_id, board.head_seq, post.seq);
+            CoreResult::Ok(())
         }
         .await;
         if let Err(error) = result {
@@ -396,7 +407,10 @@ impl RunCoordinator {
         if target.archived || caller.is_some_and(|caller| !can_dispatch(caller, &target)) {
             return Ok(false);
         }
-        let mut cursor = member.last_read_seq;
+        let mut cursor = self
+            .in_flight_seq(active, target.id)
+            .await?
+            .max(member.last_read_seq);
         let mut woken = false;
         loop {
             let messages = store
@@ -419,18 +433,90 @@ impl RunCoordinator {
                     )
                     .expect("write to String");
                 }
-                self.send_locked(active, target.clone(), queued_message(prompt), depth)
+                let run_id = self
+                    .send_locked(active, target.clone(), queued_message(prompt), depth)
                     .await?;
+                self.record_delivery(target.id, run_id, cursor, last.seq);
                 woken = true;
+            } else {
+                // Only the member's own posts: nothing to deliver.
+                store
+                    .ack_swarm_member_read_seq(target.id, cursor, last.seq)
+                    .await?;
             }
             cursor = last.seq;
-            store
-                .update_swarm_member_read_seq(target.id, cursor)
-                .await?;
             if messages.len() < WAKE_BATCH {
                 return Ok(woken);
             }
         }
+    }
+
+    fn deliveries(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Vec<WakeDelivery>>> {
+        self.0
+            .wake_deliveries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn record_delivery(&self, thread_id: Uuid, run_id: Uuid, from: i64, to: i64) {
+        self.deliveries()
+            .entry(thread_id)
+            .or_default()
+            .push(WakeDelivery { run_id, from, to });
+    }
+
+    /// Highest post seq already handed to a queued or running run of the thread. Deliveries
+    /// whose run was dropped from the queue without running are forgotten here.
+    async fn in_flight_seq(
+        &self,
+        active: &HashMap<Uuid, ActiveRun>,
+        thread_id: Uuid,
+    ) -> CoreResult<i64> {
+        let queued = self.0.store.list_queued_runs(thread_id).await?;
+        let running = active.get(&thread_id).map(|run| run.id);
+        let mut deliveries = self.deliveries();
+        let Some(list) = deliveries.get_mut(&thread_id) else {
+            return Ok(0);
+        };
+        list.retain(|delivery| {
+            Some(delivery.run_id) == running || queued.iter().any(|run| run.id == delivery.run_id)
+        });
+        Ok(list.iter().map(|delivery| delivery.to).max().unwrap_or(0))
+    }
+
+    /// Called when a run ends. A completed run acknowledges the posts it delivered. Any
+    /// other outcome drops every pending delivery of the thread, so the next wake starts
+    /// again from the acknowledged cursor and includes the posts this run never finished.
+    pub(crate) async fn settle_wake(
+        &self,
+        thread_id: Uuid,
+        run_id: Uuid,
+        status: RunStatus,
+    ) -> CoreResult<()> {
+        let delivered = {
+            let mut deliveries = self.deliveries();
+            let Some(list) = deliveries.get_mut(&thread_id) else {
+                return Ok(());
+            };
+            let (delivered, rest) = std::mem::take(list)
+                .into_iter()
+                .partition::<Vec<_>, _>(|delivery| delivery.run_id == run_id);
+            if status == RunStatus::Completed && !rest.is_empty() {
+                *list = rest;
+            } else {
+                deliveries.remove(&thread_id);
+            }
+            delivered
+        };
+        if status == RunStatus::Completed {
+            for delivery in delivered {
+                self.0
+                    .store
+                    .ack_swarm_member_read_seq(thread_id, delivery.from, delivery.to)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Wakes the coordinator when a non-coordinator member's run ends without a board post
