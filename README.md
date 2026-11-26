@@ -64,6 +64,20 @@ t3d launchd-plist --port 3774 > ~/Library/LaunchAgents/com.local.t3code-rs.plist
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.local.t3code-rs.plist
 ```
 
+### Claude Code with pstack (optional)
+
+With `pstack@cursor-plugins` enabled in Claude Code's user scope, select Claude in
+the composer and type `/pstack:` to find `/pstack:poteto-mode [task]` and
+`/pstack:poteto-help [question]`. For example, send
+`/pstack:poteto-help Which skill should I use to plan a small refactor?`.
+T3 forwards the slash invocation to Claude Code, including on a first turn
+with project instructions or a handoff. Run `claude plugin list` to check
+whether pstack is enabled for the account running T3.
+
+Keep pstack's model choices in the existing user rules file
+`~/.claude/rules/pstack-models.md`. For work that changes T3 Code, use the
+`verify-t3code` skill to check the change.
+
 ## Remote Access (Optional)
 
 ### Cloudflare Access + Tunnel

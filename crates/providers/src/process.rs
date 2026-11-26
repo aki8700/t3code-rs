@@ -77,7 +77,7 @@ pub(crate) type ActiveRunMap = Arc<Mutex<HashMap<Uuid, ActiveProcess>>>;
 type ControlRequests = Arc<Mutex<HashMap<Uuid, ControlRequest>>>;
 
 pub(crate) enum Input {
-    StreamJson(String),
+    StreamJson(Value),
     Text(String),
     None,
 }
@@ -787,9 +787,9 @@ async fn read_tail(mut input: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
     }
 }
 
-fn user_line(text: &str) -> String {
+fn user_line(content: impl serde::Serialize) -> String {
     let mut line =
-        json!({"type": "user", "message": {"role": "user", "content": text}}).to_string();
+        json!({"type": "user", "message": {"role": "user", "content": content}}).to_string();
     line.push('\n');
     line
 }
@@ -805,8 +805,8 @@ async fn write_input(
     };
     let write = async {
         match input {
-            Input::StreamJson(prompt) => {
-                stdin.write_all(user_line(&prompt).as_bytes()).await?;
+            Input::StreamJson(content) => {
+                stdin.write_all(user_line(content).as_bytes()).await?;
                 while let Some(msg) = steer.recv().await {
                     let line = match msg {
                         StdinMsg::Steer(text) => user_line(&text),

@@ -9,7 +9,8 @@ use t3_core::{
     protocol::StreamEvent,
     traits::{CoreError, CoreResult, ProviderDriver, TurnRequest},
     types::{
-        InteractionMode, McpInjectionSpec, PendingResponse, ProviderHealth, ProviderId, RuntimeMode,
+        Attachment, InteractionMode, McpInjectionSpec, PendingResponse, ProviderHealth, ProviderId,
+        RuntimeMode,
     },
 };
 use tokio::{process::Command, sync::mpsc};
@@ -260,7 +261,19 @@ fn claude_args(cmd: &mut Command, req: &TurnRequest) -> Input {
             .to_string(),
         );
     }
-    Input::StreamJson(prompt_with_paths(req, false))
+    let content = match req.claude_slash_context.as_deref() {
+        Some(context) if !context.is_empty() || !req.attachments.is_empty() => {
+            // Claude resolves the slash invocation from the last text block. Earlier blocks
+            // remain user context and stay outside the command's arguments.
+            let context = prompt_with_paths(context, &req.attachments, false);
+            json!([
+                {"type": "text", "text": context.trim_start()},
+                {"type": "text", "text": req.prompt}
+            ])
+        }
+        _ => json!(prompt_with_paths(&req.prompt, &req.attachments, false)),
+    };
+    Input::StreamJson(content)
 }
 
 fn codex_args(cmd: &mut Command, req: &TurnRequest) -> Input {
@@ -307,7 +320,7 @@ fn codex_args(cmd: &mut Command, req: &TurnRequest) -> Input {
         ]);
     }
     cmd.arg("-");
-    Input::Text(prompt_with_paths(req, true))
+    Input::Text(prompt_with_paths(&req.prompt, &req.attachments, true))
 }
 
 fn antigravity_args(cmd: &mut Command, req: &TurnRequest, mcp_enabled: bool) -> Input {
@@ -331,7 +344,8 @@ fn antigravity_args(cmd: &mut Command, req: &TurnRequest, mcp_enabled: bool) -> 
             cmd.env("T3_MCP_TOKEN", &spec.internal_token);
         }
     }
-    cmd.arg("--print").arg(prompt_with_paths(req, false));
+    cmd.arg("--print")
+        .arg(prompt_with_paths(&req.prompt, &req.attachments, false));
     Input::None
 }
 
@@ -398,10 +412,9 @@ fn mcp_args(spec: &McpInjectionSpec) -> Vec<String> {
     ]
 }
 
-fn prompt_with_paths(req: &TurnRequest, omit_images: bool) -> String {
-    let mut prompt = req.prompt.clone();
-    for (index, attachment) in req
-        .attachments
+fn prompt_with_paths(prompt: &str, attachments: &[Attachment], omit_images: bool) -> String {
+    let mut prompt = prompt.to_owned();
+    for (index, attachment) in attachments
         .iter()
         .filter(|attachment| !omit_images || !attachment.mime_type.starts_with("image/"))
         .enumerate()
@@ -419,7 +432,6 @@ fn prompt_with_paths(req: &TurnRequest, omit_images: bool) -> String {
 mod tests {
     use super::*;
     use crate::test_request;
-    use t3_core::types::Attachment;
 
     fn request(provider: ProviderId) -> TurnRequest {
         let mut req = test_request(provider);
@@ -497,7 +509,12 @@ mod tests {
                 "env":{"T3_MCP_TOKEN":"${T3_MCP_TOKEN}"}
             }}})
         );
-        assert!(prompt.contains("\n- /attachments/picture.png\n- /attachments/notes.txt"));
+        assert!(
+            prompt
+                .as_str()
+                .unwrap()
+                .contains("\n- /attachments/picture.png\n- /attachments/notes.txt")
+        );
     }
 
     #[tokio::test]

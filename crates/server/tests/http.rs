@@ -2448,6 +2448,131 @@ async fn project_patch_workspace_meta_and_instructions_injection() {
     assert!(reply.contains("Current request:\ncontinue without a provider session"));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_pstack_slash_keeps_first_turn_context_and_native_resume() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new();
+    let driver = tmp.0.join("fixture-claude");
+    std::fs::write(
+        &driver,
+        r#"#!/bin/sh
+set -eu
+IFS= read -r line
+printf '%s\n' "$line" >> stdin.jsonl
+printf '%s\n' "$*" >> argv.txt
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"fixture-session"}'
+printf '%s\n' '{"type":"result","subtype":"success","result":"fixture complete"}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut config = ServerConfig {
+        data_dir: tmp.0.join("server"),
+        enabled_providers: vec![ProviderId::Claude],
+        ..Default::default()
+    };
+    config.providers.claude_bin = driver;
+    let state = ServerState::new(config, "http://127.0.0.1:3774".into()).unwrap();
+    let mut events = state.coordinator.subscribe();
+    let store = state.store.clone();
+    let app = router(state);
+    let project = json_req(
+        &app,
+        Method::POST,
+        "/api/projects",
+        Some(json!({
+            "title": "Pstack fixture",
+            "workspace_root": tmp.0
+        })),
+    )
+    .await;
+    json_req(
+        &app,
+        Method::PATCH,
+        &format!("/api/projects/{}", project["id"].as_str().unwrap()),
+        Some(json!({"instructions": "Project instruction fixture."})),
+    )
+    .await;
+    let parent = json_req(
+        &app,
+        Method::POST,
+        "/api/threads",
+        Some(json!({
+            "project_id": project["id"],
+            "title": "Parent fixture",
+            "model_selection": {"provider": "claude", "model": "fixture"}
+        })),
+    )
+    .await;
+    let fork = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{}/fork", parent["id"].as_str().unwrap()),
+        Some(json!({"handoff_summary": "Prior thread fixture."})),
+    )
+    .await;
+    let id: Uuid = fork["id"].as_str().unwrap().parse().unwrap();
+    let attachment_id = Uuid::new_v4();
+    let attachment_path = tmp.0.join("notes.txt");
+    let notes = b"Fixture notes.";
+    std::fs::write(&attachment_path, notes).unwrap();
+    store
+        .save_attachment(t3_core::Attachment {
+            id: attachment_id,
+            thread_id: Some(id),
+            filename: "notes.txt".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: notes.len() as u64,
+            blake3_hash: blake3::hash(notes).to_hex().to_string(),
+            storage_path: attachment_path.clone(),
+            created_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    let help = "/pstack:poteto-help Which skill handles a synthetic task?";
+    let mode = "/pstack:poteto-mode Explain the fixture.";
+    for body in [
+        json!({"prompt": help, "attachment_ids": [attachment_id]}),
+        json!({"prompt": mode}),
+        json!({"prompt": "Continue the conversation."}),
+    ] {
+        json_req(
+            &app,
+            Method::POST,
+            &format!("/api/threads/{id}/messages"),
+            Some(body),
+        )
+        .await;
+        wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+    }
+
+    let input = std::fs::read_to_string(tmp.0.join("stdin.jsonl")).unwrap();
+    let messages: Vec<Value> = input
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let first = &messages[0]["message"]["content"];
+    assert_eq!(first[1], json!({"type": "text", "text": help}), "{first}");
+    let context = first[0]["text"].as_str().unwrap();
+    assert!(context.contains("Project instructions:\nProject instruction fixture."));
+    assert!(context.contains("Context from the previous thread:\nPrior thread fixture."));
+    assert!(context.contains(&format!(
+        "Attachments (file paths):\n- {}",
+        attachment_path.display()
+    )));
+    assert_eq!(messages[1]["message"]["content"], mode);
+    assert_eq!(
+        messages[2]["message"]["content"],
+        "Continue the conversation."
+    );
+    let argv = std::fs::read_to_string(tmp.0.join("argv.txt")).unwrap();
+    let mut argv = argv.lines();
+    assert!(!argv.next().unwrap().contains("--resume"));
+    assert!(argv.next().unwrap().contains("--resume fixture-session"));
+    assert!(argv.next().unwrap().contains("--resume fixture-session"));
+}
+
 #[tokio::test]
 async fn tier4_streaming_shell_cancel_monitor_and_worktree_merge_routes() {
     let tmp = TempDir::new();

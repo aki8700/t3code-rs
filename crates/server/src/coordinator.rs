@@ -723,11 +723,14 @@ impl RunCoordinator {
             .and_then(|run| run.provider_session_id.clone());
         let project = store.get_project(thread.project_id).await?;
         let original_prompt = queued.prompt.clone();
-        let mut prompt = queued.prompt;
-        if previous_run.is_some() && resume_session_id.is_none() {
+        let claude_slash = selection.provider == ProviderId::Claude
+            && matches!(
+                queued.prompt.split_whitespace().next(),
+                Some("/pstack:poteto-mode" | "/pstack:poteto-help")
+            );
+        let handoff = if previous_run.is_some() && resume_session_id.is_none() {
             let handoff = self.handoff_summary(&thread).await?;
-            prompt =
-                format!("Context from the previous run:\n{handoff}\n\nCurrent request:\n{prompt}");
+            Some(format!("Context from the previous run:\n{handoff}"))
         } else if previous_run.is_none()
             && let Some(handoff) = store
                 .list_handoffs(thread.id)
@@ -735,11 +738,20 @@ impl RunCoordinator {
                 .into_iter()
                 .find(|handoff| handoff.target_thread_id == thread.id)
         {
-            prompt = format!(
-                "Context from the previous thread:\n{}\n\nCurrent request:\n{prompt}",
+            Some(format!(
+                "Context from the previous thread:\n{}",
                 handoff.summary
-            );
-        }
+            ))
+        } else {
+            None
+        };
+        let mut prompt = if claude_slash {
+            handoff.unwrap_or_default()
+        } else if let Some(handoff) = handoff {
+            format!("{handoff}\n\nCurrent request:\n{}", queued.prompt)
+        } else {
+            queued.prompt
+        };
         if resume_session_id.is_none()
             && let Some(instructions) = project
                 .instructions
@@ -777,11 +789,17 @@ impl RunCoordinator {
         } else {
             (None, None)
         };
+        let (prompt, claude_slash_context) = if claude_slash {
+            (original_prompt.clone(), Some(prompt.trim().to_owned()))
+        } else {
+            (prompt, None)
+        };
         let request = TurnRequest {
             thread_id: thread.id,
             run_id,
             workspace_dir: workspace_dir.clone(),
             prompt,
+            claude_slash_context,
             model_selection: selection.clone(),
             runtime_mode: thread.runtime_mode,
             interaction_mode: thread.interaction_mode,
