@@ -4870,6 +4870,10 @@ function handleWs(m) {
       refreshMonitorSoon();
       break;
     }
+    case 'pending_resolved':
+      dropPending(m.thread_id, m.request_id);
+      refreshMonitorSoon();
+      break;
     case 'shell_output':
       shellAppendChunk(m.exec_id, m.stream, m.chunk);
       break;

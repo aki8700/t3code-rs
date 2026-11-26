@@ -26,6 +26,10 @@ pub enum StreamEvent {
     PendingApproval {
         request: PendingRequest,
     },
+    /// The provider withdrew a pending request before the user answered it.
+    PendingResolved {
+        request_id: Uuid,
+    },
     RateLimited {
         retry_after_secs: u64,
         message: String,
@@ -109,6 +113,10 @@ pub enum WsServerMessage {
     },
     PendingRequest {
         request: PendingRequest,
+    },
+    PendingResolved {
+        thread_id: Uuid,
+        request_id: Uuid,
     },
     SubagentUpdated {
         parent_thread_id: Uuid,

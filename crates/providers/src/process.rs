@@ -705,6 +705,20 @@ async fn read_events(
                 redact_value(&mut value, secret);
             }
             in_flight.observe(provider, &value);
+            if value["type"] == "control_cancel_request"
+                && let Some(provider_request_id) = value["request_id"].as_str()
+            {
+                control_requests
+                    .lock()
+                    .unwrap()
+                    .retain(|&request_id, request| {
+                        let cancelled = request.provider_request_id == provider_request_id;
+                        if cancelled {
+                            let _ = tx.send(StreamEvent::PendingResolved { request_id });
+                        }
+                        !cancelled
+                    });
+            }
             for event in parser.parse(&value) {
                 if let StreamEvent::PendingApproval { request } = &event
                     && let Some(provider_request_id) =
@@ -1817,6 +1831,50 @@ printf '%s\n' '{"type":"result","result":"ok"}'
             "{event:?}"
         );
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_approval_resolves_and_restores_the_idle_timeout() {
+        let fixture = Fixture::new(
+            r#"
+IFS= read -r first
+printf '%s\n' '{"type":"control_request","request_id":"cli-req-1","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/w/a"}}}'
+printf '%s\n' '{"type":"control_cancel_request","request_id":"cli-req-1"}'
+/bin/sleep 30
+"#,
+        );
+        let active = ActiveRunMap::default();
+        let run_id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_turn_with_idle_timeout(
+                &active,
+                run_id,
+                ProviderId::Claude,
+                command(&fixture.binary()),
+                Input::StreamJson(json!("write a")),
+                None,
+                tx,
+                Duration::from_millis(800),
+            ),
+        )
+        .await
+        .expect("a cancelled approval must not suspend the idle timeout")
+        .unwrap();
+        let Some(StreamEvent::PendingApproval { request }) = receive(&mut rx).await else {
+            panic!("expected a pending approval");
+        };
+        let resolved = receive(&mut rx).await;
+        assert!(
+            matches!(resolved, Some(StreamEvent::PendingResolved { request_id }) if request_id == request.id),
+            "{resolved:?}"
+        );
+        let failed = receive(&mut rx).await;
+        assert!(
+            matches!(&failed, Some(StreamEvent::Failed { message, .. }) if message.contains("idle timeout")),
+            "{failed:?}"
+        );
     }
 
     #[test]

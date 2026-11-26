@@ -1671,6 +1671,15 @@ impl RunCoordinator {
                 }
                 self.emit(WsServerMessage::PendingRequest { request });
             }
+            StreamEvent::PendingResolved { request_id } => {
+                if let Some(run) = self.0.active.lock().await.get_mut(&thread_id) {
+                    run.pending.remove(&request_id);
+                }
+                self.emit(WsServerMessage::PendingResolved {
+                    thread_id,
+                    request_id,
+                });
+            }
             StreamEvent::RateLimited {
                 retry_after_secs,
                 message,
