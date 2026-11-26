@@ -975,7 +975,7 @@ async fn restart_recovers_stale_running_and_rate_limited_runs() {
     let mut events = state.coordinator.subscribe();
     let app = router(state);
     let mut threads = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         let id = create_parent(&app, &tmp.0).await;
         json_req(
             &app,
@@ -1004,19 +1004,114 @@ async fn restart_recovers_stale_running_and_rate_limited_runs() {
             )
             .unwrap();
         }
+        // A run that ended rate limited is not in flight.
+        let ended = threads[3].to_string();
+        let limited = json!("rate-limited").to_string();
+        db.execute(
+            "UPDATE threads SET status = ?1 WHERE id = ?2",
+            [&limited, &ended],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE runs SET status = ?1 WHERE thread_id = ?2",
+            [&limited, &ended],
+        )
+        .unwrap();
     }
     let app = router(tmp.state(AuthConfig::LocalOnly));
     for (i, id) in threads.into_iter().enumerate() {
         let response = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
-        let (thread_status, run_status) = if i < 2 {
-            ("interrupted", "cancelled")
-        } else {
-            ("completed", "completed")
+        let (thread_status, run_status) = match i {
+            0 | 1 => ("interrupted", "cancelled"),
+            2 => ("completed", "completed"),
+            _ => ("rate-limited", "rate-limited"),
         };
         assert_eq!(response["thread"]["status"], thread_status);
         assert_eq!(response["runs"][0]["status"], run_status);
         assert!(response["runs"][0]["completed_at"].is_string());
     }
+}
+
+/// A crash leaves the run in flight: the first server's runtime goes away without letting the
+/// run finish, and a new server on the same data directory resumes the run's session.
+#[test]
+fn restart_resumes_an_interrupted_run_with_its_session() {
+    let tmp = TempDir::new();
+    let crashed = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (thread_id, run_id) = crashed.block_on(async {
+        let state = tmp.state(AuthConfig::LocalOnly);
+        let mut events = state.coordinator.subscribe();
+        let app = router(state);
+        let id = create_parent(&app, &tmp.0).await;
+        let run = json_req(
+            &app,
+            Method::POST,
+            &format!("/api/threads/{id}/messages"),
+            Some(json!({"prompt": "[slow] original request"})),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                events.recv().await.unwrap(),
+                WsServerMessage::Delta { thread_id, .. } if thread_id == id
+            ) {}
+        })
+        .await
+        .unwrap();
+        let run_id: Uuid = run["run_id"].as_str().unwrap().parse().unwrap();
+        (id, run_id)
+    });
+    crashed.shutdown_background();
+    // The mock names a new session after the run, so give the provider session a distinct id to
+    // tell a resume apart from a new session.
+    rusqlite::Connection::open(tmp.0.join("server").join("state.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE threads SET provider_session_id = 'crashed-session' WHERE id = ?1",
+            [thread_id.to_string()],
+        )
+        .unwrap();
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let state = tmp.state(AuthConfig::LocalOnly);
+        let coordinator = state.coordinator.clone();
+        let mut events = coordinator.subscribe();
+        let app = router(state);
+        let path = format!("/api/threads/{thread_id}");
+        let detail = json_req(&app, Method::GET, &path, None).await;
+        assert_eq!(detail["runs"][0]["status"], "queued");
+        coordinator.resume_queued_runs().await.unwrap();
+        wait_for_thread(&mut events, thread_id, ThreadStatus::Completed).await;
+
+        let detail = json_req(&app, Method::GET, &path, None).await;
+        let runs = detail["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["id"], run_id.to_string());
+        assert_eq!(runs[0]["status"], "completed");
+        assert_eq!(runs[0]["provider_session_id"], "crashed-session");
+        let items = detail["items"].as_array().unwrap();
+        let reply = items
+            .iter()
+            .rfind(|item| item["kind"] == "assistant_message")
+            .and_then(|item| item["payload"]["text"].as_str())
+            .unwrap();
+        assert!(
+            reply.starts_with("The harness restarted and interrupted your previous turn."),
+            "{reply}"
+        );
+        assert!(!reply.contains("original request"), "{reply}");
+        assert!(!reply.contains("Project instructions:") && !reply.contains("Context from"));
+        assert!(items.iter().any(|item| {
+            item["kind"] == "system_notice"
+                && item["payload"]["prompt"]
+                    .as_str()
+                    .is_some_and(|p| p == reply)
+        }));
+    });
 }
 
 #[tokio::test]
@@ -2448,6 +2543,119 @@ async fn project_patch_workspace_meta_and_instructions_injection() {
     assert!(reply.contains("Current request:\ncontinue without a provider session"));
 }
 
+/// Writes the transcript Claude keeps for `session`, so the pre-resume check accepts it.
+fn claude_transcript(home: &Path, workspace: &Path, session: &str) {
+    let workspace = std::fs::canonicalize(workspace).unwrap();
+    let project: String = workspace
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let dir = home.join(".claude").join("projects").join(project);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{session}.jsonl")),
+        "{\"type\":\"user\",\"uuid\":\"fixture-message\"}\n",
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_follow_up_resumes_only_a_session_with_a_transcript() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new();
+    let driver = tmp.0.join("fixture-claude");
+    std::fs::write(
+        &driver,
+        r#"#!/bin/sh
+set -eu
+IFS= read -r line
+printf '%s\n' "$line" >> stdin.jsonl
+printf '%s\n' "$*" >> argv.txt
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"fixture-session"}'
+printf '%s\n' '{"type":"result","subtype":"success","result":"fixture complete"}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut config = ServerConfig {
+        data_dir: tmp.0.join("server"),
+        enabled_providers: vec![ProviderId::Claude],
+        ..Default::default()
+    };
+    config.providers.claude_bin = driver;
+    let state = ServerState::new(config, "http://127.0.0.1:3774".into()).unwrap();
+    let home = tmp.0.join("home");
+    state.coordinator.set_session_home(Some(home.clone()));
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let project = json_req(
+        &app,
+        Method::POST,
+        "/api/projects",
+        Some(json!({"title": "Resume fixture", "workspace_root": tmp.0})),
+    )
+    .await;
+    json_req(
+        &app,
+        Method::PATCH,
+        &format!("/api/projects/{}", project["id"].as_str().unwrap()),
+        Some(json!({"instructions": "Project instruction fixture."})),
+    )
+    .await;
+    let thread = json_req(
+        &app,
+        Method::POST,
+        "/api/threads",
+        Some(json!({
+            "project_id": project["id"],
+            "title": "Resume fixture",
+            "model_selection": {"provider": "claude", "model": "fixture"}
+        })),
+    )
+    .await;
+    let id = thread["id"].as_str().unwrap();
+    let id: Uuid = id.parse().unwrap();
+    for prompt in ["first", "second"] {
+        json_req(
+            &app,
+            Method::POST,
+            &format!("/api/threads/{id}/messages"),
+            Some(json!({"prompt": prompt})),
+        )
+        .await;
+        wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+    }
+    claude_transcript(&home, &tmp.0, "fixture-session");
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({"prompt": "third"})),
+    )
+    .await;
+    wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+
+    let argv = std::fs::read_to_string(tmp.0.join("argv.txt")).unwrap();
+    let argv: Vec<_> = argv.lines().collect();
+    assert!(!argv[0].contains("--resume"));
+    // No transcript: the stored session is not passed on, and the new session gets the
+    // project instructions and a handoff of the previous run.
+    assert!(!argv[1].contains("--resume"), "{}", argv[1]);
+    assert!(argv[2].contains("--resume fixture-session"), "{}", argv[2]);
+    let input = std::fs::read_to_string(tmp.0.join("stdin.jsonl")).unwrap();
+    let messages: Vec<Value> = input
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let second = messages[1]["message"]["content"].as_str().unwrap();
+    assert!(second.starts_with("Project instructions:\nProject instruction fixture."));
+    assert!(second.contains("Context from the previous run:"));
+    assert!(second.ends_with("Current request:\nsecond"));
+    assert_eq!(messages[2]["message"]["content"], "third");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_pstack_slash_keeps_first_turn_context_and_native_resume() {
@@ -2474,6 +2682,9 @@ printf '%s\n' '{"type":"result","subtype":"success","result":"fixture complete"}
     };
     config.providers.claude_bin = driver;
     let state = ServerState::new(config, "http://127.0.0.1:3774".into()).unwrap();
+    let home = tmp.0.join("home");
+    claude_transcript(&home, &tmp.0, "fixture-session");
+    state.coordinator.set_session_home(Some(home));
     let mut events = state.coordinator.subscribe();
     let store = state.store.clone();
     let app = router(state);

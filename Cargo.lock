@@ -3239,6 +3239,7 @@ dependencies = [
  "getrandom 0.4.3",
  "http",
  "jsonwebtoken",
+ "libc",
  "reqwest",
  "rusqlite",
  "rust-embed",

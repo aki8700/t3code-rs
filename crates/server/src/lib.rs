@@ -9,6 +9,7 @@ mod database;
 mod export;
 mod limits;
 pub mod privacy;
+mod resume;
 pub mod routes;
 mod settings;
 mod shell;

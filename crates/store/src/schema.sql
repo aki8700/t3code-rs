@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS runs (
     error_message TEXT,
     started_at TEXT NOT NULL,
     completed_at TEXT,
+    restart_resumes INTEGER NOT NULL DEFAULT 0,
     UNIQUE (id, thread_id)
 );
 CREATE INDEX IF NOT EXISTS runs_thread_ordinal ON runs(thread_id, ordinal);

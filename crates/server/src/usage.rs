@@ -218,6 +218,97 @@ fn find_codex_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
     None
 }
 
+/// Whether the provider can resume `session_id` from `workspace`, judged from the session file
+/// the provider keeps on disk. Providers without a stable on-disk session layout (Antigravity,
+/// OpenCode, Mock) are assumed resumable.
+pub(crate) fn provider_session_resumable(
+    provider: ProviderId,
+    home: Option<&Path>,
+    workspace: &Path,
+    session_id: &str,
+) -> bool {
+    let Some(home) = home else {
+        return true;
+    };
+    match provider {
+        ProviderId::Claude => {
+            let config = std::env::var_os("CLAUDE_CONFIG_DIR")
+                .map_or_else(|| home.join(".claude"), PathBuf::from);
+            claude_session_resumable(&config.join("projects"), workspace, session_id)
+        }
+        ProviderId::Codex => find_codex_session_file(home, session_id).is_some_and(|path| {
+            has_session_line(&path, |line| line.kind.as_deref() == Some("session_meta"))
+        }),
+        ProviderId::Antigravity | ProviderId::OpenCode | ProviderId::Mock => true,
+    }
+}
+
+/// Mirrors the check Claude Code makes before `--resume`: the transcript lives in the project
+/// directory of the working directory and holds at least one message line.
+fn claude_session_resumable(projects: &Path, workspace: &Path, session_id: &str) -> bool {
+    if session_id.is_empty()
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return false;
+    }
+    // Claude keys projects by the physical working directory, e.g. /tmp becomes /private/tmp.
+    let workspace = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let dir: String = workspace
+        .to_string_lossy()
+        .chars()
+        .flat_map(|c| {
+            let dash = !c.is_ascii_alphanumeric();
+            std::iter::repeat_n(if dash { '-' } else { c }, c.len_utf16())
+        })
+        .collect();
+    let path = projects.join(dir).join(format!("{session_id}.jsonl"));
+    fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file())
+        && has_session_line(&path, |line| {
+            [&line.uuid, &line.message_id, &line.leaf_uuid]
+                .iter()
+                .any(|id| id.as_deref().is_some_and(|id| !id.is_empty()))
+        })
+}
+
+#[derive(Deserialize)]
+struct SessionLine {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    uuid: Option<String>,
+    #[serde(rename = "messageId")]
+    message_id: Option<String>,
+    #[serde(rename = "leafUuid")]
+    leaf_uuid: Option<String>,
+}
+
+fn has_session_line(path: &Path, accept: impl Fn(&SessionLine) -> bool) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut input = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match input
+            .by_ref()
+            .take((MAX_JSONL_LINE + 1) as u64)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        if line.len() > MAX_JSONL_LINE {
+            if line.last() != Some(&b'\n') && input.skip_until(b'\n').is_err() {
+                return false;
+            }
+        } else if serde_json::from_slice::<SessionLine>(&line).is_ok_and(|parsed| accept(&parsed)) {
+            return true;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CodexSessionUsageSnapshot {
     total: Option<RawTokens>,
@@ -1471,6 +1562,91 @@ invalid json
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn claude_resume_needs_a_transcript_with_a_message_in_the_workspace_project() {
+        let home = Fixture::new();
+        let workspace = home.0.join("work space");
+        fs::create_dir(&workspace).unwrap();
+        let projects = home.0.join("projects");
+        let session = "4f1c2d3e-0000-4000-8000-000000000001";
+        assert!(!claude_session_resumable(&projects, &workspace, session));
+
+        let physical = fs::canonicalize(&workspace).unwrap();
+        let name: String = physical
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        assert!(name.ends_with("-work-space"));
+        let dir = projects.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join(format!("{session}.jsonl"));
+        fs::write(&transcript, "").unwrap();
+        assert!(!claude_session_resumable(&projects, &workspace, session));
+        fs::write(
+            &transcript,
+            "{\"type\":\"queue-operation\",\"sessionId\":\"x\"}\nnot json\n{\"type\":\"user\",\"uuid\":\"\"}\n",
+        )
+        .unwrap();
+        assert!(!claude_session_resumable(&projects, &workspace, session));
+        fs::write(
+            &transcript,
+            "{\"type\":\"queue-operation\"}\n{\"type\":\"user\",\"uuid\":\"m-1\",\"message\":{\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        assert!(claude_session_resumable(&projects, &workspace, session));
+        assert!(!claude_session_resumable(&projects, &workspace, "../x"));
+        // A transcript of another working directory is not resumable from this one.
+        let other = home.0.join("other");
+        fs::create_dir(&other).unwrap();
+        assert!(!claude_session_resumable(&projects, &other, session));
+    }
+
+    #[test]
+    fn claude_project_names_count_utf16_units_like_claude() {
+        let home = Fixture::new();
+        let workspace = home.0.join("日本😀");
+        fs::create_dir(&workspace).unwrap();
+        let projects = home.0.join("projects");
+        let physical = fs::canonicalize(&home.0).unwrap();
+        let prefix: String = physical
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let dir = projects.join(format!("{prefix}-----"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("s.jsonl"), "{\"leafUuid\":\"l\"}\n").unwrap();
+        assert!(claude_session_resumable(&projects, &workspace, "s"));
+    }
+
+    #[test]
+    fn codex_resume_needs_a_rollout_with_session_meta() {
+        let home = Fixture::new();
+        let workspace = home.0.clone();
+        let session = "01a0fa7c-d795-72e1-a07d-4cea8e87567d";
+        let resumable =
+            || provider_session_resumable(ProviderId::Codex, Some(&home.0), &workspace, session);
+        assert!(!resumable());
+        let dir = home.0.join(".codex/sessions/2026/10/02");
+        fs::create_dir_all(&dir).unwrap();
+        let rollout = dir.join(format!("rollout-2026-10-02T11-41-20-{session}.jsonl"));
+        fs::write(&rollout, "").unwrap();
+        assert!(!resumable());
+        fs::write(
+            &rollout,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"01a0fa7c\"}}\n",
+        )
+        .unwrap();
+        assert!(resumable());
+        assert!(provider_session_resumable(
+            ProviderId::OpenCode,
+            Some(&home.0),
+            &workspace,
+            "anything"
+        ));
     }
 
     #[tokio::test]

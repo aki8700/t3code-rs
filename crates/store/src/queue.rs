@@ -21,6 +21,8 @@ pub struct QueuedRun {
     pub id: Uuid,
     pub prompt: String,
     pub input: QueuedRunInput,
+    /// Session to resume when a server restart interrupted this run and put it back in the queue.
+    pub restart_session: Option<String>,
 }
 
 impl SqliteStore {
@@ -81,8 +83,9 @@ impl SqliteStore {
         self.with_reader(move |connection| {
             connection
                 .query_row(
-                    "SELECT runs.id, runs.prompt, inputs.input_json FROM runs
-             JOIN queued_run_inputs AS inputs ON inputs.run_id = runs.id
+                    "SELECT runs.id, runs.prompt, inputs.input_json,
+                CASE WHEN runs.restart_resumes > 0 THEN runs.provider_session_id END
+             FROM runs JOIN queued_run_inputs AS inputs ON inputs.run_id = runs.id
              WHERE runs.thread_id = ?1 AND runs.status = ?2 ORDER BY runs.ordinal LIMIT 1",
                     params![thread_id.to_string(), encode(&RunStatus::Queued)?],
                     |row| {
@@ -90,6 +93,7 @@ impl SqliteStore {
                             id: parse(row, 0)?,
                             prompt: row.get(1)?,
                             input: decode(row, 2)?,
+                            restart_session: row.get(3)?,
                         })
                     },
                 )
@@ -227,7 +231,8 @@ impl SqliteStore {
             let now = timestamp(Utc::now());
             let run = tx
                 .query_row(
-                    "UPDATE runs SET status = ?2, provider_session_id = ?3, started_at = ?4
+                    "UPDATE runs SET status = ?2, provider_session_id = ?3,
+                    started_at = CASE WHEN restart_resumes > 0 THEN started_at ELSE ?4 END
                  WHERE id = ?1 AND status = ?5
                  RETURNING id, thread_id, ordinal, provider, model, effort, status, prompt,
                     provider_session_id, input_tokens, output_tokens, cache_read_tokens,
@@ -255,11 +260,7 @@ impl SqliteStore {
                 ],
             )
             .map_err(storage_error)?;
-            tx.execute(
-                "DELETE FROM queued_run_inputs WHERE run_id = ?1",
-                [id.to_string()],
-            )
-            .map_err(storage_error)?;
+            // The inputs stay until the run finishes so a restart can queue the run again.
             tx.commit().map_err(storage_error)?;
             Ok(run)
         })
@@ -368,6 +369,174 @@ mod tests {
         assert!(store.cancel_queued_run(thread_id, run.id).await.unwrap());
         assert!(store.list_queued_runs(thread_id).await.unwrap().is_empty());
         assert!(!store.cancel_queued_run(thread_id, run.id).await.unwrap());
+    }
+
+    fn mock_selection() -> ModelSelection {
+        ModelSelection {
+            provider: ProviderId::Mock,
+            model: "mock".into(),
+            ..ModelSelection::default()
+        }
+    }
+
+    /// Queues and starts a run as the coordinator does, optionally recording the session the
+    /// provider reported for it.
+    async fn running_run(store: &SqliteStore, thread_id: Uuid, session: Option<&str>) -> Uuid {
+        let run = queued_run(thread_id);
+        let item = NewTurnItem {
+            thread_id,
+            run_id: run.id,
+            kind: t3_core::TurnItemKind::UserMessage,
+            summary: None,
+            payload: serde_json::json!({"text": "queued"}),
+            searchable_text: None,
+        };
+        let (run, _) = store
+            .enqueue_run(
+                run,
+                item,
+                QueuedRunInput {
+                    model_selection: mock_selection(),
+                    attachment_ids: Vec::new(),
+                    notify_parent: true,
+                    wake_depth: 2,
+                    mode_ceiling: Some((RuntimeMode::ApprovalRequired, InteractionMode::Plan)),
+                    verify_fix_depth: 0,
+                    last_verify_signature: None,
+                    fallback_attempts: 0,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .start_queued_run(run.id, mock_selection(), None)
+            .await
+            .unwrap();
+        if let Some(session) = session {
+            store
+                .update_thread_session_id(thread_id, session.into())
+                .await
+                .unwrap();
+        }
+        run.id
+    }
+
+    async fn run_status(store: &SqliteStore, thread_id: Uuid) -> (RunStatus, Option<String>) {
+        let run = store.list_runs(thread_id).await.unwrap().remove(0);
+        (run.status, run.error_message)
+    }
+
+    #[tokio::test]
+    async fn restart_queues_a_run_with_a_session_once_with_its_inputs() {
+        let (store, thread_id) = fixture().await;
+        let run_id = running_run(&store, thread_id, Some("session-1")).await;
+
+        let recovered = store.recover_interrupted_runs().unwrap();
+        assert_eq!(recovered.resumed, vec![run_id]);
+        assert!(recovered.cancelled.is_empty());
+        assert_eq!(
+            store.get_thread(thread_id).await.unwrap().status,
+            ThreadStatus::Interrupted
+        );
+        let queued = store.next_queued_run(thread_id).await.unwrap().unwrap();
+        assert_eq!(queued.id, run_id);
+        assert_eq!(queued.restart_session.as_deref(), Some("session-1"));
+        assert!(queued.input.notify_parent);
+        assert_eq!(queued.input.wake_depth, 2);
+        assert_eq!(
+            queued.input.mode_ceiling,
+            Some((RuntimeMode::ApprovalRequired, InteractionMode::Plan))
+        );
+
+        // The resumed run is interrupted again: the second restart cancels it.
+        let started = store
+            .list_runs(thread_id)
+            .await
+            .unwrap()
+            .remove(0)
+            .started_at;
+        let resumed = store
+            .start_queued_run(run_id, mock_selection(), Some("session-1".into()))
+            .await
+            .unwrap();
+        assert_eq!(resumed.started_at, started);
+        let recovered = store.recover_interrupted_runs().unwrap();
+        assert!(recovered.resumed.is_empty());
+        assert_eq!(recovered.cancelled, vec![run_id]);
+        assert_eq!(
+            run_status(&store, thread_id).await,
+            (RunStatus::Cancelled, Some(INTERRUPTED_BY_RESTART.into()))
+        );
+        assert!(store.next_queued_run(thread_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_cancels_runs_without_a_session_or_inputs() {
+        let (store, thread_id) = fixture().await;
+        let run_id = running_run(&store, thread_id, None).await;
+        assert_eq!(
+            store.recover_interrupted_runs().unwrap().cancelled,
+            vec![run_id]
+        );
+        assert_eq!(
+            run_status(&store, thread_id).await,
+            (RunStatus::Cancelled, Some(INTERRUPTED_BY_RESTART.into()))
+        );
+
+        let (store, thread_id) = fixture().await;
+        let run_id = running_run(&store, thread_id, Some("session-1")).await;
+        store
+            .with_writer(move |connection| {
+                connection
+                    .execute(
+                        "DELETE FROM queued_run_inputs WHERE run_id = ?1",
+                        [run_id.to_string()],
+                    )
+                    .map_err(storage_error)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.recover_interrupted_runs().unwrap().cancelled,
+            vec![run_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_keeps_runs_that_ended_rate_limited() {
+        let (store, thread_id) = fixture().await;
+        let run_id = running_run(&store, thread_id, Some("session-1")).await;
+        store
+            .finish_run(
+                run_id,
+                RunStatus::RateLimited,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1,
+                Some("usage limit".into()),
+            )
+            .await
+            .unwrap();
+        store
+            .update_thread_status(thread_id, ThreadStatus::RateLimited)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.recover_interrupted_runs().unwrap(),
+            RecoveredRuns::default()
+        );
+        assert_eq!(
+            run_status(&store, thread_id).await,
+            (RunStatus::RateLimited, Some("usage limit".into()))
+        );
+        assert_eq!(
+            store.get_thread(thread_id).await.unwrap().status,
+            ThreadStatus::RateLimited
+        );
     }
 
     #[tokio::test]

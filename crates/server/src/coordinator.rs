@@ -17,7 +17,7 @@ use t3_providers::{
     FailureClass, ProviderRegistry, classify_harness_failure, classify_provider_failure,
     classify_rate_limit, format_delegated_error, format_run_error, run_turn_with_retry,
 };
-use t3_store::{QueuedRun, QueuedRunInput, SqliteStore};
+use t3_store::{INTERRUPTED_BY_RESTART, QueuedRun, QueuedRunInput, SqliteStore};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use uuid::Uuid;
 
@@ -35,6 +35,8 @@ pub(crate) struct Coordinator {
     pub(crate) latest_context: Mutex<HashMap<Uuid, LiveContextUsage>>,
     pub(crate) live_streams: Mutex<HashMap<Uuid, LiveStreamSnapshot>>,
     shutting_down: AtomicBool,
+    /// Home directory holding the provider CLIs' session files.
+    session_home: std::sync::RwLock<Option<std::path::PathBuf>>,
     injection: McpInjectionSpec,
     tokens: McpTokens,
     limits: Arc<crate::limits::UsageLimitsCache>,
@@ -180,7 +182,32 @@ impl RunCoordinator {
             latest_context: Mutex::new(HashMap::new()),
             live_streams: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
+            session_home: std::sync::RwLock::new(std::env::home_dir()),
         }))
+    }
+
+    /// Points the pre-resume session check at another home directory.
+    pub fn set_session_home(&self, home: Option<std::path::PathBuf>) {
+        *self
+            .0
+            .session_home
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = home;
+    }
+
+    async fn session_resumable(
+        &self,
+        provider: ProviderId,
+        workspace: &std::path::Path,
+        session_id: &str,
+    ) -> bool {
+        let home = self
+            .0
+            .session_home
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        crate::resume::session_resumable(provider, home, workspace, session_id).await
     }
 
     pub async fn live_context(&self, thread_id: Uuid) -> Option<LiveContextUsage> {
@@ -654,7 +681,8 @@ impl RunCoordinator {
         while let Some(queued) = store.next_queued_run(thread.id).await? {
             let run_id = queued.id;
             match self.start(active, thread.clone(), queued).await {
-                Ok(started) => return Ok(Some(started)),
+                Ok(Some(started)) => return Ok(Some(started)),
+                Ok(None) => {}
                 Err(error) => {
                     let message =
                         format_run_error(FailureClass::HarnessError, &error.to_string(), None);
@@ -701,7 +729,7 @@ impl RunCoordinator {
         active: &mut HashMap<Uuid, ActiveRun>,
         mut thread: Thread,
         queued: QueuedRun,
-    ) -> CoreResult<(RunTicket, RunningTurn)> {
+    ) -> CoreResult<Option<(RunTicket, RunningTurn)>> {
         self.ensure_accepting_runs()?;
         if thread.archived {
             return Err(CoreError::InvalidArgument("thread is archived".into()));
@@ -716,16 +744,46 @@ impl RunCoordinator {
         let run_id = queued.id;
         let selection = queued.input.model_selection;
         let driver = self.driver(&selection)?;
+        let workspace_dir = self.workspace(&thread).await?;
+        let restarted = queued.restart_session.is_some();
         let previous_run = store.previous_run(thread.id, run_id).await?;
-        let resume_session_id = previous_run
-            .as_ref()
-            .filter(|run| run.provider == selection.provider && run.model == selection.model)
-            .and_then(|run| run.provider_session_id.clone());
+        let resume_session_id = if let Some(session) = queued.restart_session {
+            crate::resume::stop_orphaned_processes(thread.id).await;
+            if !self
+                .session_resumable(selection.provider, &workspace_dir, &session)
+                .await
+            {
+                tracing::warn!(%run_id, %session, "Cancelling a run interrupted by restart: its provider session cannot be resumed");
+                self.cancel_unresumable(thread.id, run_id).await?;
+                return Ok(None);
+            }
+            Some(session)
+        } else {
+            match previous_run
+                .as_ref()
+                .filter(|run| run.provider == selection.provider && run.model == selection.model)
+                .and_then(|run| run.provider_session_id.clone())
+            {
+                Some(session)
+                    if !self
+                        .session_resumable(selection.provider, &workspace_dir, &session)
+                        .await =>
+                {
+                    tracing::warn!(%run_id, %session, "Provider session cannot be resumed; starting a new session");
+                    None
+                }
+                session => session,
+            }
+        };
         let project = store.get_project(thread.project_id).await?;
         let original_prompt = queued.prompt.clone();
+        let request_prompt = if restarted {
+            crate::resume::RESTART_PROMPT.to_owned()
+        } else {
+            queued.prompt
+        };
         let claude_slash = selection.provider == ProviderId::Claude
-            && queued
-                .prompt
+            && request_prompt
                 .split_whitespace()
                 .next()
                 .is_some_and(|command| {
@@ -737,7 +795,9 @@ impl RunCoordinator {
                                     .all(|c| c.is_ascii_alphanumeric() || c == b'-')
                         })
                 });
-        let handoff = if previous_run.is_some() && resume_session_id.is_none() {
+        let handoff = if restarted {
+            None
+        } else if previous_run.is_some() && resume_session_id.is_none() {
             let handoff = self.handoff_summary(&thread).await?;
             Some(format!("Context from the previous run:\n{handoff}"))
         } else if previous_run.is_none()
@@ -757,9 +817,9 @@ impl RunCoordinator {
         let mut prompt = if claude_slash {
             handoff.unwrap_or_default()
         } else if let Some(handoff) = handoff {
-            format!("{handoff}\n\nCurrent request:\n{}", queued.prompt)
+            format!("{handoff}\n\nCurrent request:\n{request_prompt}")
         } else {
-            queued.prompt
+            request_prompt.clone()
         };
         if resume_session_id.is_none()
             && let Some(instructions) = project
@@ -770,9 +830,13 @@ impl RunCoordinator {
         {
             prompt = format!("Project instructions:\n{instructions}\n\n{prompt}");
         }
-        let workspace_dir = self.workspace(&thread).await?;
         let attachment_ids = queued.input.attachment_ids.clone();
-        let attachments = self.attachments(thread.id, &attachment_ids).await?;
+        // The interrupted turn already delivered its attachments to the session.
+        let attachments = if restarted {
+            Vec::new()
+        } else {
+            self.attachments(thread.id, &attachment_ids).await?
+        };
         let swarm = self
             .get_board(thread.id)
             .await?
@@ -799,7 +863,7 @@ impl RunCoordinator {
             (None, None)
         };
         let (prompt, claude_slash_context) = if claude_slash {
-            (original_prompt.clone(), Some(prompt.trim().to_owned()))
+            (request_prompt, Some(prompt.trim().to_owned()))
         } else {
             (prompt, None)
         };
@@ -816,10 +880,12 @@ impl RunCoordinator {
             attachments,
             mcp_injection,
         };
-        let run_started_at = Utc::now();
         let run = store
             .start_queued_run(run_id, selection.clone(), resume_session_id)
             .await?;
+        // A resumed run keeps its original start, so posts made before the restart still count
+        // for the swarm's silent-exit check.
+        let run_started_at = run.started_at;
         let (cancel, cancellation) = watch::channel(false);
         let (done, completion) = watch::channel(false);
         active.insert(
@@ -850,6 +916,25 @@ impl RunCoordinator {
         {
             tracing::error!(%error, %run_id, "Could not persist swarm member state");
         }
+        if restarted {
+            let notice = "ハーネスの再起動で中断されたため、同じセッションで再開します";
+            if let Err(error) = self
+                .append(NewTurnItem {
+                    thread_id: thread.id,
+                    run_id,
+                    kind: TurnItemKind::SystemNotice,
+                    summary: Some(notice.into()),
+                    payload: json!({
+                        "message": notice,
+                        "prompt": crate::resume::RESTART_PROMPT,
+                    }),
+                    searchable_text: None,
+                })
+                .await
+            {
+                tracing::error!(%error, %run_id, "Could not record the restart resume notice");
+            }
+        }
         let ticket = RunTicket {
             id: run_id,
             done: completion,
@@ -875,7 +960,34 @@ impl RunCoordinator {
             workspace_dir,
             verify_command: project.verify_command,
         };
-        Ok((ticket, turn))
+        Ok(Some((ticket, turn)))
+    }
+
+    /// Cancels a run that a restart queued again when its provider session turns out unusable.
+    async fn cancel_unresumable(&self, thread_id: Uuid, run_id: Uuid) -> CoreResult<()> {
+        let error = format!("{INTERRUPTED_BY_RESTART} (the provider session could not be resumed)");
+        self.0
+            .store
+            .finish_run(
+                run_id,
+                RunStatus::Cancelled,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                Some(error.clone()),
+            )
+            .await?;
+        self.emit(WsServerMessage::RunStatusChanged {
+            thread_id,
+            run_id,
+            status: RunStatus::Cancelled,
+            error: Some(error),
+        });
+        Ok(())
     }
 
     fn spawn(&self, turn: RunningTurn) {

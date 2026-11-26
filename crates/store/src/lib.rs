@@ -23,10 +23,21 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use t3_core::{
     Attachment, ContextHandoff, CoreError, CoreResult, DbStats, InteractionMode, ModelSelection,
-    NewTurnItem, OrchModelStat, Project, Run, RunStatus, RuntimeMode, SearchHit, StorageConfig,
-    Store, Thread, ThreadStatus, TurnItem,
+    NewTurnItem, OrchModelStat, Project, ProviderId, Run, RunStatus, RuntimeMode, SearchHit,
+    StorageConfig, Store, Thread, ThreadStatus, TurnItem,
 };
 use uuid::Uuid;
+
+/// Error message of a run that a server restart cancelled.
+pub const INTERRUPTED_BY_RESTART: &str = "Interrupted by server restart";
+
+/// The runs `SqliteStore::recover_interrupted_runs` found in flight.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RecoveredRuns {
+    /// Runs put back in the queue to resume their provider session.
+    pub resumed: Vec<Uuid>,
+    pub cancelled: Vec<Uuid>,
+}
 
 const PREVIEW_BYTES: usize = 64 * 1024;
 const READER_COUNT: usize = 4;
@@ -335,25 +346,94 @@ impl SqliteStore {
     }
 
     /// Reconcile runs left in flight when the previous server stopped.
-    pub fn recover_interrupted_runs(&self) -> CoreResult<()> {
+    ///
+    /// An in-flight run goes back to the queue, at most once, when its thread still holds the
+    /// provider session of that run and its queued inputs survive; the coordinator then resumes
+    /// that session. Every other in-flight run is cancelled. Runs that already ended, including
+    /// those that ended rate limited, keep their status.
+    pub fn recover_interrupted_runs(&self) -> CoreResult<RecoveredRuns> {
         let mut connection = lock_connection(&self.connections.writer)?;
         let transaction = connection.transaction().map_err(storage_error)?;
         let now = timestamp(Utc::now());
-        transaction.execute(
-            "UPDATE runs SET status = ?1, completed_at = ?2, error_message = ?3 WHERE status IN (?4, ?5)",
+        let in_flight = query_all(
+            &transaction,
+            "SELECT runs.id, runs.thread_id, runs.provider, runs.model, runs.restart_resumes,
+                EXISTS (SELECT 1 FROM queued_run_inputs WHERE run_id = runs.id),
+                threads.provider_session_id, threads.model_selection, threads.archived
+             FROM runs JOIN threads ON threads.id = runs.thread_id
+             WHERE runs.status IN (?1, ?2) AND runs.completed_at IS NULL",
             params![
-                encode(&RunStatus::Cancelled)?, now, "Interrupted by server restart",
-                encode(&RunStatus::Running)?, encode(&RunStatus::RateLimited)?,
+                encode(&RunStatus::Running)?,
+                encode(&RunStatus::RateLimited)?
             ],
-        ).map_err(storage_error)?;
+            |row| {
+                let provider: ProviderId = decode(row, 2)?;
+                let model: String = row.get(3)?;
+                let selection: ModelSelection = decode(row, 7)?;
+                let session: Option<String> = row.get(6)?;
+                let resumable = row.get::<_, i64>(4)? == 0
+                    && row.get::<_, bool>(5)?
+                    && !row.get::<_, bool>(8)?
+                    && selection.provider == provider
+                    && selection.model == model;
+                Ok((
+                    parse::<Uuid>(row, 0)?,
+                    parse::<Uuid>(row, 1)?,
+                    session.filter(|_| resumable),
+                ))
+            },
+        )?;
+        let mut recovered = RecoveredRuns::default();
+        for (run_id, thread_id, session) in in_flight {
+            if let Some(session) = session {
+                transaction
+                    .execute(
+                        "UPDATE runs SET status = ?2, provider_session_id = ?3,
+                            restart_resumes = restart_resumes + 1, completed_at = NULL,
+                            error_message = NULL WHERE id = ?1",
+                        params![run_id.to_string(), encode(&RunStatus::Queued)?, session],
+                    )
+                    .map_err(storage_error)?;
+                recovered.resumed.push(run_id);
+            } else {
+                transaction
+                    .execute(
+                        "UPDATE runs SET status = ?2, completed_at = ?3, error_message = ?4
+                         WHERE id = ?1",
+                        params![
+                            run_id.to_string(),
+                            encode(&RunStatus::Cancelled)?,
+                            now,
+                            INTERRUPTED_BY_RESTART
+                        ],
+                    )
+                    .map_err(storage_error)?;
+                transaction
+                    .execute(
+                        "DELETE FROM queued_run_inputs WHERE run_id = ?1",
+                        [run_id.to_string()],
+                    )
+                    .map_err(storage_error)?;
+                recovered.cancelled.push(run_id);
+            }
+            transaction
+                .execute(
+                    "UPDATE threads SET status = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![
+                        thread_id.to_string(),
+                        encode(&ThreadStatus::Interrupted)?,
+                        now
+                    ],
+                )
+                .map_err(storage_error)?;
+        }
         transaction
             .execute(
-                "UPDATE threads SET status = ?1, updated_at = ?2 WHERE status IN (?3, ?4)",
+                "UPDATE threads SET status = ?1, updated_at = ?2 WHERE status = ?3",
                 params![
                     encode(&ThreadStatus::Interrupted)?,
                     now,
                     encode(&ThreadStatus::Running)?,
-                    encode(&ThreadStatus::RateLimited)?,
                 ],
             )
             .map_err(storage_error)?;
@@ -361,7 +441,15 @@ impl SqliteStore {
             "UPDATE swarm_members SET state = 'waiting' WHERE role = 'worker' AND state = 'working'",
             [],
         ).map_err(storage_error)?;
-        transaction.commit().map_err(storage_error)
+        transaction.commit().map_err(storage_error)?;
+        if !recovered.resumed.is_empty() || !recovered.cancelled.is_empty() {
+            tracing::info!(
+                resumed = recovered.resumed.len(),
+                cancelled = recovered.cancelled.len(),
+                "Recovered runs interrupted by server restart"
+            );
+        }
+        Ok(recovered)
     }
 
     fn initialize(
