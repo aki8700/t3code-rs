@@ -162,20 +162,21 @@ impl SqliteStore {
         .await
     }
 
+    /// Records the workspace tree from before the run and returns the run's baseline. The first
+    /// save wins: a run resumed after a restart already holds the interrupted turn's edits, so
+    /// its new snapshot must not replace the tree that verify and rollback compare against.
     pub async fn save_run_checkpoint(
         &self,
         run_id: Uuid,
         thread_id: Uuid,
         pre_tree: String,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<String> {
         self.with_writer(move |connection| {
             connection
                 .execute(
                     "INSERT INTO run_checkpoints (run_id, thread_id, pre_tree, created_at)
                  VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(run_id) DO UPDATE SET
-                    thread_id = excluded.thread_id, pre_tree = excluded.pre_tree,
-                    created_at = excluded.created_at",
+                 ON CONFLICT(run_id) DO NOTHING",
                     params![
                         run_id.to_string(),
                         thread_id.to_string(),
@@ -184,7 +185,13 @@ impl SqliteStore {
                     ],
                 )
                 .map_err(storage_error)?;
-            Ok(())
+            connection
+                .query_row(
+                    "SELECT pre_tree FROM run_checkpoints WHERE run_id = ?1",
+                    [run_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(storage_error)
         })
         .await
     }
@@ -573,6 +580,7 @@ mod tests {
                 .as_deref(),
             Some("tree-one")
         );
+        // A run resumed after a restart saves again; the pre-run baseline must survive.
         store
             .save_run_checkpoint(run.id, thread_id, "tree-two".into())
             .await
@@ -583,7 +591,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("tree-two")
+            Some("tree-one")
         );
         assert_eq!(
             store.list_run_checkpoints(thread_id).await.unwrap(),

@@ -20,7 +20,7 @@ pub(crate) fn normalize_verify_output(text: &str) -> String {
         for token in trimmed.split_whitespace() {
             normalized_tokens.push(normalize_token(token));
         }
-        lines.push(normalized_tokens.join(" "));
+        lines.push(strip_rust_thread_id(normalized_tokens.join(" ")));
     }
     while lines.last().is_some_and(String::is_empty) {
         lines.pop();
@@ -28,8 +28,22 @@ pub(crate) fn normalize_verify_output(text: &str) -> String {
     lines.join("\n")
 }
 
+/// Removes the per-process id from `thread 'name' (1234) panicked at ...`.
+fn strip_rust_thread_id(mut line: String) -> String {
+    if line.starts_with("thread '")
+        && let Some(close) = line.find(") panicked at")
+        && let Some(open) = line[..close].rfind(" (")
+        && open + 2 < close
+        && line[open + 2..close].bytes().all(|b| b.is_ascii_digit())
+    {
+        line.replace_range(open..=close, "");
+    }
+    line
+}
+
 fn normalize_token(token: &str) -> String {
-    let stripped = token.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | ',' | ';' | '.'));
+    let stripped =
+        token.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | ',' | ';' | '.'));
     if is_iso_timestamp(stripped) {
         return "<TS>".to_owned();
     }
@@ -92,13 +106,21 @@ fn is_hex_pointer(s: &str) -> bool {
 
 /// Computes a deterministic signature of the failure outcome itself (excluding `post_tree`)
 /// so editing files and hitting the exact same error still triggers a same-result-twice exit.
+///
+/// Parallel test runners report in completion order, so the signature ignores line order, and
+/// it skips passing-test lines because the tail cut keeps a different subset of them each run.
 pub(crate) fn outcome_signature(
     exit_code: Option<i32>,
     timed_out: bool,
     redacted_tail: &str,
 ) -> String {
     let normalized = normalize_verify_output(redacted_tail);
-    let input = format!("{exit_code:?}|{timed_out}|{normalized}");
+    let mut lines: Vec<&str> = normalized
+        .lines()
+        .filter(|line| !line.ends_with(" ... ok"))
+        .collect();
+    lines.sort_unstable();
+    let input = format!("{exit_code:?}|{timed_out}|{}", lines.join("\n"));
     blake3::hash(input.as_bytes()).to_hex().to_string()
 }
 
@@ -151,7 +173,9 @@ fn pick_headline(text: &str) -> Option<String> {
             || lower.starts_with("fail ")
             || lower.contains("exception:")
     });
-    let chosen = priority.copied().unwrap_or_else(|| *non_empty.last().unwrap());
+    let chosen = priority
+        .copied()
+        .unwrap_or_else(|| *non_empty.last().unwrap());
     Some(chosen.to_owned())
 }
 
@@ -206,7 +230,8 @@ EXPECTED  exit_code=0, timed_out=false\n\
 SAW       exit_code={exit_code:?}, timed_out={timed_out} — {summary}\n"
     );
     if !dead_ends.is_empty() {
-        prompt.push_str("\nDEAD ENDS (previous failed outcomes — try a genuinely different fix):\n");
+        prompt
+            .push_str("\nDEAD ENDS (previous failed outcomes — try a genuinely different fix):\n");
         for entry in dead_ends {
             prompt.push_str(&format!("- attempt {}: {}\n", entry.attempt, entry.summary));
         }
@@ -232,6 +257,37 @@ mod tests {
         assert_ne!(
             outcome_signature(Some(101), false, a),
             outcome_signature(Some(1), false, a)
+        );
+    }
+
+    /// libtest output as printed by rustc 1.100: the panicking thread's id changes on every
+    /// run, and parallel tests finish in any order.
+    #[test]
+    fn outcome_signature_ignores_rust_thread_ids_and_test_completion_order() {
+        let a = "running 3 tests\n\
+                 test one ... ok\n\
+                 test boom ... FAILED\n\
+                 test two ... ok\n\
+                 test bang ... FAILED\n\
+                 thread 'boom' (28490) panicked at src/lib.rs:1:18:\nboom\n";
+        let b = "running 3 tests\n\
+                 test bang ... FAILED\n\
+                 test two ... ok\n\
+                 test boom ... FAILED\n\
+                 thread 'boom' (28497) panicked at src/lib.rs:1:18:\nboom\n";
+        assert_eq!(
+            outcome_signature(Some(101), false, a),
+            outcome_signature(Some(101), false, b)
+        );
+        let moved = b.replace("src/lib.rs:1:18", "src/lib.rs:9:18");
+        assert_ne!(
+            outcome_signature(Some(101), false, a),
+            outcome_signature(Some(101), false, &moved)
+        );
+        let other_failure = b.replace("test bang ... FAILED", "test other ... FAILED");
+        assert_ne!(
+            outcome_signature(Some(101), false, a),
+            outcome_signature(Some(101), false, &other_failure)
         );
     }
 

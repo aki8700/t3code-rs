@@ -1114,6 +1114,96 @@ fn restart_resumes_an_interrupted_run_with_its_session() {
     });
 }
 
+/// Edits made before the crash must still be verified and rolled back by the resumed run,
+/// even when the resumed turn changes nothing further.
+#[cfg(unix)]
+#[test]
+fn resumed_run_verifies_and_rolls_back_edits_made_before_the_restart() {
+    let tmp = TempDir::new();
+    let workspace = tmp.0.join("repo");
+    std::fs::create_dir(&workspace).unwrap();
+    git(&workspace, &["init", "-q"]);
+    std::fs::write(workspace.join("a.txt"), "before\n").unwrap();
+
+    let crashed = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (thread_id, run_id) = crashed.block_on(async {
+        let state = tmp.state(AuthConfig::LocalOnly);
+        let mut events = state.coordinator.subscribe();
+        let app = router(state);
+        let id = create_parent(&app, &workspace).await;
+        let detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
+        let project = detail["thread"]["project_id"].as_str().unwrap();
+        json_req(
+            &app,
+            Method::PATCH,
+            &format!("/api/projects/{project}"),
+            Some(json!({"verify_command": "grep -q before a.txt"})),
+        )
+        .await;
+        let run = json_req(
+            &app,
+            Method::POST,
+            &format!("/api/threads/{id}/messages"),
+            Some(json!({"prompt": "[slow] edit a.txt"})),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                events.recv().await.unwrap(),
+                WsServerMessage::Delta { thread_id, .. } if thread_id == id
+            ) {}
+        })
+        .await
+        .unwrap();
+        let run_id: Uuid = run["run_id"].as_str().unwrap().parse().unwrap();
+        (id, run_id)
+    });
+    crashed.shutdown_background();
+    // The interrupted turn's edit.
+    std::fs::write(workspace.join("a.txt"), "broken\n").unwrap();
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let state = tmp.state(AuthConfig::LocalOnly);
+        let coordinator = state.coordinator.clone();
+        let mut events = coordinator.subscribe();
+        let app = router(state);
+        coordinator.resume_queued_runs().await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let WsServerMessage::RunStatusChanged {
+                    run_id: id, status, ..
+                } = events.recv().await.unwrap()
+                    && id == run_id
+                    && status != RunStatus::Queued
+                {
+                    break status;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let path = format!("/api/threads/{thread_id}");
+        let detail = json_req(&app, Method::GET, &path, None).await;
+        assert!(
+            detail["items"].as_array().unwrap().iter().any(|item| {
+                item["run_id"] == run_id.to_string() && item["payload"]["source"] == "verify_hook"
+            }),
+            "the resumed run ({status:?}) skipped verify_command"
+        );
+        // Let the auto-fix follow-up end so it cannot touch the workspace during rollback.
+        wait_for_thread(&mut events, thread_id, ThreadStatus::Failed).await;
+        coordinator.rollback_run(thread_id, run_id).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
+            "before\n"
+        );
+    });
+}
+
 #[tokio::test]
 async fn queue_and_delegated_cancellation() {
     let tmp = TempDir::new();

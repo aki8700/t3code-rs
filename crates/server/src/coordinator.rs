@@ -1122,17 +1122,18 @@ impl RunCoordinator {
         // so slow git subprocesses never block unrelated threads.
         let pre_tree = if thread.interaction_mode != InteractionMode::Plan {
             match GitManager::snapshot_tree(&workspace_dir).await {
-                Ok(Some(tree)) => {
-                    if let Err(error) = self
-                        .0
-                        .store
-                        .save_run_checkpoint(run_id, thread_id, tree.clone())
-                        .await
-                    {
+                Ok(Some(tree)) => match self
+                    .0
+                    .store
+                    .save_run_checkpoint(run_id, thread_id, tree.clone())
+                    .await
+                {
+                    Ok(baseline) => Some(baseline),
+                    Err(error) => {
                         tracing::debug!(%error, %run_id, "Could not save pre-run git checkpoint");
+                        Some(tree)
                     }
-                    Some(tree)
-                }
+                },
                 Ok(None) => None,
                 Err(error) => {
                     tracing::debug!(%error, %run_id, "Could not snapshot workspace before run");
