@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+ignore.workspace = true
 serde.workspace = true
 t3-core.workspace = true
 thiserror.workspace = true
