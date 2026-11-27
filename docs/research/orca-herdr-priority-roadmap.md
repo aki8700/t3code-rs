@@ -97,3 +97,21 @@
    - WS 3 レーン＋`seq` 再同期（P0-1/G-2）、`web/app.js` 末尾局所描画＆分割（P1-2/G-6）、`coordinator.rs` の `active` ロック縮小（G-1）。
 4. **Wave 4（耐障害性と最適化仕上げ：T-4 + T-6 + P2-1/G-7 + G-5 テスト）**:
    - `t3-maki` ハッシュキャッシュ＋handoff 項目別キャップ（T-4）、プレフィックス不変テスト（T-6）、`await_gate` 起動同期（P2-1/G-7）、`gemini_app.rs` 単体テスト（G-5）。
+
+---
+
+## 5. 実装反映・第 2 弾ハーネス改善ログ（2026-11-27 完了）
+
+- **Waves 1〜4 反映済み（Gemini Mac アプリ + Muse アプリ）**:
+  - **T-1**（再開時 Swarm 定型文省略）、**T-2 / G-4**（役割別 MCP ツール絞り込み 22→8 ツール＋`Plan`/`Worker` 時 `swiftcua` 遮断）、**T-3**（`compaction_econ` 連動 `should_auto_compact`）、**T-4**（`t3-maki` コンテンツハッシュキャッシュ＋`cap_section_utf8`）、**T-5 / G-8**（`TurnBudgetWatchdog`＋初期無反応 60 秒打ち切り）、**T-6**（プレフィックス不変＋再開決定性テスト）、**T-7**（`orchestrator_capabilities` 推奨ルーティング）。
+  - **G-3**（`WakeDeliveries` SQLite 永続化＋`sender_run_id` 無報告終了判定）、**G-5**（`gemini_app.rs` `code-widget-*` 抽出修正＋単体テスト 4 件）、**G-7**（`resume.rs` 50ms 高速 SIGTERM ポーリング）。
+  - **P0-1 / G-2**（WS 3 レーン優先度キュー `ClientLaneQueue`＋`seq` エンベロープ）、**P0-2 / P1-2 / P1-3 / G-6**（Muse 実装：`web/js/ui-guards.js` 世代フェンス・rAF 末尾局所描画・通知ゲート＋`node --test` 17 件）、**P0-3**（`RepoCoalescer` を `GitManager::diff_summary` へ接続）、**P1-1**（クラッシュループブレーキ `record_failure` / `record_success`）。
+- **第 2 弾トークン＆ハーネス改善（`harness-metrics.py` 1,125 ラン実測ベース：`swarm:worker` 50.7% 浪費対策）**:
+  - **R2-1**: `TurnBudgetWatchdog::for_profile(McpToolProfile)` によりワーカー専用タイト予算（soft 25 / hard 50 tools、soft 2.5M / hard 5M tokens）を自動適用。
+  - **R2-2**: ワーカー初回規約に `code_index` / `code_slice` / `code_grep` 優先を明記。
+  - **R2-3**: `handoff_summary` へセクション別（2.5KB）・全体（8KB）UTF-8 キャップ（`[truncated]`）を適用。
+  - **R2-4**: `Cancelled` / `RateLimited` / `Failed` 終了時に直近の部分進捗（400 文字・`@` 無害化・4096B 上限）を `@coordinator` へサルベージ通知。
+- **保留／進行中**:
+  - **Muse Wave 2**（`2026-11-27-t3code-ui-wave2`：クライアント側 `seq` 欠番検知＋`web/js/thread-helpers.js` 分割）は `~/muse-handoff/tasks/` に公開済みで Muse 処理待ち。
+  - **DeepSeek**（`opencode/deepseek-v4.1-flash-free`）は上流 API が無応答タイムアウト（15 秒）だったため、該当実装は Gemini Mac アプリへフォールバック済み。
+  - **未着手（大改修枠）**: **G-1**（`coordinator.rs` `active` ロック縮小）、**P2-1**（Unix `pre_exec` `await_gate` パイプ）、**G-9**（巨大ファイル分割）。

@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use t3_core::normalize_failure_output;
-use t3_core::types::{ProviderId, TurnItemKind};
+use t3_core::types::{McpToolProfile, ProviderId, TurnItemKind};
 
 const WINDOW_BYTES: usize = 8 * 1024;
 const MIN_PERIOD: usize = 48;
@@ -18,6 +18,10 @@ const DEFAULT_SOFT_TOOL_BUDGET: usize = 40;
 const DEFAULT_HARD_TOOL_BUDGET: usize = 80;
 const DEFAULT_SOFT_TOKEN_BUDGET: u64 = 4_000_000;
 const DEFAULT_HARD_TOKEN_BUDGET: u64 = 8_000_000;
+const WORKER_SOFT_TOOL_BUDGET: usize = 25;
+const WORKER_HARD_TOOL_BUDGET: usize = 50;
+const WORKER_SOFT_TOKEN_BUDGET: u64 = 2_500_000;
+const WORKER_HARD_TOKEN_BUDGET: u64 = 5_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BudgetAction {
@@ -45,12 +49,30 @@ impl Default for TurnBudgetWatchdog {
 
 impl TurnBudgetWatchdog {
     pub(crate) fn from_env() -> Self {
-        let soft_tool_calls = env_usize("T3_SOFT_TOOL_BUDGET", DEFAULT_SOFT_TOOL_BUDGET);
-        let hard_tool_calls =
-            env_usize("T3_HARD_TOOL_BUDGET", DEFAULT_HARD_TOOL_BUDGET).max(soft_tool_calls);
-        let soft_tokens = env_u64("T3_SOFT_TOKEN_BUDGET", DEFAULT_SOFT_TOKEN_BUDGET);
-        let hard_tokens =
-            env_u64("T3_HARD_TOKEN_BUDGET", DEFAULT_HARD_TOKEN_BUDGET).max(soft_tokens);
+        Self::for_profile(McpToolProfile::Full)
+    }
+
+    pub(crate) fn for_profile(profile: McpToolProfile) -> Self {
+        let (soft_tool_calls, hard_tool_calls, soft_tokens, hard_tokens) = match profile {
+            McpToolProfile::Full => {
+                let soft_tools = env_usize("T3_SOFT_TOOL_BUDGET", DEFAULT_SOFT_TOOL_BUDGET);
+                let hard_tools =
+                    env_usize("T3_HARD_TOOL_BUDGET", DEFAULT_HARD_TOOL_BUDGET).max(soft_tools);
+                let soft_tok = env_u64("T3_SOFT_TOKEN_BUDGET", DEFAULT_SOFT_TOKEN_BUDGET);
+                let hard_tok =
+                    env_u64("T3_HARD_TOKEN_BUDGET", DEFAULT_HARD_TOKEN_BUDGET).max(soft_tok);
+                (soft_tools, hard_tools, soft_tok, hard_tok)
+            }
+            McpToolProfile::Worker => {
+                let soft_tools = env_usize("T3_WORKER_SOFT_TOOL_BUDGET", WORKER_SOFT_TOOL_BUDGET);
+                let hard_tools = env_usize("T3_WORKER_HARD_TOOL_BUDGET", WORKER_HARD_TOOL_BUDGET)
+                    .max(soft_tools);
+                let soft_tok = env_u64("T3_WORKER_SOFT_TOKEN_BUDGET", WORKER_SOFT_TOKEN_BUDGET);
+                let hard_tok =
+                    env_u64("T3_WORKER_HARD_TOKEN_BUDGET", WORKER_HARD_TOKEN_BUDGET).max(soft_tok);
+                (soft_tools, hard_tools, soft_tok, hard_tok)
+            }
+        };
         Self {
             tool_calls: 0,
             total_tokens: 0,
@@ -898,6 +920,35 @@ mod tests {
         assert_eq!(watchdog.on_usage(400, 200, 0), BudgetAction::None);
         assert!(matches!(
             watchdog.on_usage(4_000, 1_000, 0),
+            BudgetAction::Stop(_)
+        ));
+    }
+
+    #[test]
+    fn worker_profile_enforces_tighter_tool_and_token_budgets_than_full() {
+        let mut worker = TurnBudgetWatchdog::for_profile(McpToolProfile::Worker);
+        let mut full = TurnBudgetWatchdog::for_profile(McpToolProfile::Full);
+        assert_eq!(worker.soft_tool_calls, WORKER_SOFT_TOOL_BUDGET);
+        assert_eq!(worker.hard_tool_calls, WORKER_HARD_TOOL_BUDGET);
+        assert_eq!(full.soft_tool_calls, DEFAULT_SOFT_TOOL_BUDGET);
+        assert_eq!(full.hard_tool_calls, DEFAULT_HARD_TOOL_BUDGET);
+
+        for _ in 0..24 {
+            assert_eq!(worker.on_tool_call(), BudgetAction::None);
+            assert_eq!(full.on_tool_call(), BudgetAction::None);
+        }
+        assert!(matches!(worker.on_tool_call(), BudgetAction::Warn(_)));
+        assert_eq!(full.on_tool_call(), BudgetAction::None);
+
+        let mut worker_tok = TurnBudgetWatchdog::for_profile(McpToolProfile::Worker);
+        let mut full_tok = TurnBudgetWatchdog::for_profile(McpToolProfile::Full);
+        assert!(matches!(
+            worker_tok.on_usage(2_000_000, 500_000, 0),
+            BudgetAction::Warn(_)
+        ));
+        assert_eq!(full_tok.on_usage(2_000_000, 500_000, 0), BudgetAction::None);
+        assert!(matches!(
+            worker_tok.on_usage(4_000_000, 1_000_000, 0),
             BudgetAction::Stop(_)
         ));
     }

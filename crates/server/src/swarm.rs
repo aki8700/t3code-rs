@@ -18,6 +18,7 @@ const MAX_ACTIVE_WORKERS: usize = 8;
 const WAKE_BATCH: usize = 16;
 const MAX_WAKE_REDELIVERIES: u8 = 1;
 const ENDED_ERROR_CHARS: usize = 200;
+const PARTIAL_SUMMARY_MAX_CHARS: usize = 400;
 const READ_MESSAGE_MAX_CHARS: usize = 2_000;
 
 /// Board posts `(from, to]` handed to a run that has not finished yet, per member thread.
@@ -118,7 +119,7 @@ impl SwarmTurn {
         }
         let coordinator = member.role == "coordinator";
         let report = format!(
-            "Work on the assigned brief. When finished or blocked, call swarm_post_message once with text starting with @coordinator [done] followed by result:, verified: (commands run and their outcome, or not verified), blockers: and files:. Send one post within the limit of {MAX_MESSAGE_BYTES} bytes (about 1300 Japanese characters); write longer details to a file and list its path. End your turn after posting. Reply to subsequent updates only when you have new information."
+            "Work on the assigned brief. Prefer code_index, code_slice, and code_grep over reading whole large files. When finished or blocked, call swarm_post_message once with text starting with @coordinator [done] followed by result:, verified: (commands run and their outcome, or not verified), blockers: and files:. Send one post within the limit of {MAX_MESSAGE_BYTES} bytes (about 1300 Japanese characters); write longer details to a file and list its path. End your turn after posting. Reply to subsequent updates only when you have new information."
         );
         let lead = format!(
             "Coordinate work using swarm_status, swarm_add_worker, swarm_post_message, swarm_read_board and swarm_kill_worker. Run independent slices in parallel with separate worker contexts. Each brief states the objective, the output expected, boundaries (files or scope the worker owns), an effort budget and a stop condition. When a worker ends without reporting or repeats a result, change the brief or model, or stop it, instead of resending the same request. Keep passed work frozen, and escalate no-undo merges (migrations/secrets/deploy) to the human. Mentions wake the named member. After assigning work, end your turn and wait for results addressed to @coordinator. Each brief and post has a limit of {MAX_MESSAGE_BYTES} bytes (about 1300 Japanese characters); put a longer brief in a file and send its path."
@@ -854,7 +855,27 @@ impl RunCoordinator {
         {
             return Ok(());
         }
-        let text = silent_end_text(member, status, error);
+        let partial = if matches!(
+            status,
+            RunStatus::Cancelled | RunStatus::RateLimited | RunStatus::Failed
+        ) {
+            self.recent_items(thread_id, 6)
+                .await
+                .ok()
+                .and_then(|items| {
+                    items.into_iter().rev().find_map(|item| {
+                        item.summary.filter(|s| !s.trim().is_empty()).or_else(|| {
+                            item.payload
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned)
+                        })
+                    })
+                })
+        } else {
+            None
+        };
+        let text = silent_end_text_with_context(member, status, error, partial.as_deref());
         // The ended run is still registered, so a coordinator that keeps re-waking a
         // silent worker accumulates depth even though it is idle between its turns.
         let coordinator = board.coordinator_thread_id;
@@ -1228,6 +1249,46 @@ fn silent_end_text(member: &SwarmMember, status: RunStatus, error: Option<&str>)
     } else {
         format!("@coordinator [system] worker {name} ended ({status:?}) without posting")
     }
+}
+
+fn sanitize_partial_summary(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let sanitized = trimmed
+        .replace('@', "(at)")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if sanitized.is_empty() {
+        return None;
+    }
+    if sanitized.chars().count() <= PARTIAL_SUMMARY_MAX_CHARS {
+        return Some(sanitized);
+    }
+    let keep = PARTIAL_SUMMARY_MAX_CHARS.saturating_sub(3);
+    let end_byte = sanitized
+        .char_indices()
+        .nth(keep)
+        .map_or(sanitized.len(), |(idx, _)| idx);
+    Some(format!("{}...", &sanitized[..end_byte]))
+}
+
+pub(crate) fn silent_end_text_with_context(
+    member: &SwarmMember,
+    status: RunStatus,
+    error: Option<&str>,
+    partial_summary: Option<&str>,
+) -> String {
+    let base = silent_end_text(member, status, error);
+    let Some(partial) = partial_summary.and_then(sanitize_partial_summary) else {
+        return t3_maki::cap_section_utf8(&base, MAX_MESSAGE_BYTES).0;
+    };
+    let combined = format!("{base} partial: {partial}");
+    t3_maki::cap_section_utf8(&combined, MAX_MESSAGE_BYTES).0
 }
 
 fn can_dispatch(caller: &Thread, target: &Thread) -> bool {
@@ -1633,5 +1694,43 @@ mod tests {
             assert_eq!(prefix1.as_bytes(), prefix2.as_bytes());
             assert_ne!(tail1, tail2);
         }
+    }
+
+    #[test]
+    fn worker_initial_prompt_recommends_code_index_and_partial_notice_sanitizes_mentions() {
+        let coord = member("coordinator", "coordinator", "working");
+        let worker = member("worker-1", "worker", "working");
+        let board = SwarmBoardSnapshot {
+            board_id: Uuid::new_v4(),
+            coordinator_thread_id: coord.thread_id,
+            title: "r2".into(),
+            members: vec![coord, worker.clone()],
+            messages: Vec::new(),
+            head_seq: 0,
+        };
+        let mut prompt = "Inspect module".to_owned();
+        SwarmTurn::prepare(
+            &board,
+            worker.thread_id,
+            ProviderId::Codex,
+            false,
+            &mut prompt,
+        )
+        .unwrap();
+        assert!(prompt.contains("code_index"));
+        assert!(prompt.contains("code_slice"));
+
+        let noisy_partial = format!("Edited @worker-2 and @reviewer; {}", "あ".repeat(600));
+        let msg = silent_end_text_with_context(
+            &worker,
+            RunStatus::Cancelled,
+            Some("turn budget exceeded"),
+            Some(&noisy_partial),
+        );
+        assert!(msg.contains("partial: "));
+        assert!(msg.contains("(at)worker-2"));
+        assert!(!msg.contains("@worker-2"));
+        assert!(msg.len() <= MAX_MESSAGE_BYTES);
+        validate_text(&msg).unwrap();
     }
 }

@@ -574,7 +574,10 @@ impl RunCoordinator {
     pub(crate) async fn handoff_summary(&self, thread: &Thread) -> CoreResult<String> {
         let items = self.recent_items(thread.id, 100).await?;
         let runs = self.0.store.list_runs(thread.id).await?;
-        Ok(format_handoff(&thread.title, &items, &runs))
+        Ok(cap_handoff_summary(
+            &format_handoff(&thread.title, &items, &runs),
+            HANDOFF_SUMMARY_MAX_BYTES,
+        ))
     }
 
     pub(crate) async fn discard_thread(&self, thread: &Thread) {
@@ -721,6 +724,68 @@ impl RunCoordinator {
         }
         Ok(thread)
     }
+}
+
+pub(crate) const HANDOFF_SUMMARY_MAX_BYTES: usize = 8 * 1024;
+pub(crate) const HANDOFF_SECTION_MAX_BYTES: usize = 2_560;
+
+fn split_markdown_sections(summary: &str) -> Vec<&str> {
+    let mut starts = vec![0];
+    for (idx, _) in summary.match_indices("\n## ") {
+        starts.push(idx + 1);
+    }
+    let mut sections = Vec::with_capacity(starts.len());
+    for window in starts.windows(2) {
+        let part = summary[window[0]..window[1]].trim_end_matches('\n');
+        if !part.is_empty() {
+            sections.push(part);
+        }
+    }
+    if let Some(&last_start) = starts.last() {
+        let last = summary[last_start..].trim_end_matches('\n');
+        if !last.is_empty() {
+            sections.push(last);
+        }
+    }
+    sections
+}
+
+fn cap_single_section(section: &str, max_bytes: usize) -> String {
+    if section.len() <= max_bytes {
+        return section.to_owned();
+    }
+    if let Some((heading, body)) = section.split_once('\n')
+        && heading.starts_with("## ")
+        && max_bytes > heading.len() + 16
+    {
+        let body_budget = max_bytes - (heading.len() + 1);
+        let (capped_body, _) = t3_maki::cap_section_utf8(body, body_budget);
+        return format!("{heading}\n{capped_body}");
+    }
+    t3_maki::cap_section_utf8(section, max_bytes).0
+}
+
+pub(crate) fn cap_handoff_summary(summary: &str, max_bytes: usize) -> String {
+    if max_bytes == 0 {
+        return String::new();
+    }
+    let sections = split_markdown_sections(summary);
+    if sections.len() <= 1 {
+        return t3_maki::cap_section_utf8(summary, max_bytes).0;
+    }
+    let section_count = sections.len();
+    let per_section_budget = if max_bytes < HANDOFF_SECTION_MAX_BYTES.saturating_mul(section_count)
+    {
+        (max_bytes / section_count).max(32).min(max_bytes)
+    } else {
+        HANDOFF_SECTION_MAX_BYTES
+    };
+    let mut capped_sections = Vec::with_capacity(section_count);
+    for section in sections {
+        capped_sections.push(cap_single_section(section, per_section_budget));
+    }
+    let assembled = capped_sections.join("\n\n");
+    t3_maki::cap_section_utf8(&assembled, max_bytes).0
 }
 
 fn format_handoff(title: &str, items: &[TurnItem], runs: &[Run]) -> String {
@@ -1433,6 +1498,25 @@ mod tests {
         let summary = format_handoff("Source", &[item], &[]);
         let (_, errors) = summary.split_once("## Unresolved / Recent Errors").unwrap();
         assert!(errors.contains("- Item 7 (unfinished): Apply the outstanding migration"));
+    }
+
+    #[test]
+    fn cap_handoff_summary_enforces_per_section_and_total_utf8_budgets() {
+        let raw = format!(
+            "## Changed Files\n{}\n\n## Recent Commands\n{}\n\n## Conversation Excerpt\n{}",
+            "crates/server/src/日本語ファイル名テスト.rs\n".repeat(120),
+            "cargo test -p t3-server --lib # テスト実行ログ\n".repeat(120),
+            "ユーザー: ハンドオフ要約の日本語境界テストです。\n".repeat(160),
+        );
+        let result = cap_handoff_summary(&raw, HANDOFF_SUMMARY_MAX_BYTES);
+        assert!(result.len() <= HANDOFF_SUMMARY_MAX_BYTES);
+        assert!(result.contains("## Changed Files"));
+        assert!(result.contains("## Recent Commands"));
+        assert!(result.contains("## Conversation Excerpt"));
+        assert_eq!(result.matches("[truncated]").count(), 3);
+
+        let short = "## Changed Files\nsrc/lib.rs\n\n## Recent Commands\ncargo check";
+        assert_eq!(cap_handoff_summary(short, HANDOFF_SUMMARY_MAX_BYTES), short);
     }
 
     #[test]

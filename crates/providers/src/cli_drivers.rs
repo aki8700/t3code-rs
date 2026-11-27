@@ -72,7 +72,22 @@ impl Cli {
             .mcp_injection
             .as_ref()
             .map(|spec| spec.internal_token.as_str());
-        process::run_turn(&self.active, req.run_id, provider, cmd, input, secret, tx).await
+        let tool_profile = req
+            .mcp_injection
+            .as_ref()
+            .map(|spec| spec.tool_profile)
+            .unwrap_or_default();
+        process::run_turn_with_profile(
+            &self.active,
+            req.run_id,
+            provider,
+            cmd,
+            input,
+            secret,
+            tool_profile,
+            tx,
+        )
+        .await
     }
 }
 

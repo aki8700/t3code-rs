@@ -420,7 +420,34 @@ fn configured_idle_timeout() -> Duration {
     parse_idle_timeout(raw.as_deref())
 }
 
-pub(crate) async fn run_turn(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_turn_with_profile(
+    active: &ActiveRunMap,
+    run_id: Uuid,
+    provider: ProviderId,
+    cmd: Command,
+    input: Input,
+    secret: Option<&str>,
+    tool_profile: t3_core::McpToolProfile,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+) -> CoreResult<()> {
+    run_turn_inner(
+        active,
+        run_id,
+        provider,
+        cmd,
+        input,
+        secret,
+        tool_profile,
+        tx,
+        configured_idle_timeout(),
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_with_idle_timeout(
     active: &ActiveRunMap,
     run_id: Uuid,
     provider: ProviderId,
@@ -428,28 +455,31 @@ pub(crate) async fn run_turn(
     input: Input,
     secret: Option<&str>,
     tx: mpsc::UnboundedSender<StreamEvent>,
+    idle_timeout: Duration,
 ) -> CoreResult<()> {
-    run_turn_with_idle_timeout(
+    run_turn_inner(
         active,
         run_id,
         provider,
         cmd,
         input,
         secret,
+        t3_core::McpToolProfile::Full,
         tx,
-        configured_idle_timeout(),
+        idle_timeout,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_turn_with_idle_timeout(
+async fn run_turn_inner(
     active: &ActiveRunMap,
     run_id: Uuid,
     provider: ProviderId,
     mut cmd: Command,
     input: Input,
     secret: Option<&str>,
+    tool_profile: t3_core::McpToolProfile,
     tx: mpsc::UnboundedSender<StreamEvent>,
     idle_timeout: Duration,
 ) -> CoreResult<()> {
@@ -572,6 +602,7 @@ async fn run_turn_with_idle_timeout(
                 close_tx,
                 reader_stop_tx,
                 idle_timeout,
+                tool_profile,
             ),
             read_tail(stderr),
             write_input(stdin, input, steer_rx, close_rx),
@@ -734,6 +765,7 @@ async fn read_events(
     close_stdin: oneshot::Sender<()>,
     mut stop_process: oneshot::Sender<()>,
     idle_timeout: Duration,
+    tool_profile: t3_core::McpToolProfile,
 ) -> io::Result<ReadOutcome> {
     let mut lines = BufReader::new(stdout);
     let mut line = Vec::new();
@@ -744,7 +776,7 @@ async fn read_events(
     let mut reasoning = RepetitionWatchdog::default();
     let mut tool_loop = ToolLoopWatchdog::default();
     let mut failed_tools = ToolFailureWatchdog::default();
-    let mut budget = TurnBudgetWatchdog::from_env();
+    let mut budget = TurnBudgetWatchdog::for_profile(tool_profile);
     let mut in_flight = InFlightTools::default();
     let startup_limit = startup_timeout(idle_timeout);
     let mut saw_first_event = false;
@@ -1553,6 +1585,7 @@ printf '%s\n' \
             close,
             stop,
             DEFAULT_IDLE_STDOUT_TIMEOUT,
+            t3_core::McpToolProfile::Full,
         )
         .await
         .unwrap();
