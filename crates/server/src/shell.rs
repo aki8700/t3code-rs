@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -18,7 +18,8 @@ use tokio::{
 use uuid::Uuid;
 
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
-const MAX_STREAM_BYTES: usize = 256 * 1024;
+const HEAD_STREAM_BYTES: usize = 64 * 1024;
+const TAIL_STREAM_BYTES: usize = 192 * 1024;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 120;
 
@@ -500,13 +501,13 @@ async fn run_shell_internal(
 
     let mut out_task = tokio::spawn(async move {
         match stdout_pipe {
-            Some(pipe) => read_capped_streaming(pipe, MAX_STREAM_BYTES, out_sink).await,
+            Some(pipe) => read_capped_streaming(pipe, out_sink).await,
             None => (Vec::new(), false),
         }
     });
     let mut err_task = tokio::spawn(async move {
         match stderr_pipe {
-            Some(pipe) => read_capped_streaming(pipe, MAX_STREAM_BYTES, err_sink).await,
+            Some(pipe) => read_capped_streaming(pipe, err_sink).await,
             None => (Vec::new(), false),
         }
     });
@@ -668,54 +669,85 @@ fn build_shell_command(command: &str, cwd: &Path) -> Command {
 
 async fn read_capped_streaming<R: AsyncRead + Unpin>(
     mut reader: R,
-    limit: usize,
     sink: Option<(StreamSink, &'static str)>,
 ) -> (Vec<u8>, bool) {
-    let mut out = Vec::new();
+    let mut head = Vec::with_capacity(HEAD_STREAM_BYTES);
+    let mut tail = VecDeque::with_capacity(TAIL_STREAM_BYTES);
+    let mut tail_bytes_seen = 0usize;
     let mut pending_utf8 = Vec::new();
     let mut buf = [0u8; 8192];
-    let mut truncated = false;
     loop {
         match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if out.len() < limit {
-                    let take = (limit - out.len()).min(n);
-                    let slice = &buf[..take];
-                    out.extend_from_slice(slice);
-                    if let Some((ref stream_sink, stream_name)) = sink {
-                        pending_utf8.extend_from_slice(slice);
-                        let chunk = take_valid_utf8_prefix(&mut pending_utf8);
-                        if !chunk.is_empty() {
-                            stream_sink.coordinator.emit(WsServerMessage::ShellOutput {
-                                exec_id: stream_sink.exec_id,
-                                thread_id: stream_sink.thread_id,
-                                stream: stream_name.to_owned(),
-                                chunk,
-                            });
-                        }
+                let head_take = (HEAD_STREAM_BYTES - head.len()).min(n);
+                let head_slice = &buf[..head_take];
+                head.extend_from_slice(head_slice);
+                if !head_slice.is_empty()
+                    && let Some((ref stream_sink, stream_name)) = sink
+                {
+                    pending_utf8.extend_from_slice(head_slice);
+                    let chunk = take_valid_utf8_prefix(&mut pending_utf8);
+                    if !chunk.is_empty() {
+                        stream_sink.coordinator.emit(WsServerMessage::ShellOutput {
+                            exec_id: stream_sink.exec_id,
+                            thread_id: stream_sink.thread_id,
+                            stream: stream_name.to_owned(),
+                            chunk,
+                        });
                     }
-                    if take < n {
-                        truncated = true;
+                }
+
+                let tail_slice = &buf[head_take..n];
+                tail_bytes_seen = tail_bytes_seen.saturating_add(tail_slice.len());
+                if !tail_slice.is_empty() {
+                    if tail_slice.len() >= TAIL_STREAM_BYTES {
+                        tail.clear();
+                        tail.extend(&tail_slice[tail_slice.len() - TAIL_STREAM_BYTES..]);
+                    } else {
+                        let excess = tail
+                            .len()
+                            .saturating_add(tail_slice.len())
+                            .saturating_sub(TAIL_STREAM_BYTES);
+                        tail.drain(..excess);
+                        tail.extend(tail_slice);
                     }
-                } else {
-                    truncated = true;
                 }
             }
         }
     }
-    if let Some((stream_sink, stream_name)) = sink
-        && !pending_utf8.is_empty()
-    {
-        let chunk = String::from_utf8_lossy(&pending_utf8).into_owned();
-        stream_sink.coordinator.emit(WsServerMessage::ShellOutput {
-            exec_id: stream_sink.exec_id,
-            thread_id: stream_sink.thread_id,
-            stream: stream_name.to_owned(),
-            chunk,
-        });
+
+    let omitted_bytes = tail_bytes_seen.saturating_sub(tail.len());
+    let marker =
+        (omitted_bytes > 0).then(|| format!("\n[... {omitted_bytes} bytes omitted ...]\n"));
+    if let Some((stream_sink, stream_name)) = sink {
+        let emit = |chunk: String| {
+            if !chunk.is_empty() {
+                stream_sink.coordinator.emit(WsServerMessage::ShellOutput {
+                    exec_id: stream_sink.exec_id,
+                    thread_id: stream_sink.thread_id,
+                    stream: stream_name.to_owned(),
+                    chunk,
+                });
+            }
+        };
+        if !pending_utf8.is_empty() {
+            emit(String::from_utf8_lossy(&pending_utf8).into_owned());
+        }
+        if let Some(marker) = &marker {
+            emit(marker.clone());
+        }
+        if !tail.is_empty() {
+            emit(String::from_utf8_lossy(tail.make_contiguous()).into_owned());
+        }
     }
-    (out, truncated)
+
+    let mut out = head;
+    if let Some(marker) = marker {
+        out.extend_from_slice(marker.as_bytes());
+    }
+    out.extend(tail);
+    (out, omitted_bytes > 0)
 }
 
 fn take_valid_utf8_prefix(pending: &mut Vec<u8>) -> String {
@@ -770,7 +802,33 @@ mod tests {
         assert_eq!(out.exit_code, Some(0));
         assert!(!out.timed_out);
         assert!(!out.cancelled);
+        assert!(!out.truncated);
         assert_eq!(out.stdout.trim(), "hello-shell");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_keeps_tail_when_output_exceeds_cap() {
+        let dir = std::env::temp_dir();
+        let (_tx, rx) = watch::channel(false);
+        let out = run_shell_cancellable(
+            &dir,
+            ShellExecRequest {
+                command:
+                    "head -c 300000 /dev/zero | tr '\\000' 'x'; printf '\\nFINAL_LINE_MARKER\\n'"
+                        .into(),
+                timeout_secs: Some(5),
+            },
+            rx,
+        )
+        .await
+        .expect("shell should run");
+
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.truncated);
+        assert!(out.stdout.starts_with(&"x".repeat(64 * 1024)));
+        assert!(out.stdout.ends_with("FINAL_LINE_MARKER\n"));
+        assert!(out.stdout.contains("[... 37875 bytes omitted ...]"));
     }
 
     #[tokio::test]
