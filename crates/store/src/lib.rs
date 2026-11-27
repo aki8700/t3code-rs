@@ -654,6 +654,36 @@ impl SqliteStore {
         })
     }
 
+    pub async fn gemini_app_session(
+        &self,
+        thread: Uuid,
+    ) -> CoreResult<Option<(String, String, String)>> {
+        self.with_reader(move |connection| {
+            connection.query_row(
+                "SELECT conversation_id, model, effort FROM gemini_app_sessions WHERE thread_id = ?1",
+                [thread.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional().map_err(storage_error)
+        }).await
+    }
+
+    pub async fn bind_gemini_app_session(
+        &self,
+        thread: Uuid,
+        conversation: String,
+        model: String,
+        effort: String,
+    ) -> CoreResult<()> {
+        self.with_writer(move |connection| {
+            connection.execute(
+                "INSERT INTO gemini_app_sessions (thread_id, conversation_id, model, effort) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(thread_id) DO UPDATE SET conversation_id = excluded.conversation_id,
+                 model = excluded.model, effort = excluded.effort",
+                rusqlite::params![thread.to_string(), conversation, model, effort],
+            ).map_err(storage_error)?;
+            Ok(())
+        }).await
+    }
+
     async fn with_writer<T, F>(&self, operation: F) -> CoreResult<T>
     where
         T: Send + 'static,

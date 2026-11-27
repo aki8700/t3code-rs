@@ -45,6 +45,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/threads/{id}", get(thread_detail).patch(patch_thread))
         .route("/api/threads/{id}/export", get(export_thread))
         .route("/api/threads/{id}/messages", post(send_message))
+        .route("/api/threads/{id}/gemini-app", post(gemini_app))
         .route("/api/threads/{id}/exec", post(thread_exec))
         .route("/api/threads/{id}/exec/stream", post(thread_exec_stream))
         .route("/api/exec/{exec_id}/cancel", post(cancel_exec))
@@ -711,6 +712,14 @@ async fn send_message(
 ) -> ApiResult<Json<Value>> {
     let run_id = state.coordinator.send(id, message, true).await?;
     Ok(Json(json!({"run_id": run_id})))
+}
+
+async fn gemini_app(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<crate::gemini_app::Request>,
+) -> ApiResult<Json<crate::shell::ShellExecOutput>> {
+    Ok(Json(crate::gemini_app::ask(&state, id, req).await?))
 }
 
 async fn thread_exec(

@@ -7,6 +7,7 @@ mod compact;
 pub mod coordinator;
 mod database;
 mod export;
+mod gemini_app;
 mod limits;
 pub mod privacy;
 mod provider_hold;

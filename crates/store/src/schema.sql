@@ -31,6 +31,13 @@ CREATE TABLE IF NOT EXISTS threads (
 CREATE INDEX IF NOT EXISTS threads_project ON threads(project_id);
 CREATE INDEX IF NOT EXISTS threads_parent ON threads(parent_thread_id);
 
+CREATE TABLE IF NOT EXISTS gemini_app_sessions (
+    thread_id TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL UNIQUE,
+    model TEXT NOT NULL,
+    effort TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY NOT NULL,
     thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,

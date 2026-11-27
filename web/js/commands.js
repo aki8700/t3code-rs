@@ -13,6 +13,7 @@ export const GROUP_LABEL = {
 
 export const LOCAL_COMMANDS = [
   { name: 'compact', aliases: ['compress'], args: '[方針]', desc: '会話を圧縮してコンテキストを節約', icon: 'handoff', group: 'session', requiresThread: true },
+  { name: 'gemini', args: '[--new] [--model …] [--effort …] <質問>', desc: 'Gemini Mac の会話を続ける / 新規作成', icon: 'bot', group: 'session', needsArg: true },
   { name: 'sh', aliases: ['shell', 'bash', 'run'], args: '<コマンド>', desc: '作業ディレクトリでシェルコマンドを実行（! と同等）', icon: 'terminal', group: 'shell', needsArg: true },
   { name: 'new', aliases: ['clear', 'reset'], args: '', desc: '新規スレッドを開始', icon: 'compose', group: 'session' },
   { name: 'model', aliases: ['m'], args: '[モデル名]', desc: 'モデルを切り替え／ピッカーを開く', icon: 'bot', group: 'config' },
@@ -255,6 +256,22 @@ export function getPaletteSuggestions(text, ctx = {}) {
     const cmd = findCommand(parsed.name, ctx.provider);
     if (!cmd) return null;
     const argQ = parsed.arg.toLowerCase();
+    if (cmd.name === 'gemini') {
+      const args = /^((?:(?:--new|--model (?:auto|hydrogen|neon|carbon|argon)|--effort (?:low|standard|high|app))\s+)*)(--[^\n]*)?$/.exec(raw.slice(raw.indexOf(parsed.rawName) + parsed.rawName.length).trimStart());
+      if (!args) return null;
+      const [, previous, partial = ''] = args;
+      const candidates = [
+        ['--new', '新しい T3 スレッドと Gemini 会話'],
+        ['--model auto', '自動'], ['--model hydrogen', 'Hydrogen'], ['--model neon', 'Neon'],
+        ['--model carbon', 'Carbon'], ['--model argon', 'Argon（利用可能なアカウント）'],
+        ['--effort low', '思考レベル 低'], ['--effort standard', '思考レベル 標準'],
+        ['--effort high', '思考レベル 高'], ['--effort app', 'Gemini アプリの設定を使用'],
+      ];
+      const options = candidates.filter(([value]) => value.startsWith(partial) && !previous.includes(value.split(' ')[0]));
+      return options.length ? { mode: 'arg', command: cmd, items: options.map(([value, desc]) => ({
+        kind: 'arg', insert: `/gemini ${previous}${value} `, execute: false, label: value, desc, icon: cmd.icon, cmd,
+      })) } : null;
+    }
     let opts = null;
     if (cmd.name === 'theme') {
       opts = (ctx.themes || []).map(([id, label]) => ({ value: id, label: id, desc: label }));

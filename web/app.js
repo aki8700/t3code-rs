@@ -1227,6 +1227,10 @@ function buildStep(item) {
     case 'command_execution': {
       const cmd = pstr(p, 'command', 'cmd', 'title') || (Array.isArray(p?.command) ? p.command.join(' ') : '') || sum || pstr(p, 'step_type');
       const userShell = p?.source === 'user_shell';
+      if (p?.source === 'gemini_app') return stepRow({
+        item, icon: 'bot', verb: 'Gemini', target: oneLine(cmd, 260), cls: 'cmd', open: true,
+        sections: [() => section('回答', outputBlock(pstr(p, 'stdout')))],
+      });
       const verifyHook = p?.source === 'verify_hook';
       const out = userShell
         ? pstr(p, 'output') || [textOf(p?.stdout), textOf(p?.stderr)].filter(Boolean).join('\n')
@@ -1376,6 +1380,10 @@ const isRunDone = (run, fallback) => (run ? !['queued', 'running', 'waiting-for-
 
 /** Renders one finished stretch: user message(s) → work fold → final answer → trailing notes. */
 function appendFinished(items, group, durationMs) {
+  if (items.length === 1 && items[0].payload?.source === 'gemini_app') {
+    appendItem(items[0], group);
+    return;
+  }
   const chunks = [{ users: [], rest: [] }];
   for (const it of items) {
     let c = chunks.at(-1);
@@ -2227,6 +2235,47 @@ async function executeSlashCommand(parsed) {
       goHome(S.projectId);
       toast('新規スレッドを開きました', 'ok', 1800);
       return { handled: true };
+    case 'gemini': {
+      if (!arg || S.atts.length) {
+        toast(S.atts.length ? '/gemini はテキストのみ受け付けます' : '/gemini に続けて質問を入力してください', 'info');
+        return { handled: true };
+      }
+      if (!t && !projectById(S.projectId)) {
+        toast('先にプロジェクトを追加してください', 'err');
+        return { handled: true };
+      }
+      const flags = /^(?:(?:--new|--(?:model|effort) [^\s]+)\s+)*/.exec(arg)[0];
+      const newThread = flags.split(/\s+/).includes('--new');
+      if (!arg.slice(flags.length).trim()) {
+        toast('/gemini のオプションに続けて質問を入力してください', 'info');
+        return { handled: true };
+      }
+      const input = ta();
+      sending = true;
+      syncSendEnabled();
+      let target = newThread ? null : t;
+      try {
+        if (!target) {
+          target = await createThread({ title: oneLine(arg.slice(flags.length).replace(/^--\s+/, ''), 40), model_selection: S.compose.sel });
+          clearInput();
+          await openThread(target.id);
+        } else {
+          clearInput();
+        }
+        toast('Gemini の回答を待っています', 'info');
+        await api(`/api/threads/${target.id}/gemini-app`, { method: 'POST', json: { prompt: arg } });
+        if (S.threadId === target.id) loadDetailSoon();
+        toast('Gemini の回答を保存しました', 'ok');
+      } catch (e) {
+        if ((!target || S.threadId === target.id) && !input.value) input.value = `/gemini ${arg}`;
+        toast(e.message, 'err', 6500);
+      } finally {
+        sending = false;
+        autosize();
+        renderComposer();
+      }
+      return { handled: true };
+    }
     case 'sh':
       if (!arg) {
         ta().value = '/sh ';

@@ -311,6 +311,25 @@ async fn persist_thread_shell_result(
     completed_at: DateTime<Utc>,
     result: &mut ShellExecOutput,
 ) -> CoreResult<()> {
+    persist_thread_command_result(
+        state,
+        thread,
+        started_at,
+        completed_at,
+        result,
+        "user_shell",
+    )
+    .await
+}
+
+pub(crate) async fn persist_thread_command_result(
+    state: &ServerState,
+    thread: &Thread,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    result: &mut ShellExecOutput,
+    source: &str,
+) -> CoreResult<()> {
     let run_id = Uuid::new_v4();
     let ok = !result.timed_out && !result.cancelled && result.exit_code == Some(0);
     let status = if ok {
@@ -339,10 +358,19 @@ async fn persist_thread_shell_result(
             thread_id: thread.id,
             ordinal: 0,
             provider: thread.model_selection.provider,
-            model: "shell".into(),
+            model: if source == "user_shell" {
+                "shell"
+            } else {
+                source
+            }
+            .into(),
             effort: None,
             status,
-            prompt: format!("!{}", result.command),
+            prompt: if source == "user_shell" {
+                format!("!{}", result.command)
+            } else {
+                result.command.clone()
+            },
             provider_session_id: None,
             input_tokens: None,
             output_tokens: None,
@@ -405,7 +433,7 @@ async fn persist_thread_shell_result(
                 "timed_out": result.timed_out,
                 "cancelled": result.cancelled,
                 "truncated": result.truncated,
-                "source": "user_shell",
+                "source": source,
             }),
             searchable_text: Some(searchable),
         })
