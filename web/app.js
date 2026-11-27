@@ -24,6 +24,9 @@ import {
   allCommands, GROUP_LABEL, parseShellInput, parseSlashInput, findCommand,
   getPaletteSuggestions, loadShellHistory, pushShellHistory,
 } from './js/commands.js';
+import {
+  createGenerationFence, createDeltaCoalescer, createNotificationGate,
+} from './js/ui-guards.js';
 
 // ───────────────────────── state ─────────────────────────
 const S = {
@@ -68,8 +71,8 @@ const S = {
   diffScope: ls.get('t3.diffScope', 'all') === 'latest' ? 'latest' : 'all',
   ignoreWs: ls.get('t3.ws', '1') !== '0',
   dbStats: null,
-  usage: { days: 7, metric: 'cost', tab: 'model', hidden: new Set(), cache: new Map(), errors: new Map(), pending: new Map(), seq: new Map(), refreshing: new Set(), onchange: null },
-  limits: { data: null, error: '', pending: null, refreshing: false, redeeming: false, seq: 0, fetchedAt: 0, onchange: null },
+  usage: { days: 7, metric: 'cost', tab: 'model', hidden: new Set(), cache: new Map(), errors: new Map(), pending: new Map(), refreshing: new Set(), onchange: null },
+  limits: { data: null, error: '', pending: null, refreshing: false, redeeming: false, fetchedAt: 0, onchange: null },
   subscribed: new Set(),
   ws: null, wsOk: false,
   token: ls.get('t3.token', ''),
@@ -77,6 +80,10 @@ const S = {
   shellHistory: loadShellHistory(ls),
   workspaceMeta: new Map(), // projectId -> { commands, files } (GET workspace-meta, cached)
 };
+
+// Wave 1 (P0-2 / P1-2 / P1-3): pure guards from web/js/ui-guards.js; app.js only wires them in.
+const uiFence = createGenerationFence();
+const notifyGate = createNotificationGate();
 
 const threadById = (id) => S.threads.find((t) => t.id === id) || (S.detail?.thread?.id === id ? S.detail.thread : null)
   || S.detail?.children?.find((t) => t.id === id) || null;
@@ -719,6 +726,8 @@ async function openThread(id, { push = true } = {}) {
   closePopover(); closeDrawer(); hideCommandPalette();
   if (push) setHash(`#/t/${id}`);
   if (id !== S.threadId) {
+    // A newer thread retires every in-flight response for the old one.
+    uiFence.invalidate('detail'); uiFence.invalidate('diff'); uiFence.invalidate('swarm');
     stashDraft();
     S.threadId = id;
     S.detail = null; S.diffStat = null; S.diffData = null; S.diffError = null; S.parentDiff = null;
@@ -762,8 +771,10 @@ function keepOlderPages(d, prev) {
 }
 
 async function loadDetail(id, { reset = false } = {}) {
+  const token = uiFence.next('detail');
   let d;
   try { d = normalizeDetail(await api(`/api/threads/${id}?limit=${PAGE_SIZE}`)); } catch (e) {
+    if (!uiFence.isCurrent('detail', token)) return;
     if (id === S.threadId) {
       toast(`スレッドを読み込めません: ${e.message}`, 'err');
       if (e.status === 404) goHome();
@@ -771,7 +782,7 @@ async function loadDetail(id, { reset = false } = {}) {
     }
     return;
   }
-  if (id !== S.threadId) return;
+  if (!uiFence.isCurrent('detail', token) || id !== S.threadId) return;
   S.detail = keepOlderPages(d, S.detail);
   // Restore an in-flight turn's streamed text after a reload. A longer
   // client-side live text is never overwritten by a shorter server one.
@@ -932,7 +943,7 @@ function isWorktreeChild(child, parent) {
 async function showParentDiff(parentId, childId) {
   const child = threadById(childId) || (S.detail?.children || []).find((k) => k.id === childId) || null;
   closePopover();
-  diffSeq++; // 進行中の通常差分取得を無効化する
+  uiFence.invalidate('diff'); // 進行中の通常差分取得を無効化する
   S.parentDiff = { parentId, childId, branch: child?.branch || '', data: null };
   setRail('diff'); // loadDiff は parentDiff 表示中は何もしない
   const body = $('#diff-body');
@@ -940,7 +951,7 @@ async function showParentDiff(parentId, childId) {
   try {
     const d = await api(`/api/threads/${parentId}/children/${childId}/diff?ignore_whitespace=${S.ignoreWs}`);
     if (!S.parentDiff || S.parentDiff.childId !== childId) return; // 別スレッドへ移動済み
-    diffSeq++; // setRail 経由の通常差分取得が残っていれば無効化する
+    uiFence.invalidate('diff'); // setRail 経由の通常差分取得が残っていれば無効化する
     S.parentDiff.data = d;
     if (!S.parentDiff.branch) S.parentDiff.branch = d.branch || '';
     diffShownFor = childId;
@@ -1695,23 +1706,48 @@ function optimisticEl(o) { return h('div', { class: 'msg user pending', dataset:
 // Live Markdown repaint throttle: last md() render time + pending trailing timer.
 let liveMdLast = 0;
 let liveMdTimer = 0;
+// Structure of the #live container as last built (which of the reasoning /
+// assistant / working blocks exist, and in which host element). While the host
+// and the structure are unchanged, renderLive() only touches the tail text.
+let liveHost = null;
+let liveSig = '';
 
-const renderLive = rafThrottle(() => {
-  const host = $('#live');
-  const t = curThread();
-  if (!host || !t) return;
-  const live = S.live.get(t.id);
-  const stick = S.stick;
-  let reas = $('.reasoning', host);
-  let asst = $('.msg.assistant', host);
-  let work = $('.working', host);
-  if (live?.reasoning) {
-    if (!reas) { reas = h('details', { class: 'reasoning live', open: true }, h('summary', {}, iconEl('brain'), h('span', { class: 'shimmer', text: '思考中…' }), h('small'), iconEl('chevron', 's-chev')), h('pre')); host.prepend(reas); }
+const liveWorkingLabel = (t) => t.status === 'rate-limited' ? '制限中 — 自動再開を待っています' : t.status === 'waiting-for-children' ? '子スレッドの完了を待っています' : '作業中';
+function liveReasoningEl(live) {
+  const el = h('details', { class: 'reasoning live', open: true },
+    h('summary', {}, iconEl('brain'), h('span', { class: 'shimmer', text: '思考中…' }), h('small', { text: `${fmtNum(live.reasoning.length)}文字` }), iconEl('chevron', 's-chev')),
+    h('pre', { text: live.reasoning }));
+  const box = $('pre', el); box.scrollTop = box.scrollHeight;
+  return el;
+}
+function liveAssistantEl(live) {
+  const el = h('div', { class: 'msg assistant live' }, h('div', { class: 'md' }));
+  const text = live.assistant;
+  const now = performance.now();
+  if (text.length > 4000 && now - liveMdLast < 120) {
+    // Long reply, repainted just now: leave .md empty and let the next
+    // renderLive() tail update fill it in (dataset.len stays unset so the
+    // tail path knows it is pending).
+    if (!liveMdTimer) liveMdTimer = setTimeout(() => { liveMdTimer = 0; renderLive(); }, 120 - (now - liveMdLast));
+  } else {
+    el.firstChild.innerHTML = md(text);
+    el.dataset.len = String(text.length);
+    liveMdLast = now;
+  }
+  return el;
+}
+function liveWorkingEl(t) {
+  return h('div', { class: 'working' }, h('span', { class: 'dots' }, h('i'), h('i'), h('i')), h('span', { class: 'w-label', text: liveWorkingLabel(t) }), h('span', { class: 'w-time' }));
+}
+/** Tail-only update of the reasoning / assistant text inside #live. */
+function updateLiveTail(host, live, t) {
+  const reas = $('.reasoning', host);
+  if (live?.reasoning && reas) {
     $('small', reas).textContent = `${fmtNum(live.reasoning.length)}文字`;
     const box = $('pre', reas); box.textContent = live.reasoning; box.scrollTop = box.scrollHeight;
-  } else reas?.remove();
-  if (live?.assistant) {
-    if (!asst) { asst = h('div', { class: 'msg assistant live' }, h('div', { class: 'md' })); host.insertBefore(asst, work); }
+  }
+  const asst = $('.msg.assistant', host);
+  if (live?.assistant && asst) {
     const text = live.assistant;
     if (asst.dataset.len !== String(text.length)) {
       // Long replies re-parse Markdown on every frame; throttle those repaints.
@@ -1724,12 +1760,29 @@ const renderLive = rafThrottle(() => {
         asst.dataset.len = String(text.length);
       }
     }
-  } else asst?.remove();
-  if (isBusy(t.status)) {
-    if (!work) { work = h('div', { class: 'working' }, h('span', { class: 'dots' }, h('i'), h('i'), h('i')), h('span', { class: 'w-label' }), h('span', { class: 'w-time' })); host.append(work); }
-    $('.w-label', work).textContent = t.status === 'rate-limited' ? '制限中 — 自動再開を待っています' : t.status === 'waiting-for-children' ? '子スレッドの完了を待っています' : '作業中';
-    tickTimer();
-  } else work?.remove();
+  }
+  const work = $('.working', host);
+  if (work) { $('.w-label', work).textContent = liveWorkingLabel(t); tickTimer(); }
+}
+
+const renderLive = rafThrottle(() => {
+  const host = $('#live');
+  const t = curThread();
+  if (!host || !t) return;
+  const live = S.live.get(t.id);
+  const stick = S.stick;
+  // 'r' = reasoning, 'a' = assistant, 'w' = working indicator.
+  const sig = `${live?.reasoning ? 'r' : ''}${live?.assistant ? 'a' : ''}${isBusy(t.status) ? 'w' : ''}`;
+  if (host !== liveHost || sig !== liveSig) {
+    // Structure switch (or a fresh #live host): rebuild the container once.
+    liveHost = host; liveSig = sig;
+    host.replaceChildren();
+    if (live?.reasoning) host.append(liveReasoningEl(live));
+    if (live?.assistant) host.append(liveAssistantEl(live));
+    if (isBusy(t.status)) { host.append(liveWorkingEl(t)); tickTimer(); }
+  } else {
+    updateLiveTail(host, live, t);
+  }
   if (stick) scrollBottom();
 });
 function tickTimer() {
@@ -3139,10 +3192,9 @@ function searchDialog(initialQuery = '') {
 function loadUsage(days, { refresh = false } = {}) {
   const u = S.usage;
   if (!refresh && u.pending.has(days)) return u.pending.get(days);
-  const seq = (u.seq.get(days) || 0) + 1;
-  u.seq.set(days, seq);
+  const token = uiFence.next(`usage:${days}`);
   if (refresh) u.refreshing.add(days);
-  const latest = () => u.seq.get(days) === seq; // an older response must never overwrite a newer one
+  const latest = () => uiFence.isCurrent(`usage:${days}`, token); // an older response must never overwrite a newer one
   const p = api(`/api/usage?days=${days}&tz_offset_mins=${-new Date().getTimezoneOffset()}${refresh ? '&refresh=1' : ''}`)
     .then(normalizeUsage)
     .then((d) => { if (latest()) { u.cache.set(days, d); u.errors.delete(days); } })
@@ -3183,8 +3235,8 @@ function renderUsagePill() {
 function loadUsageLimits({ refresh = false } = {}) {
   const l = S.limits;
   if (l.pending && (!refresh || l.refreshing)) return l.pending;
-  const seq = ++l.seq;
-  const latest = () => l.seq === seq; // an older response must never overwrite a newer one
+  const token = uiFence.next('limits');
+  const latest = () => uiFence.isCurrent('limits', token); // an older response must never overwrite a newer one
   l.refreshing = refresh;
   l.pending = api(`/api/usage/limits${refresh ? '?refresh=1' : ''}`)
     .then(normalizeLimits)
@@ -3379,7 +3431,7 @@ async function redeemResetCredit(p, close) {
   let res; let failure;
   try { res = await api('/api/usage/limits/reset-credit', { method: 'POST', json: { provider: p.rawProvider || p.id } }); } catch (e) { failure = e; }
   // a limits request that is still in flight may predate the redemption: drop its answer
-  l.seq += 1; l.pending = null; l.refreshing = false; l.redeeming = false;
+  uiFence.invalidate('limits'); l.pending = null; l.refreshing = false; l.redeeming = false;
   close();
   let data = null;
   try { if (res?.limits) data = normalizeLimits(res.limits); } catch { /* unusable payload: fetch it again below */ }
@@ -4289,7 +4341,6 @@ function renderContextPanel() {
 const renderContextPanelSoon = rafThrottle(() => { if (shownRail() === 'context') renderContextPanel(); });
 
 // ───────────────────────── diff panel ─────────────────────────
-let diffSeq = 0;
 let diffShownFor = null;
 const diffOpenFiles = new Set();
 
@@ -4436,19 +4487,19 @@ function renderDiffView(d) {
 async function loadDiff() {
   const t = curThread();
   const body = $('#diff-body'); const sum = $('#diff-sum'); const branch = $('#diff-branch');
-  const my = ++diffSeq;
+  const token = uiFence.next('diff');
   syncDiffScopeButtons();
   if (!t) { diffShownFor = null; body.replaceChildren(h('div', { class: 'dp-empty', text: 'スレッドを選択すると、作業ツリーの差分が表示されます' })); sum.replaceChildren(); branch.textContent = ''; return; }
   if (S.parentDiff) return; // 親との差分表示中は通常差分で上書きしない
   if (diffShownFor !== t.id) { sum.replaceChildren(); branch.textContent = ''; body.replaceChildren(h('div', { class: 'dp-empty', text: '読み込み中…' })); }
   try {
     const d = await fetchDiff(t.id);
-    if (my !== diffSeq) return;
+    if (!uiFence.isCurrent('diff', token)) return;
     diffShownFor = t.id;
     noteDiffStat(t.id, d);
     renderDiffView(d);
   } catch (e) {
-    if (my !== diffSeq) return;
+    if (!uiFence.isCurrent('diff', token)) return;
     diffShownFor = null; S.diffStat = null; renderDiffBadge();
     sum.replaceChildren(); branch.textContent = '';
     body.replaceChildren(/not a git repository/i.test(e.message)
@@ -4533,7 +4584,6 @@ const bareName = (n) => String(n ?? '').replace(/^@/, '');
 const swarmWorkers = (b) => b.members.filter((m) => m.role !== 'coordinator');
 
 const swarmPushes = new Map();  // threadId -> count of boards pushed by WS / POST (outdates GETs in flight)
-const swarmGets = new Map();    // threadId -> sequence of the latest GET
 const swarmKilling = new Set(); // `${board_id}:${name}`
 const swarmDrafts = new Map();  // board_id -> unsent quick post
 let swarmPosting = false;
@@ -4565,12 +4615,11 @@ function pushSwarm(threadId, raw) {
   }
 }
 async function loadSwarm(threadId, { manual = false } = {}) {
-  const seq = (swarmGets.get(threadId) || 0) + 1;
-  swarmGets.set(threadId, seq);
+  const token = uiFence.next('swarm');
   const pushes = swarmPushes.get(threadId) || 0;
   try {
     const r = await api(`/api/threads/${threadId}/swarm`);
-    if (swarmGets.get(threadId) !== seq || (swarmPushes.get(threadId) || 0) !== pushes) return;
+    if (!uiFence.isCurrent('swarm', token) || (swarmPushes.get(threadId) || 0) !== pushes) return;
     storeSwarm(threadId, normalizeBoard(r));
   } catch (e) {
     if (manual) toast(`Swarm ボードを取得できません: ${e.message}`, 'err'); // background fetches stay quiet
@@ -4838,9 +4887,13 @@ function setThreadStatus(id, status) {
   if (c) c.status = status;
 }
 
-// Fires only while the tab is hidden or unfocused: Desktop IPC, else Web Notification.
-function notifyUser(title, body, threadId) {
-  if (!document.hidden && document.hasFocus()) return;
+// Fires unless the user is already looking at that thread, and unless the same
+// (threadId, kind) already notified within the dedupe window (see ui-guards.js).
+function notifyUser(title, body, threadId, kind = 'notify') {
+  if (!notifyGate.shouldNotify({
+    visible: !document.hidden, focused: document.hasFocus(),
+    activeThreadId: S.threadId, threadId: threadId || null, kind, now: Date.now(),
+  })) return;
   if (isDesktop()) { ipc('notify:' + JSON.stringify({ title, body, thread_id: threadId || '' })); return; }
   if (typeof Notification === 'function' && Notification.permission === 'granted') {
     const n = new Notification(title, { body });
@@ -4853,8 +4906,24 @@ async function notifyRunOutcome(title, threadId, followup = false) {
   if (followup) return;
   // a just-spawned child may not be in the thread list yet
   const t = threadById(threadId) || (await api(`/api/threads/${threadId}`).catch(() => null))?.thread;
-  if (!t?.parent_thread_id || t.relationship === 'fork') notifyUser(title, cleanTitle(t?.title) || threadId, threadId);
+  if (!t?.parent_thread_id || t.relationship === 'fork') notifyUser(title, cleanTitle(t?.title) || threadId, threadId, `run:${title}`);
 }
+
+// P1-2: WS deltas are buffered and applied once per animation frame.
+const deltaCoalescer = createDeltaCoalescer(
+  (cb) => requestAnimationFrame(cb),
+  (chunks) => {
+    let touchedCurrent = false;
+    for (const c of chunks) {
+      let live = S.live.get(c.threadId);
+      if (!live) { live = { runId: c.runId, assistant: '', reasoning: '' }; S.live.set(c.threadId, live); }
+      const key = c.channel === 'reasoning' ? 'reasoning' : 'assistant';
+      live[key] = (live[key] + c.text).slice(-200000);
+      if (c.threadId === S.threadId) touchedCurrent = true;
+    }
+    if (touchedCurrent) { S.stick = nearBottom() || S.stick; renderLive(); }
+  },
+);
 
 function handleWs(m) {
   const cur = S.threadId;
@@ -4877,6 +4946,7 @@ function handleWs(m) {
       break;
     }
     case 'run_started': {
+      deltaCoalescer.clear(); // buffered deltas belong to the previous run
       S.live.set(m.thread_id, { runId: m.run.id, assistant: '', reasoning: '' });
       S.liveUsage.delete(m.thread_id);
       setThreadStatus(m.thread_id, 'running');
@@ -4895,6 +4965,7 @@ function handleWs(m) {
       if (TERMINAL_RUN.has(m.status)) {
         const live = S.live.get(m.thread_id);
         if (!live || !live.runId || live.runId === m.run_id) S.live.delete(m.thread_id);
+        if (m.thread_id === cur) deltaCoalescer.clear(); // a buffered delta must not resurrect a finished run
         const usage = S.liveUsage.get(m.thread_id);
         if (!usage || !usage.runId || usage.runId === m.run_id) S.liveUsage.delete(m.thread_id);
         if (m.status === 'completed' || m.status === 'failed') notifyRunOutcome(m.status === 'completed' ? '実行完了' : '実行失敗', m.thread_id, m.status === 'completed' && m.followup);
@@ -4906,17 +4977,14 @@ function handleWs(m) {
       break;
     }
     case 'delta': {
-      let live = S.live.get(m.thread_id);
-      if (!live) { live = { runId: m.run_id, assistant: '', reasoning: '' }; S.live.set(m.thread_id, live); }
-      const key = m.channel === 'reasoning' ? 'reasoning' : 'assistant';
-      live[key] = (live[key] + m.text).slice(-200000);
-      if (m.thread_id === cur) { S.stick = nearBottom() || S.stick; renderLive(); }
+      deltaCoalescer.push({ threadId: m.thread_id, runId: m.run_id, channel: m.channel, text: m.text });
       break;
     }
     case 'turn_item_added': {
       const it = m.item;
       const live = S.live.get(m.thread_id);
       if (live) {
+        if (it.kind === 'assistant_message' || it.kind === 'reasoning') deltaCoalescer.clear(); // a buffered delta must not resurrect cleared text
         if (it.kind === 'assistant_message') live.assistant = '';
         if (it.kind === 'reasoning') live.reasoning = '';
       }
@@ -4965,7 +5033,7 @@ function handleWs(m) {
       if (!a.some((x) => x.id === r.id)) a.push(r);
       S.pending.set(r.thread_id, a);
       if (r.thread_id === cur) { renderApprovals(); scrollBottom(); } else toast(`⚠ 承認待ち: ${r.title || r.kind}`, '', 5000);
-      notifyUser('承認待ち', r.title || r.kind, r.thread_id);
+      notifyUser('承認待ち', r.title || r.kind, r.thread_id, 'approval');
       renderSidebarSoon();
       refreshMonitorSoon();
       break;
