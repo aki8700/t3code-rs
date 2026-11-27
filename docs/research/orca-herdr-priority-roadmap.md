@@ -119,6 +119,11 @@
   - **R2-6**: `SwarmService::add_worker_locked` に `ProviderHolds` 事前ゲートを追加し、hold 中モデルでの空スレッド／ワークツリー作成を防止。
   - **P1-3**: `Coordinator` に `ThreadStatusDeduper` を組み込み、同一 `ThreadStatusChanged` の連続 WS 送出を抑制。
   - **P2-3**: `crates/cli/src/main.rs` に symlink 拒否＋`0o600` 原子的設定書き込み `write_config_safely` と単体テストを追加。
+- **夜間 Codex（`gpt-6.2-astra` / `xhigh`）Wave 1 反映済み（2026-11-28 01:09〜01:22 JST）**:
+  - **G-9（`usage.rs` 分割）**: `crates/server/src/usage.rs`（1,943 行）を `crates/server/src/usage/` 配下の 9 モジュールへ分割（全ファイル 587 行以下、API・テスト完全維持、`7b321b7`）。
+  - **G-9（`limits.rs` 分割）**: `crates/server/src/limits.rs`（2,330 行）を `crates/server/src/limits/` 配下の 7 モジュールへ分割（全ファイル 577 行以下、API・テスト完全維持、`f8cc44e`）。
+  - **G-10（非ルート git 解決・WS 3 レーン試験・HTTP フレーキー対策）**: `crates/git/src/lib.rs`、`crates/server/src/ws.rs`、`crates/server/tests/http.rs` を強化（`0dfac4e`）。
+  - **P2-1（Unix `pre_exec` `await_gate` 起動同期パイプ）**: `crates/providers/src/process.rs` / `lib.rs`・`crates/server/src/coordinator.rs` へ `spawn()`〜SQLite 孤児記録完了前のクラッシュ窓を塞ぐ同期ゲートを実装・単体テスト追加。
 - **保留／未着手**:
   - **DeepSeek**（`opencode/deepseek-v4.1-flash-free`）は OpenCode 無料枠上限（`AI_APICallError: Free usage limit reached`）のため、該当実装はすべて Gemini Mac アプリへフォールバック済み。
-  - **未着手（大改修枠）**: **G-1**（`coordinator.rs` `active` ロック縮小）、**P2-1**（Unix `pre_exec` `await_gate` パイプ）、**G-9**（巨大ファイル分割）。
+  - **未着手（大改修枠）**: **G-1**（`coordinator.rs` `active` ロック縮小）、**G-9 残り**（`coordinator.rs` / `process.rs` / `threads.rs` / `store/lib.rs` 分割）。
