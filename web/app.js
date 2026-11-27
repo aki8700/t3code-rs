@@ -28,6 +28,7 @@ import {
 // ───────────────────────── state ─────────────────────────
 const S = {
   meta: null,
+  pauseAll: false,
   providers: [],
   projects: [],
   projectId: ls.get('t3.project', ''),
@@ -851,7 +852,26 @@ function renderAll() {
 // ───────────────────────── topbar ─────────────────────────
 const latestRun = () => { const r = S.detail?.runs || []; return r.length ? r[r.length - 1] : null; };
 
+function renderPauseAll() {
+  const btn = $('#btn-pause-all');
+  if (!btn) return;
+  btn.textContent = S.pauseAll ? '再開' : '一時停止';
+  btn.title = S.pauseAll ? '自動実行の保留を解除します' : '実行中のターンを終えてから、自動実行を保留します';
+  btn.setAttribute('aria-pressed', String(S.pauseAll));
+}
+
+async function refreshPauseAll() {
+  try {
+    const state = await api('/api/pause-all');
+    if (typeof state.paused === 'boolean' && state.paused !== S.pauseAll) {
+      S.pauseAll = state.paused;
+      renderPauseAll();
+    }
+  } catch { /* The rest of the workspace remains usable if this request fails. */ }
+}
+
 function renderHeader() {
+  renderPauseAll();
   const t = curThread();
   const box = $('#tb-title');
   const kidsBtn = $('#btn-children');
@@ -4966,6 +4986,18 @@ function wire() {
   $('#scrim').onclick = closeDrawer;
   $('#btn-home').onclick = () => goHome();
   $('#btn-new-thread').onclick = () => goHome();
+  $('#btn-pause-all').onclick = async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      const state = await api('/api/pause-all', { method: 'PUT', json: { paused: !S.pauseAll } });
+      S.pauseAll = state.paused;
+      renderPauseAll();
+      toast(S.pauseAll ? '自動実行を一時停止しました。' : '自動実行を再開しました。');
+    } catch (error) {
+      toast(`Pause all の更新に失敗しました: ${error.message}`, 'err');
+    } finally { btn.disabled = false; }
+  };
   $('#btn-add-project').onclick = projectDialog;
   $('#btn-search').onclick = searchDialog;
   $('#btn-sb-search').onclick = searchDialog;
@@ -5228,11 +5260,14 @@ async function boot() {
   setRail(S.rail);
   connectWs();
   try {
-    const [meta, providers] = await Promise.all([
+    const [meta, providers, pauseState] = await Promise.all([
       api('/api/meta').catch(() => null),
       api('/api/providers').catch(() => []),
+      api('/api/pause-all').catch(() => null),
     ]);
     S.meta = meta; S.providers = Array.isArray(providers) ? providers : [];
+    S.pauseAll = pauseState?.paused === true;
+    renderPauseAll();
     if (S.wsOk && meta) setConn('ok', `接続済み · v${meta.version}`);
     if (meta?.follow_up_behavior && !ls.get('t3.behavior', '')) S.behavior = meta.follow_up_behavior === 'queue' ? 'queue' : 'steer';
     await loadProjects();
@@ -5252,7 +5287,7 @@ async function boot() {
   else if (!isCoarse() && !$('dialog[open]')) ta().focus();
   $('#app').classList.add('ready');
   setTimeout(loadUsageLimits, 600); // background only: the CLIs behind it can be slow
-  setInterval(() => { if (!document.hidden) loadThreads().catch(() => {}); }, 15000);
+  setInterval(() => { if (!document.hidden) { loadThreads().catch(() => {}); refreshPauseAll(); } }, 15000);
   setInterval(() => { if (!document.hidden) loadUsage(7); }, 5 * 60000);
   setInterval(tickSwarmTimes, 30000);
   setInterval(() => { if (!document.hidden) renderLimitSurfaces(); }, 30000);

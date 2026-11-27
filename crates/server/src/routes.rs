@@ -27,6 +27,7 @@ pub fn router(state: ServerState) -> Router {
     let api = Router::new()
         .route("/api/meta", get(meta))
         .route("/api/settings", get(get_settings).patch(patch_settings))
+        .route("/api/pause-all", get(pause_all_status).put(set_pause_all))
         .route("/api/monitor", get(monitor))
         .route("/api/providers", get(providers))
         .route("/api/projects", get(projects).post(create_project))
@@ -191,6 +192,24 @@ async fn patch_settings(
     Ok(Json(json!({
         "settings": settings,
         "enabled_providers": &state.config.enabled_providers,
+    })))
+}
+
+#[derive(Deserialize)]
+struct PauseAllRequest {
+    paused: bool,
+}
+
+async fn pause_all_status(State(state): State<ServerState>) -> Json<Value> {
+    Json(json!({"paused": state.coordinator.pause_all()}))
+}
+
+async fn set_pause_all(
+    State(state): State<ServerState>,
+    Json(input): Json<PauseAllRequest>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(json!({
+        "paused": state.coordinator.set_pause_all(input.paused).await?
     })))
 }
 
@@ -690,7 +709,7 @@ async fn send_message(
     Path(id): Path<Uuid>,
     Json(message): Json<Message>,
 ) -> ApiResult<Json<Value>> {
-    let run_id = state.coordinator.send(id, message).await?;
+    let run_id = state.coordinator.send(id, message, true).await?;
     Ok(Json(json!({"run_id": run_id})))
 }
 

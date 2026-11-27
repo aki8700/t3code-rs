@@ -3775,6 +3775,242 @@ async fn tier4_streaming_shell_cancel_monitor_and_worktree_merge_routes() {
     assert!(detail["context"]["compaction"]["recommended"].is_boolean());
 }
 
+#[tokio::test]
+async fn pause_all_holds_delegated_runs_but_keeps_user_messages_dispatchable() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let parent_id = create_parent(&app, &tmp.0).await;
+
+    assert_eq!(
+        json_req(&app, Method::GET, "/api/pause-all", None).await["paused"],
+        false
+    );
+    assert_eq!(
+        json_req(
+            &app,
+            Method::PUT,
+            "/api/pause-all",
+            Some(json!({"paused":true})),
+        )
+        .await["paused"],
+        true
+    );
+    let delegated = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{parent_id}/delegate"),
+        Some(json!({
+            "parent_thread_id": parent_id,
+            "title": "Held child",
+            "task": "unattended work",
+            "model_selection": {"provider":"mock","model":"mock"},
+            "runtime_mode": "approval-required",
+            "interaction_mode": "default",
+            "isolation": "shared"
+        })),
+    )
+    .await;
+    let child_id: Uuid = serde_json::from_value(delegated["thread"]["id"].clone()).unwrap();
+    let held = json_req(&app, Method::GET, &format!("/api/threads/{child_id}"), None).await;
+    assert_eq!(held["runs"][0]["status"], "queued");
+    assert_eq!(
+        held["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(
+                |item| item["kind"] == "system_notice" && item["payload"]["reason"] == "pause_all"
+            )
+            .count(),
+        1
+    );
+
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{child_id}/messages"),
+        Some(json!({"prompt":"direct user message"})),
+    )
+    .await;
+    wait_for_thread(&mut events, child_id, ThreadStatus::Completed).await;
+    let after_user = json_req(&app, Method::GET, &format!("/api/threads/{child_id}"), None).await;
+    assert_eq!(after_user["runs"][0]["status"], "queued");
+    assert_eq!(after_user["runs"][1]["status"], "completed");
+
+    mcp_tool(
+        &app,
+        "thread_send",
+        json!({"thread_id": child_id, "prompt":"agent initiated message"}),
+    )
+    .await;
+    let after_agent = json_req(&app, Method::GET, &format!("/api/threads/{child_id}"), None).await;
+    assert_eq!(after_agent["runs"][2]["status"], "queued");
+
+    assert_eq!(
+        mcp_tool(&app, "pause_all", json!({"paused":false})).await,
+        false
+    );
+    wait_for_thread(&mut events, child_id, ThreadStatus::Completed).await;
+    wait_for_thread(&mut events, child_id, ThreadStatus::Completed).await;
+    let resumed = json_req(&app, Method::GET, &format!("/api/threads/{child_id}"), None).await;
+    assert_eq!(resumed["runs"][0]["status"], "completed");
+    assert_eq!(resumed["runs"][2]["status"], "completed");
+}
+
+#[tokio::test]
+async fn pause_all_waiting_delegation_does_not_return_an_idle_empty_result() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let app = router(state);
+    let parent_id = create_parent(&app, &tmp.0).await;
+
+    json_req(
+        &app,
+        Method::PUT,
+        "/api/pause-all",
+        Some(json!({"paused":true})),
+    )
+    .await;
+    let wait_app = app.clone();
+    let mut waiting = tokio::spawn(async move {
+        mcp_tool(
+            &wait_app,
+            "delegate_task",
+            json!({
+                "parent_thread_id": parent_id,
+                "title":"Paused wait child",
+                "task":"wait for the pause to lift",
+                "provider":"mock",
+                "model":"mock",
+                "isolation":"shared",
+                "mode":"wait"
+            }),
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+            .await
+            .is_err(),
+        "a Wait delegation held by Pause all must remain pending"
+    );
+    mcp_tool(&app, "pause_all", json!({"paused":false})).await;
+    let resumed = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed["status"], "completed");
+    assert_eq!(resumed["summary"], "wait for the pause to lift");
+}
+
+#[tokio::test]
+async fn pause_all_keeps_waiting_delegation_open_across_fallback_followup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new();
+    let fake_claude = tmp.0.join("fake-claude-fallback");
+    std::fs::write(
+        &fake_claude,
+        r#"#!/bin/sh
+IFS= read -r line
+sleep 1
+printf '%s\n' '{"type":"error","error":{"type":"usage_limit","message":"You have hit your weekly usage limit","reset_at":"2030-01-01T00:00:00Z"}}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut cfg = ServerConfig {
+        data_dir: tmp.0.join("server"),
+        enabled_providers: vec![ProviderId::Claude, ProviderId::Mock],
+        fallback_models: vec![t3_core::ModelSelection {
+            provider: ProviderId::Mock,
+            model: "mock".into(),
+            effort: None,
+            agent: None,
+        }],
+        verify_max_auto_fixes: 1,
+        auth: AuthConfig::LocalOnly,
+        ..Default::default()
+    };
+    cfg.providers.claude_bin = fake_claude;
+    let state = ServerState::new(cfg, "http://127.0.0.1:3774".into()).unwrap();
+    let app = router(state);
+    let parent_id = create_parent(&app, &tmp.0).await;
+
+    let wait_app = app.clone();
+    let mut waiting = tokio::spawn(async move {
+        mcp_tool(
+            &wait_app,
+            "delegate_task",
+            json!({
+                "parent_thread_id": parent_id,
+                "title":"Verify follow-up wait child",
+                "task":"[quota-trigger] initial attempt",
+                "provider":"claude",
+                "model":"mock",
+                "isolation":"shared",
+                "mode":"wait"
+            }),
+        )
+        .await
+    });
+
+    let child_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let threads = json_req(&app, Method::GET, "/api/threads", None).await;
+            if let Some(thread) = threads.as_array().unwrap().iter().find(|thread| {
+                thread["parent_thread_id"] == json!(parent_id)
+                    && thread["title"] == "Verify follow-up wait child"
+            }) {
+                let id: Uuid = serde_json::from_value(thread["id"].clone()).unwrap();
+                if thread["status"] == "running" {
+                    break id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("delegated child should start");
+    json_req(
+        &app,
+        Method::PUT,
+        "/api/pause-all",
+        Some(json!({"paused":true})),
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let detail =
+                json_req(&app, Method::GET, &format!("/api/threads/{child_id}"), None).await;
+            if detail["runs"].as_array().unwrap().len() == 2
+                && detail["runs"][1]["status"] == "queued"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the verify follow-up should remain queued while paused");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+            .await
+            .is_err(),
+        "Wait must cover the queued verify follow-up"
+    );
+
+    mcp_tool(&app, "pause_all", json!({"paused":false})).await;
+    let result = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["status"], "completed");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn limited_provider_holds_queued_runs_until_reset_while_other_providers_dispatch() {
@@ -3950,7 +4186,7 @@ IFS= read -r line
 printf 'run\n' >> "{count}"
 case "$line" in
   *quota-trigger*)
-    printf '%s\n' '{{"type":"error","error":{{"type":"usage_limit","message":"You have hit your weekly usage limit","reset_at":"2026-11-27T03:00:00Z"}}}}'
+    printf '%s\n' '{{"type":"error","error":{{"type":"usage_limit","message":"You have hit your weekly usage limit","reset_at":"2030-01-01T00:00:00Z"}}}}'
     exit 0
     ;;
   *"verify command"*)
@@ -4077,7 +4313,7 @@ esac
     assert_eq!(fb_runs[0]["status"], "rate-limited");
     assert_eq!(
         fb_runs[0]["error_message"],
-        "usage_limit: You have hit your weekly usage limit (reset_at: 2026-11-27T03:00:00Z)"
+        "usage_limit: You have hit your weekly usage limit (reset_at: 2030-01-01T00:00:00Z)"
     );
     assert_eq!(fb_runs[1]["provider"], "mock");
     assert_eq!(fb_runs[1]["status"], "completed");

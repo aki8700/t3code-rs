@@ -382,7 +382,10 @@ pub fn classify_diff_risk(files: &[DiffFile]) -> DiffRiskReport {
         }
     };
     let mut push_path = |path: &str| {
-        if !flagged_paths.iter().any(|existing: &String| existing == path) {
+        if !flagged_paths
+            .iter()
+            .any(|existing: &String| existing == path)
+        {
             flagged_paths.push(path.to_owned());
         }
     };
@@ -396,7 +399,9 @@ pub fn classify_diff_risk(files: &[DiffFile]) -> DiffRiskReport {
 
         if is_no_undo_path(&lower, file_name) {
             tier = UndoTier::NoUndo;
-            push_reason("migration / secrets / deploy-infra path touched (human sign-off required)");
+            push_reason(
+                "migration / secrets / deploy-infra path touched (human sign-off required)",
+            );
             push_path(&norm);
             continue;
         }
@@ -410,7 +415,9 @@ pub fn classify_diff_risk(files: &[DiffFile]) -> DiffRiskReport {
             if tier < UndoTier::Cleanup {
                 tier = UndoTier::Cleanup;
             }
-            push_reason("auth / schema / manifest / store boundary changed (second-opinion review recommended)");
+            push_reason(
+                "auth / schema / manifest / store boundary changed (second-opinion review recommended)",
+            );
             push_path(&norm);
         } else if !is_test_or_doc && file.status.trim().eq_ignore_ascii_case("D")
             || (!is_test_or_doc && file.status.trim().eq_ignore_ascii_case("deleted"))
@@ -510,7 +517,16 @@ fn is_cleanup_path(lower: &str, file_name: &str) -> bool {
     if is_doc_or_test_path(lower, file_name) {
         return false;
     }
-    let sensitive_stem = ["auth", "security", "privacy", "permission", "oauth", "jwt", "crypto", "rbac"];
+    let sensitive_stem = [
+        "auth",
+        "security",
+        "privacy",
+        "permission",
+        "oauth",
+        "jwt",
+        "crypto",
+        "rbac",
+    ];
     if sensitive_stem
         .iter()
         .any(|kw| file_name.contains(kw) || has_path_segment(lower, kw))
@@ -649,7 +665,10 @@ mod tests {
             patch: String::new(),
         }]);
         assert_eq!(cleanup_auth.tier, UndoTier::Cleanup);
-        assert_eq!(cleanup_auth.flagged_paths, vec!["crates/server/src/auth.rs"]);
+        assert_eq!(
+            cleanup_auth.flagged_paths,
+            vec!["crates/server/src/auth.rs"]
+        );
 
         let no_undo_migration = classify_diff_risk(&[
             DiffFile {

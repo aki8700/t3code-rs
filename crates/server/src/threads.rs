@@ -478,18 +478,13 @@ impl RunCoordinator {
                 return Err(error);
             }
         };
+        let status = self.0.store.get_thread(thread.id).await?.status;
         self.emit(WsServerMessage::SubagentUpdated {
             parent_thread_id: parent.id,
             child_thread_id: thread.id,
-            status: ThreadStatus::Running,
+            status,
         });
-        Ok((
-            Thread {
-                status: ThreadStatus::Running,
-                ..thread
-            },
-            ticket,
-        ))
+        Ok((Thread { status, ..thread }, ticket))
     }
 
     pub async fn fork_thread(&self, id: Uuid, options: ForkOptions) -> CoreResult<Thread> {
@@ -583,6 +578,17 @@ impl RunCoordinator {
     }
 
     pub(crate) async fn discard_thread(&self, thread: &Thread) {
+        match self.0.store.list_queued_runs(thread.id).await {
+            Ok(runs) => {
+                for run in runs {
+                    self.clear_user_run(run.id);
+                    self.complete_queued_ticket(run.id);
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, thread_id = %thread.id, "Could not clear queued thread bookkeeping");
+            }
+        }
         let id = thread.id.to_string();
         if let Err(error) = self
             .sql(move |db| {
@@ -1074,6 +1080,10 @@ impl RunCoordinator {
 
 #[async_trait]
 impl OrchestratorBackend for RunCoordinator {
+    async fn pause_all(&self, paused: bool) -> CoreResult<bool> {
+        self.set_pause_all(paused).await
+    }
+
     async fn swarm_status(&self, thread_id: Uuid) -> CoreResult<Option<SwarmStatusResult>> {
         let Some(board) = self.get_board(thread_id).await? else {
             return Ok(None);
@@ -1266,9 +1276,7 @@ impl OrchestratorBackend for RunCoordinator {
         let diff = self
             .child_worktree_diff(caller_id, child_thread_id, false)
             .await?;
-        let risk = diff
-            .risk
-            .unwrap_or_else(|| classify_diff_risk(&diff.files));
+        let risk = diff.risk.unwrap_or_else(|| classify_diff_risk(&diff.files));
         if risk.tier == UndoTier::NoUndo {
             let paths = if risk.flagged_paths.is_empty() {
                 "sensitive changes".to_owned()
@@ -1323,6 +1331,7 @@ impl OrchestratorBackend for RunCoordinator {
                 behavior,
                 ..Default::default()
             },
+            false,
         )
         .await
     }
