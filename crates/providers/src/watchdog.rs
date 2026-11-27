@@ -1,5 +1,6 @@
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use t3_core::normalize_failure_output;
 use t3_core::types::{ProviderId, TurnItemKind};
 
 const WINDOW_BYTES: usize = 8 * 1024;
@@ -9,6 +10,8 @@ const LINE_REPEATS: usize = 8;
 const MAX_PERIOD: usize = 512;
 const BLOCK_REPEATS: usize = 6;
 const TOOL_LOOP_REPEATS: usize = 8;
+const FAILED_TOOL_WARN_REPEATS: usize = 2;
+const FAILED_TOOL_STOP_REPEATS: usize = 3;
 
 /// Tool steps a provider has started but not yet finished.
 ///
@@ -92,6 +95,150 @@ impl ToolLoopWatchdog {
         self.last = None;
         self.repeats = 0;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolFailureAction {
+    None,
+    Warn,
+    Stop,
+}
+
+#[derive(Default)]
+pub(crate) struct ToolFailureWatchdog {
+    calls: HashMap<String, (String, String)>,
+    failures: HashMap<String, usize>,
+}
+
+impl ToolFailureWatchdog {
+    pub(crate) fn push(
+        &mut self,
+        kind: TurnItemKind,
+        summary: Option<&str>,
+        payload: &Value,
+    ) -> ToolFailureAction {
+        if kind == TurnItemKind::ToolCall {
+            if let (Some(id), Some(tool)) = (item_id(payload), tool_name(summary, payload)) {
+                let call_signature =
+                    normalized_tool_signature(Some(&tool), payload).unwrap_or_else(|| tool.clone());
+                self.calls.insert(id.to_owned(), (tool, call_signature));
+            }
+            return ToolFailureAction::None;
+        }
+        if kind != TurnItemKind::ToolResult {
+            return ToolFailureAction::None;
+        }
+
+        let invocation = item_id(payload).and_then(|id| self.calls.remove(id));
+        let Some(tool) = tool_name(None, payload)
+            .or_else(|| invocation.as_ref().map(|(tool, _)| tool.clone()))
+            .or_else(|| {
+                summary
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+            })
+        else {
+            return ToolFailureAction::None;
+        };
+        if is_read_only_tool(&tool) {
+            return ToolFailureAction::None;
+        }
+
+        let tool_key = tool.trim().to_ascii_lowercase();
+        let prefix = format!("{tool_key}\0");
+        let Some(failure) = failure_output(payload) else {
+            self.failures
+                .retain(|signature, _| !signature.starts_with(&prefix));
+            return ToolFailureAction::None;
+        };
+
+        let call_signature = invocation
+            .map(|(_, signature)| signature)
+            .or_else(|| normalized_tool_signature(Some(&tool), payload))
+            .unwrap_or_else(|| tool.clone());
+        let error = normalize_failure_output(&failure);
+        let signature = format!("{prefix}{call_signature}\0{error}");
+        let count = self.failures.entry(signature.clone()).or_default();
+        *count += 1;
+        if *count >= FAILED_TOOL_STOP_REPEATS {
+            ToolFailureAction::Stop
+        } else if *count == FAILED_TOOL_WARN_REPEATS {
+            ToolFailureAction::Warn
+        } else {
+            ToolFailureAction::None
+        }
+    }
+}
+
+fn item_id(payload: &Value) -> Option<&str> {
+    ["tool_use_id", "call_id", "toolCallId", "id"]
+        .into_iter()
+        .find_map(|field| payload.get(field).and_then(Value::as_str))
+}
+
+fn tool_name(summary: Option<&str>, payload: &Value) -> Option<String> {
+    summary
+        .or_else(|| {
+            ["name", "tool", "tool_name", "toolName"]
+                .into_iter()
+                .find_map(|field| payload.get(field).and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn is_read_only_tool(tool: &str) -> bool {
+    let tool = tool.trim().to_ascii_lowercase();
+    [
+        "read",
+        "read_file",
+        "view",
+        "grep",
+        "glob",
+        "ls",
+        "list_files",
+        "list_directory",
+        "search",
+        "web_search",
+    ]
+    .into_iter()
+    .any(|name| tool == name || tool.ends_with(&format!("__{name}")))
+}
+
+fn failure_output(payload: &Value) -> Option<String> {
+    for result in [payload, &payload["state"]] {
+        let error = &result["error"];
+        let failed = result["is_error"].as_bool() == Some(true)
+            || result["isError"].as_bool() == Some(true)
+            || result["status"].as_str().is_some_and(|status| {
+                matches!(
+                    status.to_ascii_lowercase().as_str(),
+                    "error" | "failed" | "failure"
+                )
+            })
+            || error.as_str().is_some_and(|error| !error.trim().is_empty())
+            || error.as_object().is_some_and(|error| !error.is_empty())
+            || error.as_array().is_some_and(|error| !error.is_empty());
+        if failed {
+            return Some(
+                ["error", "message", "content", "output", "result", "stderr"]
+                    .into_iter()
+                    .find_map(|field| {
+                        let value = result.get(field)?;
+                        (!value.is_null() && !value.is_boolean()).then(|| {
+                            value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string())
+                        })
+                    })
+                    .unwrap_or_else(|| "tool reported failure without details".to_owned()),
+            );
+        }
+    }
+    None
 }
 
 fn normalized_tool_signature(summary: Option<&str>, payload: &Value) -> Option<String> {
@@ -326,6 +473,134 @@ fn short_pattern(block: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_call(id: &str, tool: &str, input: Value) -> Value {
+        serde_json::json!({"id": id, "name": tool, "input": input})
+    }
+
+    fn tool_result(id: &str, failed: bool, output: &str) -> Value {
+        serde_json::json!({
+            "tool_use_id": id,
+            "is_error": failed,
+            "content": output
+        })
+    }
+
+    #[test]
+    fn repeated_failure_signature_warns_then_stops_across_read_only_results() {
+        let mut watchdog = ToolFailureWatchdog::default();
+        let input = serde_json::json!({"command": "make build"});
+        for (id, elapsed) in [("b1", "10ms"), ("b2", "30ms"), ("b3", "50ms")] {
+            assert_eq!(
+                watchdog.push(
+                    TurnItemKind::ToolCall,
+                    Some("Bash"),
+                    &tool_call(id, "Bash", input.clone())
+                ),
+                ToolFailureAction::None
+            );
+            if id == "b2" {
+                watchdog.push(
+                    TurnItemKind::ToolCall,
+                    Some("Read"),
+                    &tool_call("r1", "Read", serde_json::json!({"file_path": "x"})),
+                );
+                watchdog.push(
+                    TurnItemKind::ToolResult,
+                    None,
+                    &tool_result("r1", true, "missing file"),
+                );
+            }
+            let result = tool_result(id, true, &format!("failed in {elapsed}"));
+            let action = watchdog.push(TurnItemKind::ToolResult, None, &result);
+            assert_eq!(
+                action,
+                if id == "b2" {
+                    ToolFailureAction::Warn
+                } else if id == "b3" {
+                    ToolFailureAction::Stop
+                } else {
+                    ToolFailureAction::None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn success_of_a_tool_clears_its_failure_count_and_read_failures_are_neutral() {
+        let mut watchdog = ToolFailureWatchdog::default();
+        let input = serde_json::json!({"command": "make build"});
+        for id in ["b1", "b2"] {
+            watchdog.push(
+                TurnItemKind::ToolCall,
+                Some("Bash"),
+                &tool_call(id, "Bash", input.clone()),
+            );
+            let action = watchdog.push(
+                TurnItemKind::ToolResult,
+                None,
+                &tool_result(id, true, "failed"),
+            );
+            assert_eq!(
+                action,
+                if id == "b2" {
+                    ToolFailureAction::Warn
+                } else {
+                    ToolFailureAction::None
+                }
+            );
+        }
+
+        watchdog.push(
+            TurnItemKind::ToolCall,
+            Some("Bash"),
+            &tool_call("ok", "Bash", input.clone()),
+        );
+        assert_eq!(
+            watchdog.push(
+                TurnItemKind::ToolResult,
+                None,
+                &tool_result("ok", false, "success")
+            ),
+            ToolFailureAction::None
+        );
+        for id in ["b3", "b4"] {
+            watchdog.push(
+                TurnItemKind::ToolCall,
+                Some("Bash"),
+                &tool_call(id, "Bash", input.clone()),
+            );
+            let action = watchdog.push(
+                TurnItemKind::ToolResult,
+                None,
+                &tool_result(id, true, "failed"),
+            );
+            assert_eq!(
+                action,
+                if id == "b4" {
+                    ToolFailureAction::Warn
+                } else {
+                    ToolFailureAction::None
+                }
+            );
+        }
+
+        for id in ["r2", "r3", "r4"] {
+            watchdog.push(
+                TurnItemKind::ToolCall,
+                Some("Read"),
+                &tool_call(id, "Read", serde_json::json!({"file_path": "x"})),
+            );
+            assert_eq!(
+                watchdog.push(
+                    TurnItemKind::ToolResult,
+                    None,
+                    &tool_result(id, true, "failed")
+                ),
+                ToolFailureAction::None
+            );
+        }
+    }
 
     #[test]
     fn detects_the_eighth_trimmed_line_without_a_final_newline() {

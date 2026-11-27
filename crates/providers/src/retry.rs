@@ -13,6 +13,7 @@ pub const MAX_RETRY_AFTER_SECS: u64 = 120;
 pub const MAX_CAPACITY_RETRIES: u32 = 2;
 
 const CAPACITY_RETRY_BASE_SECS: [u64; MAX_CAPACITY_RETRIES as usize] = [5, 20];
+pub(crate) const TOOL_FAILURE_LOOP_ERROR_CODE: &str = "tool_failure_loop";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureClass {
@@ -21,6 +22,7 @@ pub enum FailureClass {
     Auth,
     ProviderError,
     HarnessError,
+    ToolFailureLoop,
 }
 
 impl FailureClass {
@@ -31,6 +33,7 @@ impl FailureClass {
             Self::Auth => "auth",
             Self::ProviderError => "provider_error",
             Self::HarnessError => "harness_error",
+            Self::ToolFailureLoop => "tool_failure_loop",
         }
     }
 }
@@ -41,6 +44,9 @@ pub fn classify_provider_failure(
     message: &str,
     error_code: Option<&str>,
 ) -> FailureClass {
+    if error_code == Some(TOOL_FAILURE_LOOP_ERROR_CODE) {
+        return FailureClass::ToolFailureLoop;
+    }
     let normalized = format!(
         "{} {}",
         normalize(error_code.unwrap_or_default()),
@@ -121,6 +127,7 @@ pub fn format_delegated_error(provider: ProviderId, model: &str, run_error: &str
         FailureClass::Auth,
         FailureClass::ProviderError,
         FailureClass::HarnessError,
+        FailureClass::ToolFailureLoop,
     ]
     .into_iter()
     .find_map(|class| {
@@ -443,6 +450,14 @@ mod tests {
 
     #[test]
     fn classifies_provider_error_shapes_and_formats_run_errors() {
+        assert_eq!(
+            classify_provider_failure(
+                ProviderId::Claude,
+                "same tool call failed repeatedly",
+                Some(TOOL_FAILURE_LOOP_ERROR_CODE)
+            ),
+            FailureClass::ToolFailureLoop
+        );
         assert_eq!(
             classify_rate_limit(
                 ProviderId::Claude,
