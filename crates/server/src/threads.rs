@@ -1520,6 +1520,7 @@ mod tests {
                 server_url: "http://127.0.0.1:0".into(),
                 internal_token: "token".into(),
                 thread_id: Uuid::nil(),
+                cua_binary_path: None,
             },
         );
         (root, repo, coordinator, project)

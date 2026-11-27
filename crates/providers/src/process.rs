@@ -1212,6 +1212,7 @@ exit 7
             server_url: "http://127.0.0.1:3780".into(),
             internal_token: "fixture-token".into(),
             thread_id: req.thread_id,
+            cua_binary_path: None,
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
         driver.run_turn(req, tx).await.unwrap();

@@ -269,18 +269,26 @@ fn claude_args(cmd: &mut Command, req: &TurnRequest) -> Input {
     }
     if let Some(spec) = &req.mcp_injection {
         cmd.env("T3_MCP_TOKEN", &spec.internal_token);
-        cmd.arg("--mcp-config").arg(
+        let mut servers = serde_json::Map::new();
+        servers.insert(
+            "t3rs".into(),
             json!({
-                "mcpServers": {
-                    "t3rs": {
-                        "command": spec.binary_path.to_string_lossy(),
-                        "args": mcp_args(spec),
-                        "env": { "T3_MCP_TOKEN": "${T3_MCP_TOKEN}" },
-                    }
-                }
-            })
-            .to_string(),
+                "command": spec.binary_path.to_string_lossy(),
+                "args": mcp_args(spec),
+                "env": { "T3_MCP_TOKEN": "${T3_MCP_TOKEN}" },
+            }),
         );
+        if let Some(cua_bin) = &spec.cua_binary_path {
+            servers.insert(
+                "swiftcua".into(),
+                json!({
+                    "command": cua_bin.to_string_lossy(),
+                    "args": ["mcp"],
+                }),
+            );
+        }
+        cmd.arg("--mcp-config")
+            .arg(json!({ "mcpServers": servers }).to_string());
     }
     let content = match req.claude_slash_context.as_deref() {
         Some(context) if !context.is_empty() || !req.attachments.is_empty() => {
@@ -373,6 +381,17 @@ fn codex_args(cmd: &mut Command, req: &TurnRequest) -> Input {
             "-c",
             r#"mcp_servers.t3rs.env_vars=["T3_MCP_TOKEN"]"#,
         ]);
+        if let Some(cua_bin) = &spec.cua_binary_path {
+            cmd.args([
+                "-c",
+                &format!(
+                    "mcp_servers.swiftcua.command={}",
+                    json!(cua_bin.to_string_lossy())
+                ),
+                "-c",
+                r#"mcp_servers.swiftcua.args=["mcp"]"#,
+            ]);
+        }
     }
     cmd.arg("-");
     Input::Text(prompt_with_paths(&req.prompt, &req.attachments, true))
@@ -437,21 +456,27 @@ fn opencode_args(cmd: &mut Command, req: &TurnRequest) -> Input {
         let mut cmd_vec = vec![spec.binary_path.to_string_lossy().into_owned()];
         cmd_vec.extend(mcp_args(spec));
         cmd.env("T3_MCP_TOKEN", &spec.internal_token);
-        cmd.env(
-            "OPENCODE_CONFIG_CONTENT",
+        let mut mcp = serde_json::Map::new();
+        mcp.insert(
+            "t3rs".into(),
             json!({
-                "mcp": {
-                    "t3rs": {
-                        "type": "local",
-                        "command": cmd_vec,
-                        "environment": {
-                            "T3_MCP_TOKEN": "{env:T3_MCP_TOKEN}",
-                        },
-                    }
-                }
-            })
-            .to_string(),
+                "type": "local",
+                "command": cmd_vec,
+                "environment": {
+                    "T3_MCP_TOKEN": "{env:T3_MCP_TOKEN}",
+                },
+            }),
         );
+        if let Some(cua_bin) = &spec.cua_binary_path {
+            mcp.insert(
+                "swiftcua".into(),
+                json!({
+                    "type": "local",
+                    "command": [cua_bin.to_string_lossy(), "mcp"],
+                }),
+            );
+        }
+        cmd.env("OPENCODE_CONFIG_CONTENT", json!({ "mcp": mcp }).to_string());
     }
     cmd.args(["--", &req.prompt]);
     Input::None
@@ -513,6 +538,7 @@ mod tests {
             server_url: "http://127.0.0.1:3780".into(),
             internal_token: "fixture-token".into(),
             thread_id: Uuid::nil(),
+            cua_binary_path: None,
         });
         req
     }
@@ -1052,5 +1078,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn swiftcua_mcp_is_injected_when_cua_binary_path_is_set() {
+        let mut req = request(ProviderId::Claude);
+        req.mcp_injection.as_mut().unwrap().cua_binary_path = Some(PathBuf::from(
+            "/Applications/SwiftCUA.app/Contents/MacOS/cua",
+        ));
+
+        let mut claude_cmd = Command::new("claude");
+        claude_args(&mut claude_cmd, &req);
+        let claude_args_vec = args(&claude_cmd);
+        let idx = claude_args_vec
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .unwrap();
+        let mcp: serde_json::Value = serde_json::from_str(&claude_args_vec[idx + 1]).unwrap();
+        assert_eq!(
+            mcp["mcpServers"]["swiftcua"],
+            json!({
+                "command": "/Applications/SwiftCUA.app/Contents/MacOS/cua",
+                "args": ["mcp"],
+            })
+        );
+
+        let mut codex_cmd = Command::new("codex");
+        codex_args(&mut codex_cmd, &req);
+        let codex_args_vec = args(&codex_cmd);
+        assert!(
+            codex_args_vec.contains(
+                &r#"mcp_servers.swiftcua.command="/Applications/SwiftCUA.app/Contents/MacOS/cua""#
+                    .to_owned()
+            )
+        );
+        assert!(codex_args_vec.contains(&r#"mcp_servers.swiftcua.args=["mcp"]"#.to_owned()));
+
+        let mut opencode_cmd = Command::new("opencode");
+        opencode_args(&mut opencode_cmd, &req);
+        let oc_env = opencode_cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == "OPENCODE_CONFIG_CONTENT")
+            .and_then(|(_, v)| v)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let oc_json: serde_json::Value = serde_json::from_str(&oc_env).unwrap();
+        assert_eq!(
+            oc_json["mcp"]["swiftcua"],
+            json!({
+                "type": "local",
+                "command": ["/Applications/SwiftCUA.app/Contents/MacOS/cua", "mcp"],
+            })
+        );
     }
 }

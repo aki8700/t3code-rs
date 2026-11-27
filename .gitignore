@@ -6,3 +6,6 @@
 .DS_Store
 .env
 .t3-rs/
+/swift-cua/.build*
+/swift-cua/build/
+/swift-cua/.devhome/

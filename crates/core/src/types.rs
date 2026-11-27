@@ -617,6 +617,8 @@ pub struct McpInjectionSpec {
     pub server_url: String,
     pub internal_token: String,
     pub thread_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cua_binary_path: Option<PathBuf>,
 }
 
 #[cfg(test)]

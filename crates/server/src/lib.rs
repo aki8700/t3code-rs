@@ -78,6 +78,10 @@ impl ServerState {
             server_url,
             internal_token: String::new(),
             thread_id: Uuid::nil(),
+            cua_binary_path: config
+                .computer_use_enabled
+                .then(|| config.resolved_cua_bin())
+                .flatten(),
         };
         let limits_cache = Arc::new(limits::UsageLimitsCache::default());
         let coordinator = RunCoordinator::with_tokens_and_limits(

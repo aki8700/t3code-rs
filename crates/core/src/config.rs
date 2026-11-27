@@ -60,6 +60,9 @@ pub struct ProviderBinaryConfig {
     /// Optional override endpoints for Antigravity quota probe (primarily for tests).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub antigravity_quota_endpoints: Option<Vec<String>>,
+    /// Optional path to the SwiftCUA `cua` CLI binary for macOS Computer Use MCP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cua_bin: Option<PathBuf>,
 }
 
 impl Default for ProviderBinaryConfig {
@@ -71,6 +74,7 @@ impl Default for ProviderBinaryConfig {
             opencode_bin: PathBuf::from("/opt/homebrew/bin/opencode"),
             antigravity_data_dir: None,
             antigravity_quota_endpoints: None,
+            cua_bin: None,
         }
     }
 }
@@ -244,6 +248,9 @@ pub struct ServerConfig {
     /// Opt-in per-run env injection for a pre-registered Antigravity (`agy`) MCP entry.
     #[serde(default)]
     pub antigravity_mcp_enabled: bool,
+    /// Opt-in SwiftCUA macOS Computer Use MCP injection (`cua mcp`) for supported providers.
+    #[serde(default)]
+    pub computer_use_enabled: bool,
 }
 
 impl Default for ServerConfig {
@@ -273,6 +280,7 @@ impl Default for ServerConfig {
             fallback_models: Vec::new(),
             verify_max_auto_fixes: default_verify_max_auto_fixes(),
             antigravity_mcp_enabled: false,
+            computer_use_enabled: false,
         }
     }
 }
@@ -323,6 +331,16 @@ impl ServerConfig {
             .antigravity_data_dir
             .clone()
             .unwrap_or_else(|| self.data_dir.join("providers").join("antigravity"))
+    }
+
+    pub fn resolved_cua_bin(&self) -> Option<PathBuf> {
+        if let Some(path) = &self.providers.cua_bin {
+            return Some(path.clone());
+        }
+        let default_path = std::env::var_os("HOME")
+            .map(PathBuf::from)?
+            .join("Applications/SwiftCUA.app/Contents/MacOS/cua");
+        default_path.exists().then_some(default_path)
     }
 
     pub fn is_loopback_host(&self) -> bool {
