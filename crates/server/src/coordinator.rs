@@ -788,10 +788,18 @@ impl RunCoordinator {
     }
 
     pub async fn resume_queued_runs(&self) -> CoreResult<()> {
+        self.resume_queued_runs_excluding(&std::collections::HashSet::new())
+            .await
+    }
+
+    pub(crate) async fn resume_queued_runs_excluding(
+        &self,
+        excluded_threads: &std::collections::HashSet<Uuid>,
+    ) -> CoreResult<()> {
         let mut active = self.0.active.lock().await;
         self.ensure_accepting_runs()?;
         for id in self.0.store.queued_threads().await? {
-            if !active.contains_key(&id) {
+            if !excluded_threads.contains(&id) && !active.contains_key(&id) {
                 let thread = self.0.store.get_thread(id).await?;
                 if let Some((_, turn)) = self.start_next(&mut active, &thread, None).await? {
                     self.spawn(turn);

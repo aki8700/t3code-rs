@@ -155,7 +155,7 @@ pub async fn serve(config: ServerConfig) -> CoreResult<()> {
     prune_known_project_snapshots(&state.store).await;
     let coordinator = state.coordinator.clone();
     let _daemon_lock = state.daemon_lock.clone();
-    coordinator.resume_queued_runs().await?;
+    resume_queued_runs_after_orphan_cleanup(&coordinator, &state.store).await?;
     let _sleep_guard = sleep_guard::spawn(coordinator.clone());
     let (shutdown, stop) = watch::channel(false);
     let public = axum::serve(
@@ -224,6 +224,20 @@ fn storage_io(error: io::Error) -> CoreError {
 
 fn internal_io(error: io::Error) -> CoreError {
     CoreError::Internal(error.to_string())
+}
+
+async fn resume_queued_runs_after_orphan_cleanup(
+    coordinator: &RunCoordinator,
+    store: &SqliteStore,
+) -> CoreResult<()> {
+    let pending_threads = store
+        .threads_with_pending_orphan_processes()
+        .await?
+        .into_iter()
+        .collect();
+    coordinator
+        .resume_queued_runs_excluding(&pending_threads)
+        .await
 }
 
 #[cfg(all(test, unix))]
@@ -400,5 +414,141 @@ mod startup_tests {
                 .is_empty()
         );
         assert!(!waiter.join().unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn unresolved_orphan_holds_back_only_its_thread_from_auto_resume() {
+        let dir = TempDir::new();
+        let config = ServerConfig {
+            data_dir: dir.0.join("server"),
+            port: 0,
+            enabled_providers: vec![ProviderId::Mock],
+            ..ServerConfig::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let store = SqliteStore::open(config.db_path(), config.storage.clone()).unwrap();
+        let project = store
+            .create_project("Orphan gate test".into(), dir.0.clone())
+            .await
+            .unwrap();
+        let selection = ModelSelection {
+            provider: ProviderId::Mock,
+            model: "mock".into(),
+            ..ModelSelection::default()
+        };
+        let now = Utc::now();
+        let mut thread_ids = Vec::new();
+        let mut run_ids = Vec::new();
+
+        for title in ["orphaned", "recoverable"] {
+            let thread_id = Uuid::new_v4();
+            let run_id = Uuid::new_v4();
+            let thread = store
+                .create_thread(Thread {
+                    id: thread_id,
+                    project_id: project.id,
+                    parent_thread_id: None,
+                    relationship: None,
+                    title: title.into(),
+                    model_selection: selection.clone(),
+                    runtime_mode: RuntimeMode::AutoAcceptEdits,
+                    interaction_mode: InteractionMode::Plan,
+                    status: ThreadStatus::Idle,
+                    worktree_path: None,
+                    branch: None,
+                    provider_session_id: None,
+                    archived: false,
+                    pinned: false,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await
+                .unwrap();
+            store
+                .enqueue_run(
+                    Run {
+                        id: run_id,
+                        thread_id,
+                        ordinal: 1,
+                        provider: ProviderId::Mock,
+                        model: "mock".into(),
+                        effort: None,
+                        status: RunStatus::Queued,
+                        prompt: "queued".into(),
+                        provider_session_id: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
+                        reasoning_tokens: None,
+                        duration_ms: None,
+                        error_message: None,
+                        started_at: now,
+                        completed_at: None,
+                    },
+                    NewTurnItem {
+                        thread_id,
+                        run_id,
+                        kind: TurnItemKind::UserMessage,
+                        summary: None,
+                        payload: serde_json::json!({"text": "queued"}),
+                        searchable_text: None,
+                    },
+                    QueuedRunInput {
+                        model_selection: selection.clone(),
+                        attachment_ids: Vec::new(),
+                        notify_parent: false,
+                        wake_depth: 0,
+                        mode_ceiling: None,
+                        verify_fix_depth: 0,
+                        last_verify_signature: None,
+                        verify_dead_ends: Vec::new(),
+                        fallback_attempts: 0,
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .start_queued_run(run_id, selection.clone(), None)
+                .await
+                .unwrap();
+            store
+                .update_thread_session_id(thread_id, format!("{title}-session"))
+                .await
+                .unwrap();
+            if title == "orphaned" {
+                store
+                    .record_orphan_process(run_id, 999_999, "old-process-start".into())
+                    .await
+                    .unwrap();
+            }
+            thread_ids.push(thread.id);
+            run_ids.push(run_id);
+        }
+
+        let recovered = store.recover_interrupted_runs().unwrap();
+        assert_eq!(recovered.resumed.len(), 2);
+        assert_eq!(recovered.orphan_processes.len(), 1);
+        drop(store);
+
+        let state = ServerState::new(config, "http://127.0.0.1".into()).unwrap();
+        resume_queued_runs_after_orphan_cleanup(&state.coordinator, &state.store)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.store.list_queued_runs(thread_ids[0]).await.unwrap()[0].id,
+            run_ids[0],
+            "the thread with a pending orphan process must remain queued"
+        );
+        assert!(
+            state
+                .store
+                .list_queued_runs(thread_ids[1])
+                .await
+                .unwrap()
+                .is_empty(),
+            "another recovered thread should still auto-resume"
+        );
     }
 }
