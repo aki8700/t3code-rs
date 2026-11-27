@@ -37,6 +37,15 @@ pub struct RecoveredRuns {
     /// Runs put back in the queue to resume their provider session.
     pub resumed: Vec<Uuid>,
     pub cancelled: Vec<Uuid>,
+    /// Provider process groups still requiring restart cleanup.
+    pub orphan_processes: Vec<OrphanProcess>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanProcess {
+    pub run_id: Uuid,
+    pub process_group_id: i32,
+    pub start_time: String,
 }
 
 const MIGRATIONS: &[&str] = &[
@@ -46,6 +55,13 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE runs ADD COLUMN cache_creation_tokens INTEGER",
     "ALTER TABLE runs ADD COLUMN reasoning_tokens INTEGER",
     "ALTER TABLE runs ADD COLUMN restart_resumes INTEGER NOT NULL DEFAULT 0",
+    "CREATE TABLE IF NOT EXISTS run_orphan_processes (
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        process_group_id INTEGER NOT NULL,
+        start_time TEXT NOT NULL,
+        cleanup_pending INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (run_id, process_group_id, start_time)
+    )",
 ];
 
 const PREVIEW_BYTES: usize = 64 * 1024;
@@ -209,6 +225,68 @@ impl Drop for WalCheckpoint {
 }
 
 impl SqliteStore {
+    /// Saves the process identity as soon as a provider CLI starts.
+    pub async fn record_orphan_process(
+        &self,
+        run_id: Uuid,
+        process_group_id: i32,
+        start_time: String,
+    ) -> CoreResult<()> {
+        self.with_writer(move |connection| {
+            connection
+                .execute(
+                    "INSERT INTO run_orphan_processes (run_id, process_group_id, start_time)
+                 SELECT ?1, ?2, ?3 WHERE EXISTS (
+                    SELECT 1 FROM runs WHERE id = ?1 AND status IN (?4, ?5)
+                 ) ON CONFLICT(run_id, process_group_id, start_time) DO NOTHING",
+                    params![
+                        run_id.to_string(),
+                        process_group_id,
+                        start_time,
+                        encode(&RunStatus::Running)?,
+                        encode(&RunStatus::RateLimited)?
+                    ],
+                )
+                .map_err(storage_error)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Clears a cleanup request only after the recorded process group is confirmed gone.
+    pub async fn clear_orphan_cleanup(&self, process: OrphanProcess) -> CoreResult<()> {
+        self.with_writer(move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM run_orphan_processes
+                     WHERE run_id = ?1 AND process_group_id = ?2 AND start_time = ?3
+                        AND cleanup_pending = 1",
+                    params![
+                        process.run_id.to_string(),
+                        process.process_group_id,
+                        process.start_time
+                    ],
+                )
+                .map_err(storage_error)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Removes process identities after a provider run has completed and cleaned up its groups.
+    pub async fn clear_run_orphan_processes(&self, run_id: Uuid) -> CoreResult<()> {
+        self.with_writer(move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM run_orphan_processes WHERE run_id = ?1 AND cleanup_pending = 0",
+                    [run_id.to_string()],
+                )
+                .map_err(storage_error)?;
+            Ok(())
+        })
+        .await
+    }
+
     pub fn open(db_path: impl AsRef<Path>, storage_cfg: StorageConfig) -> CoreResult<Self> {
         let db_path = std::path::absolute(db_path.as_ref()).map_err(storage_error)?;
         #[cfg(unix)]
@@ -394,6 +472,12 @@ impl SqliteStore {
         )?;
         let mut recovered = RecoveredRuns::default();
         for (run_id, thread_id, session) in in_flight {
+            transaction
+                .execute(
+                    "UPDATE run_orphan_processes SET cleanup_pending = 1 WHERE run_id = ?1",
+                    [run_id.to_string()],
+                )
+                .map_err(storage_error)?;
             if let Some(session) = session {
                 transaction
                     .execute(
@@ -450,6 +534,19 @@ impl SqliteStore {
             "UPDATE swarm_members SET state = 'waiting' WHERE role = 'worker' AND state = 'working'",
             [],
         ).map_err(storage_error)?;
+        recovered.orphan_processes = query_all(
+            &transaction,
+            "SELECT run_id, process_group_id, start_time FROM run_orphan_processes
+             WHERE cleanup_pending = 1 ORDER BY run_id, process_group_id",
+            [],
+            |row| {
+                Ok(OrphanProcess {
+                    run_id: parse(row, 0)?,
+                    process_group_id: row.get(1)?,
+                    start_time: row.get(2)?,
+                })
+            },
+        )?;
         transaction.commit().map_err(storage_error)?;
         if !recovered.resumed.is_empty() || !recovered.cancelled.is_empty() {
             tracing::info!(

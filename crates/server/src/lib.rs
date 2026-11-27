@@ -32,7 +32,7 @@ use std::{
 use t3_core::{CoreError, CoreResult, McpInjectionSpec, ServerConfig, Store, create_private_dir};
 use t3_git::GitManager;
 use t3_mcp::McpServer;
-use t3_store::{DaemonLock, SqliteStore, acquire_daemon_lock};
+use t3_store::{DaemonLock, RecoveredRuns, SqliteStore, acquire_daemon_lock};
 use tokio::{net::TcpListener, sync::watch};
 use uuid::Uuid;
 
@@ -61,12 +61,17 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn new(config: ServerConfig, server_url: String) -> CoreResult<Self> {
+        Self::recover(config, server_url).map(|(state, _)| state)
+    }
+
+    /// Like `new`, also returning the runs the previous server left in flight.
+    fn recover(config: ServerConfig, server_url: String) -> CoreResult<(Self, RecoveredRuns)> {
         let tokens = auth::McpTokens::default();
         let auth = AuthLayer::new(&config, tokens.clone())?;
         create_private_dir(&config.data_dir).map_err(storage_io)?;
         let daemon_lock = Arc::new(acquire_daemon_lock(&config.data_dir)?);
         let store = SqliteStore::open(config.db_path(), config.storage.clone())?;
-        store.recover_interrupted_runs()?;
+        let recovered = store.recover_interrupted_runs()?;
         let settings = settings::SettingsStore::load_or_init(&config);
         let injection = McpInjectionSpec {
             binary_path: std::env::current_exe().map_err(internal_io)?,
@@ -83,7 +88,7 @@ impl ServerState {
             limits_cache.clone(),
             settings.clone(),
         );
-        Ok(Self {
+        let state = Self {
             mcp: Arc::new(McpServer::new(coordinator.clone())),
             coordinator,
             daemon_lock,
@@ -95,7 +100,8 @@ impl ServerState {
             usage_cache: Arc::new(Mutex::new(usage::UsageScanCache::default())),
             limits_cache,
             shells: shell::ActiveShells::default(),
-        })
+        };
+        Ok((state, recovered))
     }
 }
 
@@ -136,7 +142,12 @@ pub async fn serve(config: ServerConfig) -> CoreResult<()> {
         .transpose()
         .map_err(internal_io)?
         .unwrap_or(public_address);
-    let state = ServerState::new(config, format!("http://{mcp_address}"))?;
+    let (state, recovered) = ServerState::recover(config, format!("http://{mcp_address}"))?;
+    // Keep cleanup targets persisted until process-group termination is confirmed.
+    let stopped = resume::stop_orphaned_processes(recovered.orphan_processes).await;
+    for process in stopped {
+        state.store.clear_orphan_cleanup(process).await?;
+    }
     prune_known_project_snapshots(&state.store).await;
     let coordinator = state.coordinator.clone();
     let _daemon_lock = state.daemon_lock.clone();
@@ -209,4 +220,181 @@ fn storage_io(error: io::Error) -> CoreError {
 
 fn internal_io(error: io::Error) -> CoreError {
     CoreError::Internal(error.to_string())
+}
+
+#[cfg(all(test, unix))]
+mod startup_tests {
+    use super::*;
+    use chrono::Utc;
+    use std::{os::unix::process::CommandExt, path::PathBuf};
+    use t3_core::{
+        InteractionMode, ModelSelection, NewTurnItem, ProviderId, Run, RunStatus, RuntimeMode,
+        Store, Thread, ThreadStatus, TurnItemKind,
+    };
+    use t3_store::QueuedRunInput;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("t3-startup-test-{}", Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_retries_pending_cleanup_after_crash_before_process_stop() {
+        let dir = TempDir::new();
+        let config = ServerConfig {
+            data_dir: dir.0.join("server"),
+            port: 0,
+            enabled_providers: vec![ProviderId::Mock],
+            ..ServerConfig::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let store = SqliteStore::open(config.db_path(), config.storage.clone()).unwrap();
+        let project = store
+            .create_project("Restart test".into(), dir.0.clone())
+            .await
+            .unwrap();
+        let selection = ModelSelection {
+            provider: ProviderId::Mock,
+            model: "mock".into(),
+            ..ModelSelection::default()
+        };
+        let now = Utc::now();
+        let thread = store
+            .create_thread(Thread {
+                id: Uuid::new_v4(),
+                project_id: project.id,
+                parent_thread_id: None,
+                relationship: None,
+                title: "Restart test".into(),
+                model_selection: selection.clone(),
+                runtime_mode: RuntimeMode::AutoAcceptEdits,
+                interaction_mode: InteractionMode::Plan,
+                status: ThreadStatus::Idle,
+                worktree_path: None,
+                branch: None,
+                provider_session_id: None,
+                archived: false,
+                pinned: false,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let run = Run {
+            id: Uuid::new_v4(),
+            thread_id: thread.id,
+            ordinal: 1,
+            provider: ProviderId::Mock,
+            model: "mock".into(),
+            effort: None,
+            status: RunStatus::Queued,
+            prompt: "queued".into(),
+            provider_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
+            duration_ms: None,
+            error_message: None,
+            started_at: now,
+            completed_at: None,
+        };
+        let run_id = run.id;
+        let _ = store
+            .enqueue_run(
+                run,
+                NewTurnItem {
+                    thread_id: thread.id,
+                    run_id,
+                    kind: TurnItemKind::UserMessage,
+                    summary: None,
+                    payload: serde_json::json!({"text": "queued"}),
+                    searchable_text: None,
+                },
+                QueuedRunInput {
+                    model_selection: selection.clone(),
+                    attachment_ids: Vec::new(),
+                    notify_parent: false,
+                    wake_depth: 0,
+                    mode_ceiling: None,
+                    verify_fix_depth: 0,
+                    last_verify_signature: None,
+                    verify_dead_ends: Vec::new(),
+                    fallback_attempts: 0,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .start_queued_run(run_id, selection.clone(), None)
+            .await
+            .unwrap();
+        store
+            .update_thread_session_id(thread.id, "session-1".into())
+            .await
+            .unwrap();
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30; :"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let waiter = std::thread::spawn(move || {
+            let mut child = child;
+            child.wait().unwrap()
+        });
+        store
+            .record_orphan_process(run_id, child_pid as i32, "Fri Nov 27 13:34:00 2026".into())
+            .await
+            .unwrap();
+        let first_startup = store.recover_interrupted_runs().unwrap();
+        assert_eq!(first_startup.resumed, vec![run_id]);
+        assert_eq!(first_startup.orphan_processes.len(), 1);
+        drop(store); // Simulate a crash after DB recovery but before process cleanup.
+
+        let store = SqliteStore::open(config.db_path(), config.storage).unwrap();
+        let next_startup = store.recover_interrupted_runs().unwrap();
+        assert_eq!(
+            next_startup.orphan_processes,
+            first_startup.orphan_processes
+        );
+        let target = &next_startup.orphan_processes[0];
+        let snapshot = format!(
+            "{} {} {} {}",
+            child_pid,
+            child_pid,
+            unsafe { libc::getuid() },
+            target.start_time
+        );
+        let stopped = resume::stop_orphaned_processes_from_snapshot(
+            next_startup.orphan_processes.clone(),
+            &snapshot,
+        )
+        .await;
+        assert_eq!(stopped, next_startup.orphan_processes);
+        store
+            .clear_orphan_cleanup(stopped[0].clone())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .recover_interrupted_runs()
+                .unwrap()
+                .orphan_processes
+                .is_empty()
+        );
+        assert!(!waiter.join().unwrap().success());
+    }
 }

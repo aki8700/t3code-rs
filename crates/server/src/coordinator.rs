@@ -938,7 +938,6 @@ impl RunCoordinator {
         let restarted = queued.restart_session.is_some();
         let previous_run = store.previous_run(thread.id, run_id).await?;
         let resume_session_id = if let Some(session) = queued.restart_session {
-            crate::resume::stop_orphaned_processes(thread.id).await;
             if !self
                 .session_resumable(selection.provider, &workspace_dir, &session)
                 .await
@@ -1422,6 +1421,12 @@ impl RunCoordinator {
             }
         };
         drop(mcp_token);
+        // The provider worker has returned, so its attempt groups have gone through the
+        // driver's process cleanup. Rows from retries and terminal failures are no longer
+        // restart cleanup targets either.
+        if let Err(error) = self.0.store.clear_run_orphan_processes(run_id).await {
+            tracing::warn!(%error, %run_id, "Could not clear finished provider process tracking");
+        }
 
         struct VerifyFailure {
             command: String,
@@ -2067,6 +2072,16 @@ impl RunCoordinator {
         out: &mut Outcome,
     ) -> CoreResult<()> {
         match event {
+            #[cfg(unix)]
+            StreamEvent::ProcessStarted {
+                process_group_id,
+                start_time,
+            } => {
+                self.0
+                    .store
+                    .record_orphan_process(run_id, process_group_id, start_time)
+                    .await?;
+            }
             StreamEvent::SessionStarted {
                 provider_session_id,
             } => {
