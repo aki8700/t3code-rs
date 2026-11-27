@@ -1411,6 +1411,20 @@ fn every_added_column_in_projects_and_runs_has_a_migration_and_matches_fresh_sch
     {
         let conn = rusqlite::Connection::open(&legacy_path).unwrap();
         for (table, col) in &migrated_pairs {
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 AND sql LIKE ?2")
+                .unwrap();
+            let indexes: Vec<String> = stmt
+                .query_map(rusqlite::params![table, format!("%{col}%")], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for idx in indexes {
+                conn.execute_batch(&format!("DROP INDEX IF EXISTS {idx}"))
+                    .unwrap();
+            }
             conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {col}"))
                 .unwrap();
         }

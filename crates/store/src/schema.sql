@@ -177,11 +177,25 @@ CREATE TABLE IF NOT EXISTS swarm_messages (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     board_id TEXT NOT NULL REFERENCES swarm_boards(id) ON DELETE CASCADE,
     sender TEXT NOT NULL,
+    sender_run_id TEXT,
     text TEXT NOT NULL,
     mentions_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS swarm_messages_board_seq ON swarm_messages(board_id, seq);
+
+CREATE TABLE IF NOT EXISTS swarm_wake_deliveries (
+    thread_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    from_seq INTEGER NOT NULL,
+    to_seq INTEGER NOT NULL,
+    redeliveries INTEGER NOT NULL DEFAULT 0,
+    wake_depth INTEGER NOT NULL DEFAULT 0,
+    mode_ceiling_json TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (thread_id, run_id, from_seq, to_seq)
+);
+CREATE INDEX IF NOT EXISTS swarm_wake_deliveries_thread ON swarm_wake_deliveries(thread_id);
 
 CREATE TABLE IF NOT EXISTS thread_context (
     thread_id TEXT PRIMARY KEY NOT NULL REFERENCES threads(id) ON DELETE CASCADE,

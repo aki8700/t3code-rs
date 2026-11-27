@@ -1037,7 +1037,15 @@ impl RunCoordinator {
         let swarm = self
             .get_board(thread.id)
             .await?
-            .map(|board| SwarmTurn::prepare(&board, thread.id, selection.provider, &mut prompt))
+            .map(|board| {
+                SwarmTurn::prepare(
+                    &board,
+                    thread.id,
+                    selection.provider,
+                    resume_session_id.is_some(),
+                    &mut prompt,
+                )
+            })
             .transpose()?;
         let live = self.0.settings.get();
         let enable_mcp = if selection.provider == ProviderId::Antigravity {
@@ -1965,6 +1973,7 @@ impl RunCoordinator {
                 .notify_worker_ended_silently(
                     &mut active,
                     thread_id,
+                    run_id,
                     run_started_at,
                     status,
                     error.as_deref(),

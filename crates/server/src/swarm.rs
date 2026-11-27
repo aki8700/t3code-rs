@@ -8,6 +8,7 @@ use std::{collections::HashMap, fmt::Write, path::Path};
 use t3_core::*;
 use t3_mcp::{SwarmPostResult, SwarmReadMessage};
 use t3_providers::{ProviderRegistry, format_delegated_error};
+use t3_store::SwarmWakeDeliveryRow;
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -22,10 +23,10 @@ const READ_MESSAGE_MAX_CHARS: usize = 2_000;
 /// Board posts `(from, to]` handed to a run that has not finished yet, per member thread.
 /// The member's `last_read_seq` advances only when that run completes, so a failed or
 /// cancelled run leaves its posts unread for the next wake (at-least-once delivery).
-/// Lost on restart, which can only cause a duplicate delivery.
+/// Mirrored to SQLite (`swarm_wake_deliveries`) so restarts recover pending deliveries.
 pub(crate) type WakeDeliveries = std::sync::Mutex<HashMap<Uuid, Vec<WakeDelivery>>>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WakeDelivery {
     run_id: Uuid,
     from: i64,
@@ -33,6 +34,48 @@ pub(crate) struct WakeDelivery {
     redeliveries: u8,
     wake_depth: u8,
     mode_ceiling: Option<(RuntimeMode, InteractionMode)>,
+}
+
+impl WakeDelivery {
+    fn to_row(self, thread_id: Uuid) -> SwarmWakeDeliveryRow {
+        SwarmWakeDeliveryRow {
+            thread_id,
+            run_id: self.run_id,
+            from_seq: self.from,
+            to_seq: self.to,
+            redeliveries: self.redeliveries,
+            wake_depth: self.wake_depth,
+            mode_ceiling: self.mode_ceiling,
+        }
+    }
+
+    fn from_row(row: SwarmWakeDeliveryRow) -> Self {
+        Self {
+            run_id: row.run_id,
+            from: row.from_seq,
+            to: row.to_seq,
+            redeliveries: row.redeliveries,
+            wake_depth: row.wake_depth,
+            mode_ceiling: row.mode_ceiling,
+        }
+    }
+}
+
+fn append_live_members(out: &mut String, board: &SwarmBoardSnapshot) {
+    out.push_str("Members: ");
+    let mut first = true;
+    for member in board
+        .members
+        .iter()
+        .filter(|member| member.state != "killed")
+    {
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        write!(out, "{} ({})", member.name, member.state).expect("write to String");
+    }
+    out.push('\n');
 }
 
 pub(crate) fn is_swarm_command(prompt: &str) -> bool {
@@ -59,9 +102,20 @@ impl SwarmTurn {
         board: &SwarmBoardSnapshot,
         thread_id: Uuid,
         provider: ProviderId,
+        resumed: bool,
         prompt: &mut String,
     ) -> CoreResult<Self> {
         let member = live_member(board, thread_id)?;
+        let marker =
+            (provider != ProviderId::Mock).then(|| format!("T3_SWARM_ACTION {}", board.board_id));
+        if resumed {
+            let mut instructions = format!("Swarm board {} ({}).\n", board.board_id, member.name);
+            if marker.is_some() {
+                append_live_members(&mut instructions, board);
+            }
+            *prompt = format!("{prompt}\n\n{instructions}");
+            return Ok(Self { marker });
+        }
         let coordinator = member.role == "coordinator";
         let report = format!(
             "Work on the assigned brief. When finished or blocked, call swarm_post_message once with text starting with @coordinator [done] followed by result:, verified: (commands run and their outcome, or not verified), blockers: and files:. Send one post within the limit of {MAX_MESSAGE_BYTES} bytes (about 1300 Japanese characters); write longer details to a file and list its path. End your turn after posting. Reply to subsequent updates only when you have new information."
@@ -70,8 +124,6 @@ impl SwarmTurn {
             "Coordinate work using swarm_status, swarm_add_worker, swarm_post_message, swarm_read_board and swarm_kill_worker. Run independent slices in parallel with separate worker contexts. Each brief states the objective, the output expected, boundaries (files or scope the worker owns), an effort budget and a stop condition. When a worker ends without reporting or repeats a result, change the brief or model, or stop it, instead of resending the same request. Keep passed work frozen, and escalate no-undo merges (migrations/secrets/deploy) to the human. Mentions wake the named member. After assigning work, end your turn and wait for results addressed to @coordinator. Each brief and post has a limit of {MAX_MESSAGE_BYTES} bytes (about 1300 Japanese characters); put a longer brief in a file and send its path."
         );
         let instructions = if coordinator { lead } else { report };
-        let marker =
-            (provider != ProviderId::Mock).then(|| format!("T3_SWARM_ACTION {}", board.board_id));
         let mut instructions = format!(
             "Swarm board {}. You are {}.\n{instructions}\n",
             board.board_id, member.name
@@ -88,17 +140,7 @@ impl SwarmTurn {
             for example in examples.lines() {
                 writeln!(instructions, "{marker} {example}").expect("write to String");
             }
-            instructions.push_str("Members: ");
-            for member in board
-                .members
-                .iter()
-                .filter(|member| member.state != "killed")
-            {
-                write!(instructions, "{} ({}), ", member.name, member.state)
-                    .expect("write to String");
-            }
-            instructions.truncate(instructions.len() - 2);
-            instructions.push('\n');
+            append_live_members(&mut instructions, board);
         }
         *prompt = format!("{prompt}\n\n{instructions}");
         Ok(Self { marker })
@@ -293,7 +335,8 @@ impl RunCoordinator {
                     wake_depth: depth + 1,
                     mode_ceiling: None,
                 },
-            );
+            )
+            .await?;
             CoreResult::Ok(())
         }
         .await;
@@ -368,10 +411,21 @@ impl RunCoordinator {
             )
         };
         let mentions = mentions_in(&text);
+        let sender_run_id = if sender_override.is_none() {
+            active.get(&caller_id).map(|run| run.id)
+        } else {
+            None
+        };
         let post = self
             .0
             .store
-            .append_swarm_message(board.board_id, sender.clone(), text, mentions)
+            .append_swarm_message_with_run(
+                board.board_id,
+                sender.clone(),
+                text,
+                mentions,
+                sender_run_id,
+            )
             .await?;
         let board = self.require_board(caller_id).await?;
         self.emit_board(&board);
@@ -504,7 +558,8 @@ impl RunCoordinator {
                                 wake_depth: run.input.wake_depth,
                                 mode_ceiling: run.input.mode_ceiling,
                             },
-                        );
+                        )
+                        .await?;
                         run.id
                     } else {
                         let mut message = queued_message(prompt);
@@ -536,7 +591,8 @@ impl RunCoordinator {
                             wake_depth: depth,
                             mode_ceiling: effective_ceiling,
                         },
-                    );
+                    )
+                    .await?;
                 }
                 woken = true;
             } else {
@@ -560,11 +616,45 @@ impl RunCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn record_delivery(&self, thread_id: Uuid, delivery: WakeDelivery) {
-        self.deliveries()
-            .entry(thread_id)
-            .or_default()
-            .push(delivery);
+    async fn ensure_deliveries_loaded(&self, thread_id: Uuid) -> CoreResult<()> {
+        let needs_load = {
+            let deliveries = self.deliveries();
+            deliveries.get(&thread_id).is_none_or(Vec::is_empty)
+        };
+        if !needs_load {
+            return Ok(());
+        }
+        let rows = self.0.store.list_swarm_wake_deliveries(thread_id).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let loaded: Vec<WakeDelivery> = rows.into_iter().map(WakeDelivery::from_row).collect();
+        let mut deliveries = self.deliveries();
+        let entry = deliveries.entry(thread_id).or_default();
+        if entry.is_empty() {
+            *entry = loaded;
+        }
+        Ok(())
+    }
+
+    async fn record_delivery(&self, thread_id: Uuid, delivery: WakeDelivery) -> CoreResult<()> {
+        self.ensure_deliveries_loaded(thread_id).await?;
+        {
+            let mut deliveries = self.deliveries();
+            let list = deliveries.entry(thread_id).or_default();
+            if let Some(existing) = list.iter_mut().find(|d| {
+                d.run_id == delivery.run_id && d.from == delivery.from && d.to == delivery.to
+            }) {
+                *existing = delivery;
+            } else {
+                list.push(delivery);
+            }
+        }
+        self.0
+            .store
+            .upsert_swarm_wake_delivery(delivery.to_row(thread_id))
+            .await?;
+        Ok(())
     }
 
     /// Keeps the earliest queued wake so coalescing can update it without moving its queue
@@ -575,8 +665,9 @@ impl RunCoordinator {
         active: &HashMap<Uuid, ActiveRun>,
         thread_id: Uuid,
     ) -> CoreResult<((i64, i64), Vec<WakeDelivery>)> {
+        self.ensure_deliveries_loaded(thread_id).await?;
         let running = active.get(&thread_id).map(|run| run.id);
-        let result = {
+        let (running_range, preserved, remaining_rows) = {
             let mut deliveries = self.deliveries();
             let Some(list) = deliveries.get_mut(&thread_id) else {
                 return Ok(((0, 0), Vec::new()));
@@ -594,14 +685,23 @@ impl RunCoordinator {
                 .map(|delivery| delivery.to)
                 .max()
                 .unwrap_or(0);
+            let remaining_rows: Vec<SwarmWakeDeliveryRow> = current
+                .iter()
+                .map(|delivery| delivery.to_row(thread_id))
+                .collect();
             if current.is_empty() {
                 deliveries.remove(&thread_id);
             } else {
                 *list = current;
             }
-            ((running_from, running_to), superseded)
+            ((running_from, running_to), superseded, remaining_rows)
         };
-        let (running_range, preserved) = result;
+        if !preserved.is_empty() {
+            self.0
+                .store
+                .replace_swarm_wake_deliveries(thread_id, remaining_rows)
+                .await?;
+        }
         Ok((running_range, preserved))
     }
 
@@ -631,7 +731,8 @@ impl RunCoordinator {
         run_id: Uuid,
         status: RunStatus,
     ) -> CoreResult<()> {
-        let (delivered, remaining) = {
+        self.ensure_deliveries_loaded(thread_id).await?;
+        let (delivered, remaining, remaining_rows) = {
             let mut deliveries = self.deliveries();
             let Some(list) = deliveries.get_mut(&thread_id) else {
                 return Ok(());
@@ -640,13 +741,23 @@ impl RunCoordinator {
                 .into_iter()
                 .partition::<Vec<_>, _>(|delivery| delivery.run_id == run_id);
             let remaining = rest.clone();
+            let remaining_rows: Vec<SwarmWakeDeliveryRow> = remaining
+                .iter()
+                .map(|delivery| delivery.to_row(thread_id))
+                .collect();
             if rest.is_empty() {
                 deliveries.remove(&thread_id);
             } else {
                 *list = rest;
             }
-            (delivered, remaining)
+            (delivered, remaining, remaining_rows)
         };
+        if !delivered.is_empty() {
+            self.0
+                .store
+                .replace_swarm_wake_deliveries(thread_id, remaining_rows)
+                .await?;
+        }
         if status == RunStatus::Completed {
             for delivery in delivered {
                 self.0
@@ -711,13 +822,14 @@ impl RunCoordinator {
     }
 
     /// Wakes the coordinator when a non-coordinator member's run ends without a board post
-    /// since `run_started_at`, so a coordinator waiting on that worker cannot stall forever.
-    /// The notice is a follow-up queued on the coordinator, so an in-progress coordinator turn
-    /// finishes first and then picks it up.
+    /// for `run_id` or since `run_started_at`, so a coordinator waiting on that worker cannot
+    /// stall forever. The notice is a follow-up queued on the coordinator, so an in-progress
+    /// coordinator turn finishes first and then picks it up.
     pub(crate) async fn notify_worker_ended_silently(
         &self,
         active: &mut HashMap<Uuid, ActiveRun>,
         thread_id: Uuid,
+        run_id: Uuid,
         run_started_at: DateTime<Utc>,
         status: RunStatus,
         error: Option<&str>,
@@ -735,7 +847,9 @@ impl RunCoordinator {
         if member.role == "coordinator"
             || member.state == "killed"
             || self
-                .worker_posted_since(board.board_id, &member.name, run_started_at)
+                .0
+                .store
+                .worker_posted_for_run(board.board_id, &member.name, run_id, run_started_at)
                 .await?
         {
             return Ok(());
@@ -748,34 +862,6 @@ impl RunCoordinator {
         self.post_locked(active, coordinator, Some("system"), text, depth)
             .await?;
         Ok(())
-    }
-
-    /// Pages through the whole board, since the snapshot only holds the most recent messages.
-    async fn worker_posted_since(
-        &self,
-        board_id: Uuid,
-        sender: &str,
-        since: DateTime<Utc>,
-    ) -> CoreResult<bool> {
-        const PAGE: usize = 200;
-        let mut cursor = 0;
-        loop {
-            let page = self
-                .0
-                .store
-                .list_swarm_messages(board_id, cursor, PAGE)
-                .await?;
-            if posted_since(&page, sender, since) {
-                return Ok(true);
-            }
-            let Some(last) = page.last() else {
-                return Ok(false);
-            };
-            if page.len() < PAGE {
-                return Ok(false);
-            }
-            cursor = last.seq;
-        }
     }
 
     pub(crate) async fn read_board(
@@ -1119,6 +1205,7 @@ fn live_worker_count(board: &SwarmBoardSnapshot) -> usize {
         .count()
 }
 
+#[cfg(test)]
 fn posted_since(messages: &[SwarmMessage], sender: &str, since: DateTime<Utc>) -> bool {
     messages
         .iter()
@@ -1269,7 +1356,8 @@ mod tests {
             head_seq: 0,
         };
         let mut prompt = "cached user prompt".to_owned();
-        let turn = SwarmTurn::prepare(&board, thread_id, ProviderId::Codex, &mut prompt).unwrap();
+        let turn =
+            SwarmTurn::prepare(&board, thread_id, ProviderId::Codex, false, &mut prompt).unwrap();
         let marker = format!("T3_SWARM_ACTION {board_id}");
         assert!(prompt.starts_with("cached user prompt\n\nSwarm board"));
         assert!(prompt.contains(&marker));
@@ -1282,8 +1370,24 @@ mod tests {
         );
         let mut next_prompt = "another prompt".to_owned();
         let next_turn =
-            SwarmTurn::prepare(&board, thread_id, ProviderId::Codex, &mut next_prompt).unwrap();
+            SwarmTurn::prepare(&board, thread_id, ProviderId::Codex, true, &mut next_prompt)
+                .unwrap();
         assert_eq!(turn.marker, next_turn.marker);
+        assert!(
+            next_prompt.len() < 250,
+            "resumed prompt should stay compact: {next_prompt}"
+        );
+        assert!(next_prompt.contains(&format!("Swarm board {board_id} (coordinator).\n")));
+        assert!(next_prompt.contains("Members: coordinator (working)\n"));
+        assert!(!next_prompt.contains("When swarm MCP is unavailable"));
+        assert_eq!(
+            next_turn
+                .actions(&format!(
+                    "{marker} {{\"tool\":\"swarm_post_message\",\"text\":\"done\"}}"
+                ))
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1300,7 +1404,7 @@ mod tests {
         };
         let prompt_for = |thread_id| {
             let mut prompt = String::new();
-            SwarmTurn::prepare(&board, thread_id, ProviderId::Codex, &mut prompt).unwrap();
+            SwarmTurn::prepare(&board, thread_id, ProviderId::Codex, false, &mut prompt).unwrap();
             prompt
         };
         let lead = prompt_for(coordinator.thread_id);
@@ -1357,6 +1461,7 @@ mod tests {
             &short_board,
             coordinator_id,
             ProviderId::Codex,
+            false,
             &mut short_prompt,
         )
         .unwrap();
@@ -1364,6 +1469,7 @@ mod tests {
             &long_board,
             coordinator_id,
             ProviderId::Codex,
+            false,
             &mut long_prompt,
         )
         .unwrap();

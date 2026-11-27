@@ -64,6 +64,22 @@ const MIGRATIONS: &[&str] = &[
     )",
     "INSERT OR IGNORE INTO fts_item_rows (item_id, thread_id, fts_rowid)
         SELECT item_id, thread_id, rowid FROM fts_entries WHERE item_id IS NOT NULL",
+    "ALTER TABLE swarm_messages ADD COLUMN sender_run_id TEXT",
+    "CREATE INDEX IF NOT EXISTS swarm_messages_board_sender_run
+        ON swarm_messages(board_id, sender, sender_run_id)",
+    "CREATE TABLE IF NOT EXISTS swarm_wake_deliveries (
+        thread_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        from_seq INTEGER NOT NULL,
+        to_seq INTEGER NOT NULL,
+        redeliveries INTEGER NOT NULL DEFAULT 0,
+        wake_depth INTEGER NOT NULL DEFAULT 0,
+        mode_ceiling_json TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (thread_id, run_id, from_seq, to_seq)
+    )",
+    "CREATE INDEX IF NOT EXISTS swarm_wake_deliveries_thread
+        ON swarm_wake_deliveries(thread_id)",
 ];
 
 const PREVIEW_BYTES: usize = 64 * 1024;
@@ -76,6 +92,7 @@ const ORPHAN_BLOBS: &str = "NOT EXISTS (
 mod queue;
 mod swarm;
 pub use queue::{QueuedRun, QueuedRunInput, VerifyDeadEnd};
+pub use swarm::SwarmWakeDeliveryRow;
 mod history;
 mod prune;
 
