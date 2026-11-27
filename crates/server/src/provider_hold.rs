@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -13,7 +13,11 @@ use std::{
 use t3_core::{ModelSelection, ProviderId};
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+pub(crate) const CRASH_LOOP_WINDOW_SECS: i64 = 300;
+pub(crate) const CRASH_LOOP_THRESHOLD: usize = 3;
+pub(crate) const CRASH_LOOP_HOLD_SECS: i64 = 300;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderHold {
     pub(crate) provider: ProviderId,
     /// `None` holds every model of the provider.
@@ -27,8 +31,15 @@ struct Entry {
     announced: HashSet<Uuid>,
 }
 
+type FailureHistory = HashMap<(ProviderId, String), VecDeque<DateTime<Utc>>>;
+
 #[derive(Default)]
-pub(crate) struct ProviderHolds(Mutex<Vec<Entry>>, AtomicBool, Mutex<HashSet<Uuid>>);
+pub(crate) struct ProviderHolds(
+    Mutex<Vec<Entry>>,
+    AtomicBool,
+    Mutex<HashSet<Uuid>>,
+    Mutex<FailureHistory>,
+);
 
 impl ProviderHolds {
     pub(crate) fn set_paused(&self, paused: bool) {
@@ -100,6 +111,49 @@ impl ProviderHolds {
     pub(crate) fn release(&self, provider: ProviderId) {
         let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
         entries.retain(|entry| entry.hold.provider != provider);
+    }
+
+    /// Tracks recent consecutive failures per (provider, model). When `CRASH_LOOP_THRESHOLD`
+    /// failures occur within `CRASH_LOOP_WINDOW_SECS`, automatically records a temporary hold
+    /// so broken/unauthenticated providers stop burning tokens in tight retry loops.
+    pub(crate) fn record_failure(
+        &self,
+        selection: &ModelSelection,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Option<ProviderHold> {
+        let cutoff = now - Duration::seconds(CRASH_LOOP_WINDOW_SECS);
+        let triggered_count = {
+            let mut failures = self.3.lock().unwrap_or_else(|e| e.into_inner());
+            let history = failures
+                .entry((selection.provider, selection.model.clone()))
+                .or_default();
+            history.retain(|&ts| ts >= cutoff);
+            history.push_back(now);
+            if history.len() >= CRASH_LOOP_THRESHOLD {
+                let count = history.len();
+                history.clear();
+                Some(count)
+            } else {
+                None
+            }
+        };
+        let count = triggered_count?;
+        let hold = ProviderHold {
+            provider: selection.provider,
+            model: Some(selection.model.clone()),
+            until: now + Duration::seconds(CRASH_LOOP_HOLD_SECS),
+            reason: format!(
+                "crash_loop: {count} consecutive failures within {CRASH_LOOP_WINDOW_SECS}s ({reason})"
+            ),
+        };
+        self.record(hold.clone());
+        Some(hold)
+    }
+
+    pub(crate) fn record_success(&self, selection: &ModelSelection) {
+        let mut failures = self.3.lock().unwrap_or_else(|e| e.into_inner());
+        failures.remove(&(selection.provider, selection.model.clone()));
     }
 }
 
@@ -258,5 +312,97 @@ mod tests {
         holds.set_paused(false);
         assert!(!holds.is_paused());
         assert_eq!(holds.pause_blocking(run), None);
+    }
+
+    #[test]
+    fn crash_loop_holds_on_third_failure_within_window() {
+        let holds = ProviderHolds::default();
+        let sel = selection(ProviderId::Codex, "gpt-6-luna");
+        let t0 = Utc::now();
+
+        assert!(holds.record_failure(&sel, "exit 1", t0).is_none());
+        assert!(
+            holds
+                .record_failure(&sel, "exit 1", t0 + Duration::seconds(60))
+                .is_none()
+        );
+        assert!(holds.blocking(&sel, None).is_none());
+
+        let t_trigger = t0 + Duration::seconds(120);
+        let hold = holds
+            .record_failure(&sel, "exit 1", t_trigger)
+            .expect("third failure should trigger crash_loop hold");
+        assert_eq!(hold.provider, ProviderId::Codex);
+        assert_eq!(hold.model.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(
+            hold.until,
+            t_trigger + Duration::seconds(CRASH_LOOP_HOLD_SECS)
+        );
+        assert!(
+            hold.reason
+                .starts_with("crash_loop: 3 consecutive failures")
+        );
+        assert!(holds.blocking(&sel, None).is_some());
+        assert!(
+            holds
+                .record_failure(&sel, "exit 1", t_trigger + Duration::seconds(10))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn record_success_resets_crash_loop_counter() {
+        let holds = ProviderHolds::default();
+        let sel = selection(ProviderId::Claude, "claude-haiku-5-5");
+        let t0 = Utc::now();
+
+        assert!(holds.record_failure(&sel, "sigkill", t0).is_none());
+        assert!(
+            holds
+                .record_failure(&sel, "sigkill", t0 + Duration::seconds(30))
+                .is_none()
+        );
+        holds.record_success(&sel);
+        assert!(
+            holds
+                .record_failure(&sel, "sigkill", t0 + Duration::seconds(60))
+                .is_none()
+        );
+        assert!(
+            holds
+                .record_failure(&sel, "sigkill", t0 + Duration::seconds(90))
+                .is_none()
+        );
+        assert!(
+            holds
+                .record_failure(&sel, "sigkill", t0 + Duration::seconds(120))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn failures_outside_window_are_not_counted() {
+        let holds = ProviderHolds::default();
+        let sel = selection(ProviderId::Codex, "gpt-6-luna");
+        let t0 = Utc::now();
+
+        assert!(holds.record_failure(&sel, "err", t0).is_none());
+        assert!(
+            holds
+                .record_failure(&sel, "err", t0 + Duration::seconds(1))
+                .is_none()
+        );
+        let t_later = t0 + Duration::seconds(CRASH_LOOP_WINDOW_SECS + 5);
+        assert!(holds.record_failure(&sel, "err", t_later).is_none());
+        assert!(
+            holds
+                .record_failure(&sel, "err", t_later + Duration::seconds(10))
+                .is_none()
+        );
+        assert!(
+            holds
+                .record_failure(&sel, "err", t_later + Duration::seconds(20))
+                .is_some()
+        );
     }
 }
