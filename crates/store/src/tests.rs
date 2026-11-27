@@ -1311,7 +1311,10 @@ fn opening_a_database_from_before_restart_resumes_adds_the_column() {
 fn every_added_column_in_projects_and_runs_has_a_migration_and_matches_fresh_schema() {
     use std::collections::{BTreeMap, BTreeSet};
 
-    fn table_columns(conn: &rusqlite::Connection, table: &str) -> BTreeMap<String, (String, i64, Option<String>)> {
+    fn table_columns(
+        conn: &rusqlite::Connection,
+        table: &str,
+    ) -> BTreeMap<String, (String, i64, Option<String>)> {
         let mut stmt = conn
             .prepare(&format!("PRAGMA table_info({table})"))
             .unwrap();

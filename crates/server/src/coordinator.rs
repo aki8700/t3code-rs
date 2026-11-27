@@ -45,6 +45,7 @@ pub(crate) struct Coordinator {
     holds: ProviderHolds,
     user_runs: StdMutex<HashSet<Uuid>>,
     queued_tickets: StdMutex<HashMap<Uuid, watch::Sender<bool>>>,
+    queued_chained_dones: StdMutex<HashMap<Uuid, Vec<watch::Sender<bool>>>>,
     pub(crate) wake_deliveries: crate::swarm::WakeDeliveries,
 }
 
@@ -189,6 +190,7 @@ impl RunCoordinator {
             holds: ProviderHolds::default(),
             user_runs: StdMutex::default(),
             queued_tickets: StdMutex::default(),
+            queued_chained_dones: StdMutex::default(),
             wake_deliveries: Default::default(),
             events,
             active: Mutex::new(HashMap::new()),
@@ -477,7 +479,7 @@ impl RunCoordinator {
             .contains(&run_id)
     }
 
-    fn clear_user_run(&self, run_id: Uuid) {
+    pub(crate) fn clear_user_run(&self, run_id: Uuid) {
         self.0
             .user_runs
             .lock()
@@ -485,7 +487,7 @@ impl RunCoordinator {
             .remove(&run_id);
     }
 
-    fn complete_queued_ticket(&self, run_id: Uuid) {
+    pub(crate) fn complete_queued_ticket(&self, run_id: Uuid) {
         if let Some(done) = self
             .0
             .queued_tickets
@@ -493,6 +495,32 @@ impl RunCoordinator {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&run_id)
         {
+            done.send_replace(true);
+        }
+        self.complete_deferred_dones(run_id);
+    }
+
+    fn defer_dones_for_queued_run(&self, run_id: Uuid, dones: Vec<watch::Sender<bool>>) {
+        self.0
+            .queued_chained_dones
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(run_id)
+            .or_default()
+            .extend(dones);
+    }
+
+    fn take_deferred_dones(&self, run_id: Uuid) -> Vec<watch::Sender<bool>> {
+        self.0
+            .queued_chained_dones
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id)
+            .unwrap_or_default()
+    }
+
+    fn complete_deferred_dones(&self, run_id: Uuid) {
+        for done in self.take_deferred_dones(run_id) {
             done.send_replace(true);
         }
     }
@@ -507,10 +535,15 @@ impl RunCoordinator {
             .unwrap_or_default()
     }
 
-    pub async fn send(&self, id: Uuid, message: Message) -> CoreResult<Uuid> {
+    pub(crate) async fn send(
+        &self,
+        id: Uuid,
+        message: Message,
+        user_requested: bool,
+    ) -> CoreResult<Uuid> {
         let mut active = self.0.active.lock().await;
         let thread = self.0.store.get_thread(id).await?;
-        self.send_locked(&mut active, thread, message, 0, true)
+        self.send_locked(&mut active, thread, message, 0, user_requested)
             .await
     }
 
@@ -781,9 +814,9 @@ impl RunCoordinator {
         let store = &self.0.store;
         let mut next = store.next_queued_run(thread.id).await?;
         if self.0.holds.is_paused()
-            && next
-                .as_ref()
-                .is_some_and(|queued| !self.user_run_pending(queued.id))
+            && next.as_ref().is_some_and(|queued| {
+                !self.user_run_pending(queued.id) && queued.restart_session.is_none()
+            })
         {
             for run in store.list_queued_runs(thread.id).await? {
                 if self.user_run_pending(run.id) {
@@ -1033,6 +1066,7 @@ impl RunCoordinator {
                 (done, completion)
             })
             .unwrap_or_else(|| watch::channel(false));
+        let chained_dones = self.take_deferred_dones(run_id);
         active.insert(
             thread.id,
             ActiveRun {
@@ -1092,7 +1126,7 @@ impl RunCoordinator {
             attachment_ids,
             cancellation,
             done,
-            chained_dones: Vec::new(),
+            chained_dones,
             driver,
             notify_parent: queued.input.notify_parent,
             wake_depth: queued.input.wake_depth,
@@ -1232,7 +1266,7 @@ impl RunCoordinator {
             attachment_ids,
             mut cancellation,
             done,
-            mut chained_dones,
+            chained_dones,
             driver,
             notify_parent,
             wake_depth,
@@ -1827,13 +1861,15 @@ impl RunCoordinator {
             });
         }
         let mut enqueued_followup = false;
+        let mut followup_run_id = None;
         if let Some((followup_msg, followup_meta)) = scheduled_auto_followup {
             match self
                 .enqueue_with_meta(&thread, followup_msg, followup_meta, true)
                 .await
             {
-                Ok(_) => {
+                Ok(id) => {
                     enqueued_followup = true;
+                    followup_run_id = Some(id);
                 }
                 Err(error) => {
                     tracing::error!(%error, %thread_id, "Could not enqueue automatic follow-up run");
@@ -1841,6 +1877,12 @@ impl RunCoordinator {
             }
         }
         let defer_completion = enqueued_followup && !self.0.shutting_down.load(Ordering::Relaxed);
+        if defer_completion && let Some(followup_id) = followup_run_id {
+            let mut dones = Vec::with_capacity(chained_dones.len() + 1);
+            dones.push(done.clone());
+            dones.extend(chained_dones.iter().cloned());
+            self.defer_dones_for_queued_run(followup_id, dones);
+        }
         if notify_parent && !defer_completion {
             let child_error = error
                 .as_deref()
@@ -1907,11 +1949,8 @@ impl RunCoordinator {
         }
         .await;
         match next {
-            Ok(Some((_, mut next_turn))) => {
-                if defer_completion {
-                    chained_dones.push(done);
-                    next_turn.chained_dones.extend(chained_dones);
-                } else {
+            Ok(Some((_, next_turn))) => {
+                if !defer_completion {
                     done.send_replace(true);
                     for waiter in chained_dones {
                         waiter.send_replace(true);
@@ -1920,16 +1959,20 @@ impl RunCoordinator {
                 Some(next_turn)
             }
             Ok(None) => {
-                done.send_replace(true);
-                for waiter in chained_dones {
-                    waiter.send_replace(true);
+                if !defer_completion {
+                    done.send_replace(true);
+                    for waiter in chained_dones {
+                        waiter.send_replace(true);
+                    }
                 }
                 None
             }
             Err(error) => {
-                done.send_replace(true);
-                for waiter in chained_dones {
-                    waiter.send_replace(true);
+                if !defer_completion {
+                    done.send_replace(true);
+                    for waiter in chained_dones {
+                        waiter.send_replace(true);
+                    }
                 }
                 tracing::error!(%error, %thread_id, "Could not start next queued run");
                 self.emit(WsServerMessage::Error {

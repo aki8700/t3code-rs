@@ -709,7 +709,7 @@ async fn send_message(
     Path(id): Path<Uuid>,
     Json(message): Json<Message>,
 ) -> ApiResult<Json<Value>> {
-    let run_id = state.coordinator.send(id, message).await?;
+    let run_id = state.coordinator.send(id, message, true).await?;
     Ok(Json(json!({"run_id": run_id})))
 }
 

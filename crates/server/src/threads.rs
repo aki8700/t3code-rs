@@ -578,6 +578,17 @@ impl RunCoordinator {
     }
 
     pub(crate) async fn discard_thread(&self, thread: &Thread) {
+        match self.0.store.list_queued_runs(thread.id).await {
+            Ok(runs) => {
+                for run in runs {
+                    self.clear_user_run(run.id);
+                    self.complete_queued_ticket(run.id);
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, thread_id = %thread.id, "Could not clear queued thread bookkeeping");
+            }
+        }
         let id = thread.id.to_string();
         if let Err(error) = self
             .sql(move |db| {
@@ -1096,7 +1107,7 @@ impl OrchestratorBackend for RunCoordinator {
         mode: DelegateMode,
     ) -> CoreResult<DelegatedTask> {
         let (thread, mut ticket) = self.launch_child(spec).await?;
-        if matches!(mode, DelegateMode::Wait) && thread.status == ThreadStatus::Running {
+        if matches!(mode, DelegateMode::Wait) {
             let _ = ticket.done.wait_for(|done| *done).await;
             return self.task_status(thread.id).await;
         }
@@ -1170,9 +1181,7 @@ impl OrchestratorBackend for RunCoordinator {
         let diff = self
             .child_worktree_diff(caller_id, child_thread_id, false)
             .await?;
-        let risk = diff
-            .risk
-            .unwrap_or_else(|| classify_diff_risk(&diff.files));
+        let risk = diff.risk.unwrap_or_else(|| classify_diff_risk(&diff.files));
         if risk.tier == UndoTier::NoUndo {
             let paths = if risk.flagged_paths.is_empty() {
                 "sensitive changes".to_owned()
@@ -1227,6 +1236,7 @@ impl OrchestratorBackend for RunCoordinator {
                 behavior,
                 ..Default::default()
             },
+            false,
         )
         .await
     }
