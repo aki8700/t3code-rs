@@ -231,12 +231,34 @@ pub(crate) mod startup {
             })
             .map_err(process_error)?;
         let mut bytes = [0; size_of::<libc::pid_t>()];
-        if let Err(err) = pid_reader.read_exact(&mut bytes) {
-            drop(permit);
-            return Err(process_error(join(launch).err().unwrap_or(err)));
-        }
+        let pid_read =
+            tokio::task::spawn_blocking(move || pid_reader.read_exact(&mut bytes).map(|()| bytes))
+                .await
+                .map_err(|err| {
+                    CoreError::Provider(format!("CLI spawn handshake task failed: {err}"))
+                })?;
+        let bytes = match pid_read {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                drop(permit);
+                return Err(process_error(join(launch).err().unwrap_or(err)));
+            }
+        };
         let pid = libc::pid_t::from_ne_bytes(bytes);
-        let start = process_start_time(pid as u32).ok_or_else(|| {
+        let start = tokio::task::spawn_blocking(move || {
+            for attempt in 0..5 {
+                if let Some(start) = process_start_time(pid as u32) {
+                    return Some(start);
+                }
+                if attempt < 4 {
+                    thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+            None
+        })
+        .await
+        .map_err(|err| CoreError::Provider(format!("CLI start-time probe task failed: {err}")))?
+        .ok_or_else(|| {
             CoreError::Provider(format!("could not identify starting CLI process {pid}"))
         })?;
         record(pid, start).await?;

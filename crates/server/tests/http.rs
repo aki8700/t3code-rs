@@ -489,14 +489,28 @@ async fn wait_for_thread_timeout(
     status: ThreadStatus,
     timeout: Duration,
 ) {
-    tokio::time::timeout(timeout, async {
+    let mut seen_statuses = Vec::new();
+    let result = tokio::time::timeout(timeout, async {
         loop {
             let event = events.recv().await.unwrap();
-            if matches!(event, WsServerMessage::ThreadStatusChanged { thread_id: id, status: seen } if id == thread_id && seen == status) {
-                break;
+            if let WsServerMessage::ThreadStatusChanged {
+                thread_id: id,
+                status: seen,
+            } = event
+                && id == thread_id
+            {
+                seen_statuses.push(seen);
+                if seen == status {
+                    break;
+                }
             }
         }
-    }).await.unwrap();
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "timed out after {timeout:?} waiting for {status:?} on {thread_id}; seen statuses: {seen_statuses:?}"
+    );
 }
 
 async fn mcp_tool(app: &Router, name: &str, arguments: Value) -> Value {
@@ -2467,7 +2481,10 @@ async fn repeated_failing_swarm_action_stops_at_the_wake_depth_limit() {
         }
         last = calls;
     }
-    assert!((2..=10).contains(&last), "coordinator woken {last} times");
+    if !(2..=10).contains(&last) {
+        let detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
+        panic!("coordinator woken {last} times; runs={}", detail["runs"]);
+    }
 }
 
 // A coordinator that keeps re-waking a worker which never reports must stop at the
