@@ -2145,8 +2145,7 @@ async fn task_and_swarm_status_report_worktree_clashes_and_behind_counts() {
         .find(|overlap| overlap["file"] == "shared-swarm.txt")
         .unwrap();
     assert_eq!(clash["workers"], json!(["swarm-a", "swarm-b"]));
-    let from_worker =
-        mcp_tool(&app, "swarm_status", json!({"thread_id":swarm_ids[0]})).await;
+    let from_worker = mcp_tool(&app, "swarm_status", json!({"thread_id":swarm_ids[0]})).await;
     assert_eq!(from_worker["board_id"], swarm["board_id"]);
     assert_eq!(from_worker["overlaps"], swarm["overlaps"]);
 
