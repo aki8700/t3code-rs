@@ -46,7 +46,7 @@ const LEGACY_IDLE_STDOUT_TIMEOUT_ENV: &str = "T3_IDLE_STDOUT_TIMEOUT_SECS";
 /// While a tool step is running the idle limit is stretched by this factor
 /// (default 900 s -> 1 h), so a hung tool is still stopped eventually.
 const IN_FLIGHT_TOOL_IDLE_FACTOR: u32 = 4;
-const TOOL_FAILURE_LOOP_NOTICE: &str = "[automatic notice] This tool call has failed with the same result before. Stop retrying it and change approach. If it fails the same way again, the run will stop.";
+const TOOL_FAILURE_LOOP_NOTICE: &str = "[automatic notice] This tool call has failed with the same result twice. Stop retrying it and change the command, inputs, or approach. One more identical failure will stop the run.";
 
 fn warn_agent_of_tool_failure(
     steer: Option<&mpsc::UnboundedSender<StdinMsg>>,
@@ -823,7 +823,7 @@ async fn read_events(
                         ToolFailureAction::Stop => {
                             let _ = stop_process.send(());
                             return Ok(ReadOutcome::Stopped(
-                                "tool_failure_loop: same tool call failed repeatedly; stopped the provider run".into(),
+                                "tool_failure_loop: same tool call failed four times; inspect the error and change the command, inputs, or approach before retrying".into(),
                             ));
                         }
                         ToolFailureAction::None => {}
