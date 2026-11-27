@@ -1967,6 +1967,64 @@ async fn swarm_mock_workers_post_results_and_wake_the_coordinator() {
 }
 
 #[tokio::test]
+async fn killing_rate_limited_swarm_worker_clears_thread_status() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let id = create_parent(&app, &tmp.0).await;
+    let thread = format!("/api/threads/{id}");
+    json_req(
+        &app,
+        Method::PATCH,
+        &thread,
+        Some(json!({"interaction_mode":"plan"})),
+    )
+    .await;
+    json_req(
+        &app,
+        Method::POST,
+        &format!("{thread}/messages"),
+        Some(json!({"prompt":"/swarm inspect workers"})),
+    )
+    .await;
+    wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+
+    let worker = mcp_tool(
+        &app,
+        "swarm_add_worker",
+        json!({"thread_id":id,"name":"limited","brief":"[rate-limit-once]","provider":"mock","model":"mock"}),
+    )
+    .await;
+    let worker_id: Uuid = serde_json::from_value(worker["thread_id"].clone()).unwrap();
+    wait_for_thread(&mut events, worker_id, ThreadStatus::RateLimited).await;
+    let limited = json_req(
+        &app,
+        Method::GET,
+        &format!("/api/threads/{worker_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(limited["thread"]["status"], "rate-limited");
+
+    let killed = mcp_tool(
+        &app,
+        "swarm_kill_worker",
+        json!({"thread_id":id,"name":"limited"}),
+    )
+    .await;
+    assert_eq!(killed["state"], "killed");
+    let after = json_req(
+        &app,
+        Method::GET,
+        &format!("/api/threads/{worker_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(after["thread"]["status"], "interrupted");
+}
+
+#[tokio::test]
 async fn swarm_mcp_status_and_reader_return_compact_truncated_messages() {
     let tmp = TempDir::new();
     let state = tmp.state(AuthConfig::LocalOnly);

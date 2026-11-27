@@ -855,6 +855,14 @@ impl RunCoordinator {
         let thread_id = member.thread_id;
         self.swarm_state(thread_id, "killed").await?;
         let done = self.interrupt_locked(active, thread_id).await?;
+        self.0
+            .store
+            .update_thread_status(thread_id, ThreadStatus::Interrupted)
+            .await?;
+        self.emit(WsServerMessage::ThreadStatusChanged {
+            thread_id,
+            status: ThreadStatus::Interrupted,
+        });
         self.cleanup_killed_worktree(&board, thread_id, done.clone())
             .await;
         Ok(done)
