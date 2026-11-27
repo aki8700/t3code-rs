@@ -71,13 +71,29 @@
 
 ---
 
-## 3. 推奨実装順（未実装＋既存欠陥の統合 Phase 構成）
+## 3. トークン節約・ハーネス最適化リスト（実測データ＋Orca 由来）
 
-1. **Wave 1（S ランク欠陥の止血：G-4 + G-3 + G-5 テスト）**:
-   - `Plan` モード時の `swiftcua` 遮断（G-4）、Swarm 配信記録の DB 永続化＋`run_id` 紐付けで「報告なし終了」誤判定根絶（G-3）、`gemini_app.rs` のモック AX ツリー単体テスト追加（G-5）。
-2. **Wave 2（並列性能と UI 整合性：P0-2 + P0-3 + P1-1 + G-1 縮小）**:
-   - `web/app.js` の `epoch` ガード（P0-2）、リポ単位 Git コアレス（P0-3）、クラッシュループブレーキ（P1-1）、`coordinator.rs` の `active` ロック保持区間から重い DB/Git I/O を外す（G-1）。
-3. **Wave 3（配信・描画基盤の刷新：P0-1 / G-2 + P1-2 + G-6 分割）**:
-   - WS 3 レーン＋`seq` 再同期（P0-1 / G-2）、`web/app.js` の末尾局所描画（P1-2）とモジュール分割・JS ユニットテスト導入（G-6）。
-4. **Wave 4（プロバイダー信頼性仕上げ：P2-1 / G-7 + P2-2 / G-8）**:
-   - `await_gate` 起動同期パイプ、初回応答タイムアウト、`resume.rs` の固定 1500ms スリープ短縮（`harness-metrics.py` で改善幅を計測）。
+`state.sqlite` 実測（完了ラン平均）では **coordinator が 119 万トークン/回（平均プロンプト 2,959B）・worker が 517 万トークン/回**、さらに **Codex のキャッシュ率は 61%（Claude は 97.5%）**・**Codex のキャンセル損失が全体の 29%** に達している。ここを直接削るハーネス改善を優先度順に整理した。
+
+| # | 施策 | 根拠・参照元 | 期待効果 | 最小実装スコープ |
+|---|---|---|---|---|
+| **T-1** | **再開セッション時の Swarm ボイラープレート省略** | `crates/server/src/swarm.rs:74-95`。現状は既存セッション再開でも毎ターン約 1.3KB の `Swarm board ... T3_SWARM_ACTION ...` 全文を再注入している。 | coordinator 履歴の肥大化とキャッシュ後半の揺れを削減（毎ターン 400〜600 トークン節約 × 数百ターン）。 | `swarm.rs`: `resume_session_id.is_some()` 時は指示全文を省き、変更があった `Members:` 差分のみ付与。 |
+| **T-2** | **役割別 MCP ツールプロファイル（最小ツール露出）** | `crates/mcp/src/lib.rs`, `cli_drivers.rs`。全ロールに 22 ツール＋`swiftcua` 17 ツール＝計 39 ツール定義が毎ターン乗る。 | worker から `swarm_add/kill`・`swiftcua`・`thread_fork` 等を外すだけで毎ターン数千トークンの固定入力を削減（同時に誤操作防止・G-4 解消）。 | `McpInjectionSpec` にロール（`coordinator` / `worker` / `user`）と `computer_use` 許可フラグを持たせ、`tools/list` と `swiftcua` 注入を絞る。 |
+| **T-3** | **`compaction_econ` 連動の自動コンパクション／自動ハンドオフ** | `crates/maki/src/econ.rs`, `crates/server/src/compact.rs`。経済計算器と圧縮実装はあるが手動トリガーのみで自動発動しない。 | 長期 coordinator（平均 119 万トークン/回）と大型 worker の入力トークン膨張を自動で頭打ちにする。 | `coordinator.rs`: コンテキスト 75% 超かつ `compaction_econ` が黒字判定のターン境界で自動コンパクト（非対応プロバイダーは自動ハンドオフ）。 |
+| **T-4** | **コンテキスト項目別＋全体予算キャップ＆`t3-maki` 標準利用** | `orca` `linear-issue-context-snapshot.ts` (`LINEAR_ISSUE_CONTEXT_CAPS`), `journal-domain-schema-001-outline.ts`（ハッシュ＋予算キャッシュ） | handoff 要約・verify 失敗ログ・ファイル読み込みの無制限膨張を項目別上限＋`[truncated]` で抑え、`code_index`/`code_slice` 優先で worker の 517 万トークン/回を大幅圧縮。 | `crates/server/src/threads.rs`（handoff の項目別バイト上限）、`crates/maki`（内容ハッシュキャッシュ）、`swarm.rs`（worker 規約に `code_index/slice` 優先を明記）。 |
+| **T-5** | **ワーカーのトークン／ツール回数予算ガード＆早期打ち切り** | `state.sqlite` 実測（Codex 中断 16 回で 8,000 万トークン・17.7 分/回を喪失）。 | 迷走したワーカーが枠を焼き切る前に「N ツール呼出 or M トークン超過で中間報告を強制」＋起動無反応（60 秒）で即切り上げ。 | `crates/providers/src/watchdog.rs` に soft-budget 警告（steering 注入）と hard-budget 停止を追加。 |
+| **T-6** | **Codex / Antigravity 向けプロンプトキャッシュ・プレフィックス固定化** | 実測キャッシュ率: Claude 97.5% vs Codex 61%。`orca` `moduleCacheIdentity` / `cachePrefix`。 | システム指示・ツール定義・プロジェクト指示を先頭固定し、可変情報（現在時刻・メンバー一覧・未読件数）を完全末尾化して Codex キャッシュ率を 85%+ へ引き上げる。 | `crates/providers/src/cli_drivers.rs`, `swarm.rs`, `coordinator.rs` にプレフィックス不変回帰テストを追加。 |
+| **T-7** | **実測駆動のモデルルーティング＋`/gemini` 無料枠活用** | `scripts/harness-metrics.py` + `gemini_app.rs`。 | 探索・定型読込＝`Tier1Fast`（Haiku/Hydrogen）、設計・レビュー＝`/gemini`（API 0 トークン）、実装＝Codex/Haiku の自動推奨を `orchestrator_capabilities` に載せ、最適化ループを `harness-metrics.py` の前後比較で検証。 | `crates/mcp` の `orchestrator_capabilities` に推奨ルーティングを返し、`scripts/harness-metrics.py` で週次改善を追跡。 |
+
+---
+
+## 4. 推奨実装順（未実装＋既存欠陥＋トークン節約の統合 Phase 構成）
+
+1. **Wave 1（即効性・トークン節約＆S ランク止血：T-1 + T-2/G-4 + G-3）**:
+   - 再開時 Swarm ボイラープレート省略（T-1）、役割別 MCP ツール絞り込み＋`Plan` 時 `swiftcua` 遮断（T-2/G-4）、Swarm 配信永続化＆`run_id` 判定（G-3）。
+2. **Wave 2（トークン暴走防止＆並列性能：T-3 + T-5/G-8 + P0-2 + P0-3 + P1-1）**:
+   - `compaction_econ` 自動コンパクション（T-3）、予算ガード＆初期無反応タイムアウト（T-5/G-8）、`web/app.js` 世代フェンス（P0-2）、リポ単位 Git コアレス（P0-3）、クラッシュループブレーキ（P1-1）。
+3. **Wave 3（配信・描画基盤の刷新：P0-1/G-2 + P1-2 + G-1/G-6）**:
+   - WS 3 レーン＋`seq` 再同期（P0-1/G-2）、`web/app.js` 末尾局所描画＆分割（P1-2/G-6）、`coordinator.rs` の `active` ロック縮小（G-1）。
+4. **Wave 4（耐障害性と最適化仕上げ：T-4 + T-6 + P2-1/G-7 + G-5 テスト）**:
+   - `t3-maki` ハッシュキャッシュ＋handoff 項目別キャップ（T-4）、プレフィックス不変テスト（T-6）、`await_gate` 起動同期（P2-1/G-7）、`gemini_app.rs` 単体テスト（G-5）。
