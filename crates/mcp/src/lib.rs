@@ -1034,9 +1034,10 @@ fn tools() -> Vec<Value> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use t3_maki::{CompactionEconInput, Prices};
 
     #[derive(Debug, PartialEq, Eq)]
     struct RecordedMerge {
@@ -1271,145 +1272,168 @@ mod tests {
         })
     }
 
+    /// Field names of an argument struct. The pattern has no `..`, so adding a
+    /// field without listing it here (and in the schema) fails to compile.
+    macro_rules! fields {
+        ($ty:ident { $($field:ident),+ }) => {{
+            let _ = |$ty { $($field: _),+ }: $ty| {};
+            vec![$(stringify!($field)),+]
+        }};
+    }
+    pub(crate) use fields;
+
+    fn assert_schema_keys(schema: &Value, mut fields: Vec<&str>, path: &str) {
+        let mut keys = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        fields.sort_unstable();
+        assert_eq!(keys, fields, "{path}");
+    }
+
     #[test]
     fn tool_argument_fields_match_the_declared_schemas() {
-        let expected = [
-            ("orchestrator_capabilities", &[][..]),
-            ("swarm_status", &["thread_id"][..]),
+        // `SwarmArgs` flattens `input` and `ForkArgs` flattens `options`.
+        let _ = |SwarmArgs::<()> {
+                     thread_id: _,
+                     input: _,
+                 }| {};
+        let swarm = |input: Vec<&'static str>| [vec!["thread_id"], input].concat();
+        let mut fork = fields!(ForkArgs {
+            thread_id,
+            options,
+            provider,
+            model,
+            effort
+        });
+        fork.retain(|field| *field != "options");
+        fork.extend(fields!(ForkOptions {
+            title,
+            target_model,
+            handoff_summary
+        }));
+        let mut expected = vec![
+            ("orchestrator_capabilities", vec![]),
+            ("pause_all", fields!(PauseAllInput { paused })),
+            ("swarm_status", fields!(SwarmStatus { thread_id })),
             (
                 "swarm_add_worker",
-                &[
-                    "thread_id",
-                    "name",
-                    "brief",
-                    "provider",
-                    "model",
-                    "effort",
-                    "isolation",
-                ][..],
+                swarm(fields!(SwarmWorkerSpec {
+                    name,
+                    brief,
+                    provider,
+                    model,
+                    effort,
+                    isolation
+                })),
             ),
-            ("swarm_post_message", &["thread_id", "text"][..]),
+            ("swarm_post_message", swarm(fields!(SwarmPost { text }))),
             (
                 "swarm_read_board",
-                &["thread_id", "since_seq", "limit", "seq"][..],
+                swarm(fields!(SwarmRead {
+                    since_seq,
+                    limit,
+                    seq
+                })),
             ),
-            ("swarm_kill_worker", &["thread_id", "name"][..]),
+            ("swarm_kill_worker", swarm(fields!(SwarmKill { name }))),
             (
                 "delegate_task",
-                &[
-                    "parent_thread_id",
-                    "title",
-                    "task",
-                    "provider",
-                    "model",
-                    "effort",
-                    "isolation",
-                    "base_ref",
-                    "mode",
-                    "runtime_mode",
-                    "interaction_mode",
-                ][..],
+                fields!(DelegateArgs {
+                    parent_thread_id,
+                    title,
+                    task,
+                    provider,
+                    model,
+                    effort,
+                    isolation,
+                    base_ref,
+                    mode,
+                    runtime_mode,
+                    interaction_mode
+                }),
             ),
-            ("task_status", &["task_id"][..]),
-            ("task_cancel", &["task_id"][..]),
-            ("task_diff", &["child_thread_id", "parent_thread_id"][..]),
+            ("task_status", fields!(TaskArgs { task_id })),
+            ("task_cancel", fields!(TaskArgs { task_id })),
+            (
+                "task_diff",
+                fields!(TaskDiffArgs {
+                    child_thread_id,
+                    parent_thread_id
+                }),
+            ),
             (
                 "task_merge",
-                &[
-                    "child_thread_id",
-                    "parent_thread_id",
-                    "commit_message",
-                    "cleanup",
-                ][..],
+                fields!(TaskMergeArgs {
+                    child_thread_id,
+                    parent_thread_id,
+                    commit_message,
+                    cleanup
+                }),
             ),
             (
                 "thread_list",
-                &["project_id", "include_archived", "limit"][..],
+                fields!(ListArgs {
+                    project_id,
+                    include_archived,
+                    limit
+                }),
             ),
-            ("thread_read", &["thread_id", "limit"][..]),
-            ("thread_send", &["thread_id", "prompt", "behavior"][..]),
+            ("thread_read", fields!(ReadArgs { thread_id, limit })),
             (
-                "thread_fork",
-                &[
-                    "thread_id",
-                    "title",
-                    "target_model",
-                    "provider",
-                    "model",
-                    "effort",
-                    "handoff_summary",
-                ][..],
+                "thread_send",
+                fields!(SendArgs {
+                    thread_id,
+                    prompt,
+                    behavior
+                }),
             ),
-            ("orch_stats", &[][..]),
-            ("code_index", &["path", "max_depth", "max_lines"][..]),
-            (
-                "code_slice",
-                &["path", "symbol", "max_bytes", "start", "end"][..],
-            ),
-            (
-                "code_grep",
-                &["path", "pattern", "glob", "max_hits", "max_bytes"][..],
-            ),
-            ("code_diff", &["cwd", "rev", "path", "max_bytes"][..]),
+            ("thread_fork", fork),
+            ("orch_stats", vec![]),
             (
                 "compaction_econ",
-                &[
-                    "prefix",
-                    "replaced",
-                    "summary",
-                    "tail",
-                    "instruction",
-                    "summarizer_reuses_prefix",
-                    "prices",
-                    "remaining_turns",
-                ][..],
+                fields!(CompactionEconInput {
+                    prefix,
+                    replaced,
+                    summary,
+                    tail,
+                    instruction,
+                    summarizer_reuses_prefix,
+                    prices,
+                    remaining_turns
+                }),
             ),
         ];
+        expected.extend(code_tools::argument_fields());
+
         let listed = tools();
         assert_eq!(listed.len(), expected.len());
-        for tool in &listed {
-            let name = tool["name"].as_str().unwrap();
-            let mut schema_keys = tool["inputSchema"]["properties"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
-            let mut struct_fields = expected
-                .iter()
-                .find(|(tool_name, _)| *tool_name == name)
-                .unwrap_or_else(|| panic!("missing argument struct fields for {name}"))
-                .1
-                .to_vec();
-            schema_keys.sort_unstable();
-            struct_fields.sort_unstable();
-            assert_eq!(schema_keys, struct_fields, "{name}");
+        for (name, fields) in expected {
+            assert_schema_keys(listed_schema(&listed, name), fields, name);
         }
-
-        for (tool_name, property, fields) in [
-            (
-                "thread_fork",
-                "target_model",
-                &["provider", "model", "effort", "agent"][..],
-            ),
-            (
-                "compaction_econ",
-                "prices",
-                &["input", "output", "cache_read", "cache_write"][..],
-            ),
-        ] {
-            let schema = listed_schema(&listed, tool_name);
-            let mut actual = schema["properties"][property]["properties"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
-            let mut expected = fields.to_vec();
-            actual.sort_unstable();
-            expected.sort_unstable();
-            assert_eq!(actual, expected, "{tool_name}.{property}");
-        }
+        assert_schema_keys(
+            &listed_schema(&listed, "thread_fork")["properties"]["target_model"],
+            fields!(ModelSelection {
+                provider,
+                model,
+                effort,
+                agent
+            }),
+            "thread_fork.target_model",
+        );
+        assert_schema_keys(
+            &listed_schema(&listed, "compaction_econ")["properties"]["prices"],
+            fields!(Prices {
+                input,
+                output,
+                cache_read,
+                cache_write
+            }),
+            "compaction_econ.prices",
+        );
     }
 
     #[test]
