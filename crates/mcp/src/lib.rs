@@ -31,6 +31,23 @@ pub struct DelegatedTask {
     pub status: ThreadStatus,
     pub worktree_path: Option<std::path::PathBuf>,
     pub summary: Option<String>,
+    pub worktree: Option<WorktreeChange>,
+    pub overlaps: Vec<WorktreeOverlap>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeChange {
+    pub thread_id: Uuid,
+    pub worker: String,
+    pub changed_files: Vec<String>,
+    pub behind: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeOverlap {
+    pub file: String,
+    pub worker_ids: Vec<Uuid>,
+    pub workers: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,6 +138,8 @@ pub struct SwarmStatusResult {
     pub members: Vec<SwarmMemberSummary>,
     pub head_seq: i64,
     pub message_count: usize,
+    pub worktrees: Vec<WorktreeChange>,
+    pub overlaps: Vec<WorktreeOverlap>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -768,7 +787,7 @@ fn tools() -> Vec<Value> {
         ),
         make(
             "swarm_status",
-            "Get compact swarm status: member name/state/provider/model/last_read_seq, head sequence, and message count.",
+            "Get compact swarm status with member records, worktree changed files, commits behind each base branch, and files shared by multiple workers.",
             json!({"thread_id": uuid}),
             &[],
         ),
@@ -812,7 +831,7 @@ fn tools() -> Vec<Value> {
         ),
         make(
             "task_status",
-            "Read a delegated task's status and latest assistant summary.",
+            "Read a delegated task's status, summary, worktree changed files, commits behind its base, and overlapping workers.",
             json!({"task_id": uuid}),
             &["task_id"],
         ),
