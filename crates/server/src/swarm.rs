@@ -441,6 +441,10 @@ impl RunCoordinator {
         if target.archived || caller.is_some_and(|caller| !can_dispatch(caller, &target)) {
             return Ok(false);
         }
+        let effective_ceiling = stricter_mode_ceiling(
+            mode_ceiling,
+            Some((target.runtime_mode, target.interaction_mode)),
+        );
         // At most one queued wake per member: a wake still waiting in the queue is replaced
         // by one that carries every unread post, so posts arriving while the member is busy
         // cost one turn instead of one turn each. Only the running run's posts are skipped.
@@ -479,7 +483,7 @@ impl RunCoordinator {
                         continue;
                     };
                     run.input.mode_ceiling =
-                        stricter_mode_ceiling(run.input.mode_ceiling, mode_ceiling);
+                        stricter_mode_ceiling(run.input.mode_ceiling, effective_ceiling);
                     run.input.wake_depth = coalesced_wake_depth(run.input.wake_depth, depth);
                     if store
                         .update_queued_run(target.id, run.id, prompt.clone(), run.input.clone())
@@ -500,7 +504,7 @@ impl RunCoordinator {
                     } else {
                         let mut message = queued_message(prompt);
                         message.mode_ceiling =
-                            stricter_mode_ceiling(delivery.mode_ceiling, mode_ceiling);
+                            stricter_mode_ceiling(delivery.mode_ceiling, effective_ceiling);
                         self.send_locked(
                             active,
                             target.clone(),
@@ -512,7 +516,7 @@ impl RunCoordinator {
                     }
                 } else {
                     let mut message = queued_message(prompt);
-                    message.mode_ceiling = mode_ceiling;
+                    message.mode_ceiling = effective_ceiling;
                     self.send_locked(active, target.clone(), message, depth, false)
                         .await?
                 };
@@ -525,7 +529,7 @@ impl RunCoordinator {
                             to: last.seq,
                             redeliveries,
                             wake_depth: depth,
-                            mode_ceiling,
+                            mode_ceiling: effective_ceiling,
                         },
                     );
                 }
@@ -622,7 +626,7 @@ impl RunCoordinator {
         run_id: Uuid,
         status: RunStatus,
     ) -> CoreResult<()> {
-        let (delivered, queued_wake) = {
+        let (delivered, remaining) = {
             let mut deliveries = self.deliveries();
             let Some(list) = deliveries.get_mut(&thread_id) else {
                 return Ok(());
@@ -630,13 +634,13 @@ impl RunCoordinator {
             let (delivered, rest) = std::mem::take(list)
                 .into_iter()
                 .partition::<Vec<_>, _>(|delivery| delivery.run_id == run_id);
-            let queued_wake = rest.first().map(|delivery| delivery.run_id);
+            let remaining = rest.clone();
             if rest.is_empty() {
                 deliveries.remove(&thread_id);
             } else {
                 *list = rest;
             }
-            (delivered, queued_wake)
+            (delivered, remaining)
         };
         if status == RunStatus::Completed {
             for delivery in delivered {
@@ -647,23 +651,36 @@ impl RunCoordinator {
             }
             return Ok(());
         }
-        let Some(queued_wake) = queued_wake.filter(|_| !delivered.is_empty()) else {
+        if delivered.is_empty() || remaining.is_empty() {
             return Ok(());
-        };
-        let Some(queued) = self.0.store.queued_run(thread_id, queued_wake).await? else {
+        }
+        let mut live_queued = Vec::new();
+        for delivery in &remaining {
+            if let Some(queued) = self.0.store.queued_run(thread_id, delivery.run_id).await? {
+                live_queued.push((delivery, queued));
+            }
+        }
+        if live_queued.is_empty() {
             return Ok(());
-        };
+        }
         let depth = delivered
             .iter()
             .map(|delivery| delivery.wake_depth)
+            .chain(
+                live_queued
+                    .iter()
+                    .map(|(delivery, queued)| delivery.wake_depth.max(queued.input.wake_depth)),
+            )
             .max()
-            .unwrap_or(0)
-            .max(queued.input.wake_depth);
-        let mode_ceiling = delivered
-            .iter()
-            .fold(queued.input.mode_ceiling, |ceiling, delivery| {
-                stricter_mode_ceiling(ceiling, delivery.mode_ceiling)
-            });
+            .unwrap_or(0);
+        let mode_ceiling =
+            delivered
+                .iter()
+                .map(|delivery| delivery.mode_ceiling)
+                .chain(live_queued.iter().flat_map(|(delivery, queued)| {
+                    [delivery.mode_ceiling, queued.input.mode_ceiling]
+                }))
+                .fold(None, stricter_mode_ceiling);
         let attempts = delivered
             .iter()
             .map(|delivery| delivery.redeliveries)
