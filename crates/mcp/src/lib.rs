@@ -39,6 +39,8 @@ pub struct DelegatedTask {
 pub struct WorktreeChange {
     pub thread_id: Uuid,
     pub worker: String,
+    pub changed_file_count: usize,
+    /// The first changed files only; see `changed_file_count` for the total.
     pub changed_files: Vec<String>,
     pub behind: Option<usize>,
 }

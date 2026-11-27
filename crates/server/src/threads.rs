@@ -1003,6 +1003,9 @@ fn workspace_merge_lock(canonical_workspace: &Path) -> Arc<tokio::sync::Mutex<()
     )
 }
 
+/// Changed files listed per worker in status calls; `changed_file_count` has the total.
+const MAX_LISTED_CHANGED_FILES: usize = 20;
+
 impl RunCoordinator {
     async fn worktree_changes(
         &self,
@@ -1036,9 +1039,10 @@ impl RunCoordinator {
                 Some(base_ref) => GitManager::worktree_branch_status(path, base_ref).await.ok(),
                 None => None,
             };
-            let report = WorktreeChange {
+            let mut report = WorktreeChange {
                 thread_id: child.id,
                 worker: child.title,
+                changed_file_count: 0,
                 changed_files: status
                     .as_ref()
                     .map_or_else(Vec::new, |status| status.changed_files.clone()),
@@ -1050,6 +1054,9 @@ impl RunCoordinator {
                     .or_default()
                     .push((report.thread_id, report.worker.clone()));
             }
+            // Overlaps carry the signal; per-worker lists stay short so status calls stay small.
+            report.changed_file_count = report.changed_files.len();
+            report.changed_files.truncate(MAX_LISTED_CHANGED_FILES);
             worktrees.push(report);
         }
         let overlaps = by_file
