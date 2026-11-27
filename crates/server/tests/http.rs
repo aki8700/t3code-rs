@@ -2364,6 +2364,15 @@ printf '{{"type":"result","subtype":"success","result":"%s"}}\n' "$text"
 
 #[cfg(unix)]
 async fn swarm_fixture(tmp: &TempDir, script: &str) -> (Router, Uuid) {
+    let (app, id, _) = swarm_fixture_with_events(tmp, script).await;
+    (app, id)
+}
+
+#[cfg(unix)]
+async fn swarm_fixture_with_events(
+    tmp: &TempDir,
+    script: &str,
+) -> (Router, Uuid, broadcast::Receiver<WsServerMessage>) {
     use std::os::unix::fs::PermissionsExt;
     let driver = tmp.0.join("fixture-claude");
     std::fs::write(&driver, script).unwrap();
@@ -2375,9 +2384,10 @@ async fn swarm_fixture(tmp: &TempDir, script: &str) -> (Router, Uuid) {
     };
     config.providers.claude_bin = driver;
     let state = ServerState::new(config, "http://127.0.0.1:3774".into()).unwrap();
+    let events = state.coordinator.subscribe();
     let app = router(state);
     let id = create_parent(&app, &tmp.0).await;
-    (app, id)
+    (app, id, events)
 }
 
 #[cfg(unix)]
@@ -2814,6 +2824,85 @@ printf '{"type":"result","subtype":"success","result":"noted"}\n'
     );
     let board = json_req(&app, Method::GET, &format!("/api/threads/{id}/swarm"), None).await;
     assert_eq!(board["members"][0]["last_read_seq"], last["seq"]);
+}
+
+// Coalescing a queued wake rewrites its prompt in place without any run-status change, so
+// the server must announce it on the target thread (here the coordinator, which `@coordinator`
+// wakes): an open tab would otherwise keep the stale queued prompt.
+#[cfg(unix)]
+#[tokio::test]
+async fn coalescing_a_queued_wake_in_place_emits_resync_for_the_target_thread() {
+    use tokio::sync::broadcast::error::TryRecvError;
+    let tmp = TempDir::new();
+    let (app, id, mut events) = swarm_fixture_with_events(
+        &tmp,
+        r#"#!/bin/sh
+IFS= read -r prompt
+case "$prompt" in *"first"*) touch first-wake-started; while [ ! -f release-first-wake ]; do sleep 0.01; done ;; esac
+printf '{"type":"result","subtype":"success","result":"noted"}\n'
+"#,
+    )
+    .await;
+    start_swarm(&app, id).await;
+    wait_for_runs(&app, id, 1).await;
+    let worker = mcp_tool(
+        &app,
+        "swarm_add_worker",
+        json!({
+            "thread_id":id,"name":"w1","brief":"check","provider":"mock","model":"mock",
+        }),
+    )
+    .await;
+    let post = |text: &str| {
+        mcp_tool(
+            &app,
+            "swarm_post_message",
+            json!({"thread_id":worker["thread_id"],"text":text}),
+        )
+    };
+    post("@coordinator first").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !tmp.0.join("first-wake-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first wake did not start");
+    // "second" creates the queued wake; "third" rewrites its prompt in place.
+    post("@coordinator second").await;
+    while !matches!(
+        events.try_recv(),
+        Err(TryRecvError::Empty | TryRecvError::Closed)
+    ) {}
+    post("@coordinator third").await;
+    let resynced = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(WsServerMessage::Resync { thread_id }) if thread_id == Some(id) => {
+                    break true;
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        resynced,
+        "in-place coalesce did not emit Resync for the target thread"
+    );
+    // The reloaded state must already carry the coalesced prompt the event points at.
+    let detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
+    let queued_prompt = detail["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["status"] == "queued")
+        .and_then(|run| run["prompt"].as_str())
+        .unwrap_or_default();
+    assert!(queued_prompt.contains("third"), "{detail}");
+    std::fs::write(tmp.0.join("release-first-wake"), "ready").unwrap();
 }
 
 #[cfg(unix)]
