@@ -1340,6 +1340,141 @@ fn resumed_run_verifies_and_rolls_back_edits_made_before_the_restart() {
 }
 
 #[tokio::test]
+async fn task_status_reports_the_latest_follow_up_run() {
+    let tmp = TempDir::new();
+    let workspace = tmp.0.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    git(&workspace, &["init", "-q"]);
+    std::fs::write(workspace.join("tracked.txt"), "before\n").unwrap();
+    git(&workspace, &["add", "tracked.txt"]);
+    git(
+        &workspace,
+        &[
+            "-c",
+            "user.name=T3 Test",
+            "-c",
+            "user.email=t3@example.test",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let parent_id = create_parent(&app, &workspace).await;
+    let parent = json_req(
+        &app,
+        Method::GET,
+        &format!("/api/threads/{parent_id}"),
+        None,
+    )
+    .await;
+    let project_id = parent["thread"]["project_id"].as_str().unwrap();
+    json_req(
+        &app,
+        Method::PATCH,
+        &format!("/api/projects/{project_id}"),
+        Some(json!({
+            "verify_command": "test -e task-status-verify-marker || (touch task-status-verify-marker && false)"
+        })),
+    )
+    .await;
+    json_req(
+        &app,
+        Method::PATCH,
+        "/api/settings",
+        Some(json!({"verify_max_auto_fixes": 0})),
+    )
+    .await;
+
+    let started = mcp_tool(
+        &app,
+        "delegate_task",
+        json!({
+            "parent_thread_id":parent_id,"title":"Retry task","task":"[slow] first attempt",
+            "provider":"mock","model":"mock"
+        }),
+    )
+    .await;
+    let task_id: Uuid = serde_json::from_value(started["task_id"].clone()).unwrap();
+    let child_id: Uuid = serde_json::from_value(started["child_thread_id"].clone()).unwrap();
+    let first_run_id: Uuid = serde_json::from_value(started["run_id"].clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), WsServerMessage::Delta { thread_id, .. } if thread_id == child_id) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::write(workspace.join("tracked.txt"), "trigger verify\n").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let WsServerMessage::RunStatusChanged {
+                thread_id,
+                run_id,
+                status: RunStatus::Failed,
+                ..
+            } = events.recv().await.unwrap()
+                && thread_id == child_id
+                && run_id == first_run_id
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let failed = mcp_tool(&app, "task_status", json!({"task_id":task_id})).await;
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["run_id"], first_run_id.to_string());
+
+    let sent = mcp_tool(
+        &app,
+        "thread_send",
+        json!({"thread_id":child_id,"prompt":"[slow] second attempt succeeded"}),
+    )
+    .await;
+    let second_run_id = sent["run_id"].clone();
+    assert_ne!(first_run_id.to_string(), second_run_id.as_str().unwrap());
+
+    let in_progress = mcp_tool(&app, "task_status", json!({"task_id":task_id})).await;
+    assert_eq!(in_progress["status"], "running");
+    assert_eq!(in_progress["run_id"], second_run_id);
+
+    let second_run_id: Uuid = serde_json::from_value(second_run_id.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let WsServerMessage::RunStatusChanged {
+                thread_id,
+                run_id,
+                status: RunStatus::Completed,
+                ..
+            } = events.recv().await.unwrap()
+                && thread_id == child_id
+                && run_id == second_run_id
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    let completed = mcp_tool(&app, "task_status", json!({"task_id":task_id})).await;
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["run_id"], second_run_id.to_string());
+    assert!(
+        completed["summary"]
+            .as_str()
+            .unwrap()
+            .contains("second attempt succeeded")
+    );
+}
+
+#[tokio::test]
 async fn queue_and_delegated_cancellation() {
     let tmp = TempDir::new();
     let state = tmp.state(AuthConfig::LocalOnly);
@@ -1369,6 +1504,26 @@ async fn queue_and_delegated_cancellation() {
             item["run_id"] == queued["run_id"] && item["payload"]["text"] == "queued"
         })
     );
+    let first_run_id: Uuid = serde_json::from_value(first["run_id"].clone()).unwrap();
+    let followed_up = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let WsServerMessage::RunStatusChanged {
+                thread_id,
+                run_id,
+                status: RunStatus::Completed,
+                followup,
+                ..
+            } = events.recv().await.unwrap()
+                && thread_id == id
+                && run_id == first_run_id
+            {
+                break followup;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(followed_up);
     wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
     wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
     let detail = json_req(&app, Method::GET, &path, None).await;
@@ -1848,6 +2003,8 @@ async fn swarm_mcp_status_and_reader_return_compact_truncated_messages() {
     let status = mcp_tool(&app, "swarm_status", json!({"thread_id":id})).await;
     assert_eq!(status["message_count"], 21);
     assert!(status.get("messages").is_none());
+    assert_eq!(status["worktrees"], json!([]));
+    assert_eq!(status["overlaps"], json!([]));
     assert_eq!(
         status["members"][0]
             .as_object()
@@ -1876,6 +2033,138 @@ async fn swarm_mcp_status_and_reader_return_compact_truncated_messages() {
     .await;
     assert_eq!(full[0]["text"], long_text);
     assert_eq!(full[0]["truncated"], false);
+}
+
+#[tokio::test]
+async fn task_and_swarm_status_report_worktree_clashes_and_behind_counts() {
+    let tmp = TempDir::new();
+    let workspace = tmp.0.join("repo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    git(&workspace, &["init", "-q", "--initial-branch=main"]);
+    git(&workspace, &["config", "user.name", "T3 Test"]);
+    git(&workspace, &["config", "user.email", "t3@example.test"]);
+    std::fs::write(workspace.join("base.txt"), "initial\n").unwrap();
+    git(&workspace, &["add", "."]);
+    git(&workspace, &["commit", "-qm", "initial"]);
+
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let parent_id = create_parent(&app, &workspace).await;
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{parent_id}/messages"),
+        Some(json!({"prompt":"/swarm inspect worktree clashes"})),
+    )
+    .await;
+    wait_for_thread(&mut events, parent_id, ThreadStatus::Completed).await;
+
+    let add_worker = |name: &str, isolation: &str| {
+        mcp_tool(
+            &app,
+            "swarm_add_worker",
+            json!({
+                "thread_id":parent_id,"name":name,"brief":"inspect","provider":"mock",
+                "model":"mock","isolation":isolation,
+            }),
+        )
+    };
+    let swarm_a = add_worker("swarm-a", "worktree").await;
+    let swarm_b = add_worker("swarm-b", "worktree").await;
+    let _shared = add_worker("shared", "shared").await;
+    let swarm_ids = [swarm_a["thread_id"].clone(), swarm_b["thread_id"].clone()]
+        .map(|value| serde_json::from_value::<Uuid>(value).unwrap());
+    for worker_id in swarm_ids {
+        wait_for_thread(&mut events, worker_id, ThreadStatus::Completed).await;
+    }
+    let worker_path = |id: Uuid| format!("/api/threads/{id}");
+    let mut swarm_paths = Vec::new();
+    for id in swarm_ids {
+        let detail = json_req(&app, Method::GET, &worker_path(id), None).await;
+        swarm_paths.push(PathBuf::from(
+            detail["thread"]["worktree_path"].as_str().unwrap(),
+        ));
+    }
+
+    let task_a = mcp_tool(
+        &app,
+        "delegate_task",
+        json!({
+            "parent_thread_id":parent_id,"title":"task-a","task":"inspect","provider":"mock",
+            "model":"mock","isolation":"worktree","mode":"wait"
+        }),
+    )
+    .await;
+    let task_b = mcp_tool(
+        &app,
+        "delegate_task",
+        json!({
+            "parent_thread_id":parent_id,"title":"task-b","task":"inspect","provider":"mock",
+            "model":"mock","isolation":"worktree","mode":"wait"
+        }),
+    )
+    .await;
+    let task_ids = [task_a["task_id"].clone(), task_b["task_id"].clone()]
+        .map(|value| serde_json::from_value::<Uuid>(value).unwrap());
+    let task_paths = [
+        task_a["worktree_path"].as_str().unwrap(),
+        task_b["worktree_path"].as_str().unwrap(),
+    ]
+    .map(PathBuf::from);
+
+    std::fs::write(workspace.join("base-progress.txt"), "advanced\n").unwrap();
+    git(&workspace, &["add", "."]);
+    git(&workspace, &["commit", "-qm", "advance base"]);
+    std::fs::write(swarm_paths[0].join("shared-swarm.txt"), "worker a\n").unwrap();
+    git(&swarm_paths[0], &["add", "."]);
+    git(&swarm_paths[0], &["commit", "-qm", "swarm a"]);
+    std::fs::write(swarm_paths[0].join("dirty-a.txt"), "dirty\n").unwrap();
+    std::fs::write(swarm_paths[1].join("shared-swarm.txt"), "worker b\n").unwrap();
+    std::fs::write(swarm_paths[1].join("dirty-b.txt"), "dirty\n").unwrap();
+    std::fs::write(task_paths[0].join("shared-task.txt"), "task a\n").unwrap();
+    git(&task_paths[0], &["add", "."]);
+    git(&task_paths[0], &["commit", "-qm", "task a"]);
+    std::fs::write(task_paths[1].join("shared-task.txt"), "task b\n").unwrap();
+
+    let swarm = mcp_tool(&app, "swarm_status", json!({"thread_id":parent_id})).await;
+    assert_eq!(swarm["worktrees"].as_array().unwrap().len(), 2);
+    for worker in swarm["worktrees"].as_array().unwrap() {
+        assert_eq!(worker["behind"], 1);
+        assert!(
+            worker["changed_files"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("shared-swarm.txt"))
+        );
+    }
+    let clash = swarm["overlaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|overlap| overlap["file"] == "shared-swarm.txt")
+        .unwrap();
+    assert_eq!(clash["workers"], json!(["swarm-a", "swarm-b"]));
+    let from_worker =
+        mcp_tool(&app, "swarm_status", json!({"thread_id":swarm_ids[0]})).await;
+    assert_eq!(from_worker["board_id"], swarm["board_id"]);
+    assert_eq!(from_worker["overlaps"], swarm["overlaps"]);
+
+    let task = mcp_tool(&app, "task_status", json!({"task_id":task_ids[0]})).await;
+    assert_eq!(task["worktree"]["behind"], 1);
+    assert!(
+        task["worktree"]["changed_files"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("shared-task.txt"))
+    );
+    let clash = task["overlaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|overlap| overlap["file"] == "shared-task.txt")
+        .unwrap();
+    assert_eq!(clash["workers"], json!(["task-a", "task-b"]));
 }
 
 #[tokio::test]

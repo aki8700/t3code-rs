@@ -1,6 +1,9 @@
 use crate::{
     parsers::{Parser, provider_error},
-    watchdog::{InFlightTools, RepetitionWatchdog, ToolLoopWatchdog},
+    retry::TOOL_FAILURE_LOOP_ERROR_CODE,
+    watchdog::{
+        InFlightTools, RepetitionWatchdog, ToolFailureAction, ToolFailureWatchdog, ToolLoopWatchdog,
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -43,6 +46,25 @@ const LEGACY_IDLE_STDOUT_TIMEOUT_ENV: &str = "T3_IDLE_STDOUT_TIMEOUT_SECS";
 /// While a tool step is running the idle limit is stretched by this factor
 /// (default 900 s -> 1 h), so a hung tool is still stopped eventually.
 const IN_FLIGHT_TOOL_IDLE_FACTOR: u32 = 4;
+const TOOL_FAILURE_LOOP_NOTICE: &str = "[automatic notice] This tool call has failed with the same result before. Stop retrying it and change approach. If it fails the same way again, the run will stop.";
+
+fn warn_agent_of_tool_failure(
+    steer: Option<&mpsc::UnboundedSender<StdinMsg>>,
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+) {
+    let steered = steer.is_some_and(|steer| {
+        steer
+            .send(StdinMsg::Steer(TOOL_FAILURE_LOOP_NOTICE.to_owned()))
+            .is_ok()
+    });
+    if !steered {
+        let _ = tx.send(StreamEvent::Item {
+            kind: TurnItemKind::SystemNotice,
+            summary: Some(TOOL_FAILURE_LOOP_NOTICE.to_owned()),
+            payload: json!({ "message": TOOL_FAILURE_LOOP_NOTICE }),
+        });
+    }
+}
 
 /// Messages written to a streaming provider's stdin while the turn is open.
 enum StdinMsg {
@@ -422,6 +444,7 @@ async fn run_turn_with_idle_timeout(
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
+    let steer_supported = matches!(&input, Input::StreamJson(_));
     let control_requests = ControlRequests::default();
     let interrupted = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
@@ -448,7 +471,7 @@ async fn run_turn_with_idle_timeout(
                 pid: child.id().expect("newly spawned child"),
                 #[cfg(unix)]
                 released: release_rx,
-                stdin_tx: matches!(input, Input::StreamJson(_)).then_some(steer_tx),
+                stdin_tx: matches!(input, Input::StreamJson(_)).then_some(steer_tx.clone()),
                 control_requests: Arc::clone(&control_requests),
                 interrupted: Arc::clone(&interrupted),
                 #[cfg(not(unix))]
@@ -518,6 +541,7 @@ async fn run_turn_with_idle_timeout(
                 provider,
                 secret,
                 &tx,
+                steer_supported.then_some(&steer_tx),
                 &control_requests,
                 close_tx,
                 reader_stop_tx,
@@ -551,10 +575,13 @@ async fn run_turn_with_idle_timeout(
         }
         ReadOutcome::StoppedAfterCompleted(completed) => Some(completed),
         ReadOutcome::Stopped(message) => {
+            let error_code = message
+                .starts_with("tool_failure_loop:")
+                .then(|| TOOL_FAILURE_LOOP_ERROR_CODE.to_owned());
             let _ = tx.send(StreamEvent::Failed {
                 message: message.into(),
                 reset_at: None,
-                error_code: None,
+                error_code,
             });
             return Ok(());
         }
@@ -657,6 +684,7 @@ async fn read_events(
     provider: ProviderId,
     secret: Option<&str>,
     tx: &mpsc::UnboundedSender<StreamEvent>,
+    steer: Option<&mpsc::UnboundedSender<StdinMsg>>,
     control_requests: &ControlRequests,
     close_stdin: oneshot::Sender<()>,
     mut stop_process: oneshot::Sender<()>,
@@ -670,6 +698,7 @@ async fn read_events(
     let mut assistant = RepetitionWatchdog::default();
     let mut reasoning = RepetitionWatchdog::default();
     let mut tool_loop = ToolLoopWatchdog::default();
+    let mut failed_tools = ToolFailureWatchdog::default();
     let mut in_flight = InFlightTools::default();
     loop {
         let wait = match in_flight.oldest() {
@@ -751,6 +780,26 @@ async fn read_events(
                     );
                 }
                 if !matches!(terminal, Some(StreamEvent::Completed { .. })) {
+                    let failure_action = match &event {
+                        StreamEvent::Item {
+                            kind,
+                            summary,
+                            payload,
+                        } => failed_tools.push(*kind, summary.as_deref(), payload),
+                        _ => ToolFailureAction::None,
+                    };
+                    match failure_action {
+                        ToolFailureAction::Warn => {
+                            warn_agent_of_tool_failure(steer, tx);
+                        }
+                        ToolFailureAction::Stop => {
+                            let _ = stop_process.send(());
+                            return Ok(ReadOutcome::Stopped(
+                                "tool_failure_loop: same tool call failed repeatedly; stopped the provider run".into(),
+                            ));
+                        }
+                        ToolFailureAction::None => {}
+                    }
                     let stop_reason = match &event {
                         StreamEvent::AssistantDelta { text } if assistant.push(text) => Some(
                             "repetition loop detected — terminated runaway provider process to save tokens/battery",
@@ -894,6 +943,25 @@ mod tests {
         traits::ProviderDriver,
         types::{McpInjectionSpec, PendingResponse},
     };
+
+    #[test]
+    fn failure_notice_uses_steering_or_a_system_notice_fallback() {
+        let (steer_tx, mut steer_rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        warn_agent_of_tool_failure(Some(&steer_tx), &tx);
+        assert!(matches!(
+            steer_rx.try_recv(),
+            Ok(StdinMsg::Steer(message)) if message == TOOL_FAILURE_LOOP_NOTICE
+        ));
+        assert!(rx.try_recv().is_err());
+
+        warn_agent_of_tool_failure(None, &tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(StreamEvent::Item { kind: TurnItemKind::SystemNotice, summary: Some(message), .. })
+                if message == TOOL_FAILURE_LOOP_NOTICE
+        ));
+    }
 
     struct Fixture(PathBuf);
 
@@ -1281,6 +1349,48 @@ wait
     }
 
     #[tokio::test]
+    async fn repeated_failed_tool_result_survives_interleaved_read_success() {
+        let fixture = Fixture::new(
+            r#"
+IFS= read -r prompt
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"failure-loop"}'
+printf '%s\n' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"make build"}}]}}' \
+  '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":true,"content":"failed in 10ms"}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"src/main.rs"}}]}}' \
+  '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"r1","content":"source"}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"make build"}}]}}' \
+  '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b2","is_error":true,"content":"failed in 30ms"}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b3","name":"Bash","input":{"command":"make build"}}]}}' \
+  '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b3","is_error":true,"content":"failed in 50ms"}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b4","name":"Bash","input":{"command":"make build"}}]}}' \
+  '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b4","is_error":true,"content":"failed in 80ms"}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b5","name":"Bash","input":{"command":"make build"}}]}}' \
+  '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b5","is_error":true,"content":"failed in 100ms"}]}}' \
+  '{"type":"result","subtype":"success","result":"unexpected completion"}'
+"#,
+        );
+        let driver = ClaudeDriver::new(fixture.binary());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        driver
+            .run_turn(test_request(ProviderId::Claude), tx)
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = receive(&mut rx).await {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::Failed { error_code: Some(code), .. }
+                    if code == "tool_failure_loop"
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn completed_response_is_not_tested_for_repetition() {
         let answer = "The final answer intentionally repeats this same example.\n".repeat(10);
         let event = json!({"type": "result", "subtype": "success", "result": answer});
@@ -1334,6 +1444,7 @@ wait
             ProviderId::Claude,
             None,
             &tx,
+            None,
             &ControlRequests::default(),
             close,
             stop,

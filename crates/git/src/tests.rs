@@ -298,6 +298,54 @@ async fn worktree_isolation_and_whitespace_diff() {
 }
 
 #[tokio::test]
+async fn worktree_branch_status_includes_committed_and_uncommitted_files_and_behind_count() {
+    let fixture = TempRepo::new().await;
+    fixture.write("shared.txt", "base\n");
+    fixture.commit().await;
+    let manager = GitManager::new(fixture.root.join("worktrees"));
+    let (worktree, _) = manager
+        .create_worktree(&fixture.repo, "worker", Some("main"))
+        .await
+        .unwrap();
+
+    fixture.write("main-only.txt", "base advanced\n");
+    fixture.commit().await;
+    fs::write(worktree.join("branch.txt"), "committed by worker\n").unwrap();
+    git_output(&worktree, &["add", "--", "branch.txt"])
+        .await
+        .unwrap();
+    git_output(
+        &worktree,
+        &[
+            "-c",
+            "user.name=Git test",
+            "-c",
+            "user.email=git-test@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-m",
+            "Worker commit",
+        ],
+    )
+    .await
+    .unwrap();
+    fs::write(worktree.join("shared.txt"), "uncommitted edit\n").unwrap();
+    fs::write(worktree.join("untracked.txt"), "untracked\n").unwrap();
+
+    let status = GitManager::worktree_branch_status(&worktree, "main")
+        .await
+        .unwrap();
+    assert_eq!(status.behind, 1);
+    assert_eq!(
+        status.changed_files,
+        vec!["branch.txt", "shared.txt", "untracked.txt"]
+    );
+}
+
+#[tokio::test]
 async fn staged_rename_and_literal_filenames_from_nested_directory() {
     let fixture = TempRepo::new().await;
     let repo = &fixture.repo;
@@ -507,6 +555,45 @@ async fn remove_worktree_pins_uncommitted_work_under_snapshot_ref() {
         .unwrap();
     let head = git_output(repo, &["rev-parse", &branch]).await.unwrap();
     assert_eq!(parent, head);
+}
+
+#[tokio::test]
+async fn new_snapshot_prunes_expired_refs_and_keeps_younger_ones() {
+    let fixture = TempRepo::new().await;
+    fixture.write("tracked.txt", "base\n");
+    fixture.commit().await;
+    let now = chrono::Utc::now();
+    let expired = format!(
+        "refs/t3/snapshots/expired-{}",
+        (now - chrono::Duration::days(15)).format("%Y%m%dT%H%M%S%3fZ")
+    );
+    let recent = format!(
+        "refs/t3/snapshots/recent-{}",
+        (now - chrono::Duration::days(13)).format("%Y%m%dT%H%M%S%3fZ")
+    );
+    for reference in [&expired, &recent] {
+        git_output(&fixture.repo, &["update-ref", reference, "HEAD"])
+            .await
+            .unwrap();
+    }
+
+    let manager = GitManager::new(fixture.root.join("worktrees"));
+    let (worktree, _) = manager
+        .create_worktree(&fixture.repo, "retention", None)
+        .await
+        .unwrap();
+    fs::write(worktree.join("tracked.txt"), "edited\n").unwrap();
+    let snapshot = manager
+        .remove_worktree(&fixture.repo, &worktree)
+        .await
+        .unwrap()
+        .expect("dirty worktree is snapshotted");
+
+    let refs = snapshot_refs(&fixture.repo).await;
+    assert!(!refs.contains(&expired));
+    assert!(refs.contains(&recent));
+    assert!(refs.contains(&snapshot));
+    assert_eq!(refs.len(), 2);
 }
 
 #[tokio::test]

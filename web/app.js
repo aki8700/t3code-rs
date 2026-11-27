@@ -4800,7 +4800,8 @@ function notifyUser(title, body, threadId) {
 }
 
 // Run outcomes raise OS notifications for top-level threads and forks; swarm workers and delegated tasks stay in-app.
-async function notifyRunOutcome(title, threadId) {
+async function notifyRunOutcome(title, threadId, followup = false) {
+  if (followup) return;
   // a just-spawned child may not be in the thread list yet
   const t = threadById(threadId) || (await api(`/api/threads/${threadId}`).catch(() => null))?.thread;
   if (!t?.parent_thread_id || t.relationship === 'fork') notifyUser(title, cleanTitle(t?.title) || threadId, threadId);
@@ -4845,7 +4846,7 @@ function handleWs(m) {
       if (TERMINAL_RUN.has(m.status)) {
         S.live.delete(m.thread_id);
         S.liveUsage.delete(m.thread_id);
-        if (m.status === 'completed' || m.status === 'failed') notifyRunOutcome(m.status === 'completed' ? '実行完了' : '実行失敗', m.thread_id);
+        if (m.status === 'completed' || m.status === 'failed') notifyRunOutcome(m.status === 'completed' ? '実行完了' : '実行失敗', m.thread_id, m.status === 'completed' && m.followup);
         if (m.status === 'failed' && m.error) toast(`実行失敗: ${m.error}`, 'err', 6000);
         if (m.thread_id === cur) { loadDetailSoon(); refreshDiffSoon(); loadSwarm(cur); }
         loadThreadsSoon(); loadDbStatsSoon(); loadUsageSoon(); loadUsageLimitsSoon();

@@ -18,6 +18,7 @@ const PATCH_LIMIT: usize = 200 * 1024;
 const MAX_TOTAL_PATCH_BYTES: usize = 2 * 1024 * 1024;
 const PATCH_TRUNCATED_MARKER: &str = "\n... [truncated]";
 const BUDGET_TRUNCATED_MARKER: &str = "[truncated: total diff patch budget exceeded]";
+const SNAPSHOT_RETENTION_DAYS: i64 = 14;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -29,6 +30,12 @@ pub enum MergeOutcome {
         conflict_files: Vec<String>,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchWorktreeStatus {
+    pub changed_files: Vec<String>,
+    pub behind: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +332,40 @@ impl GitManager {
         Ok(())
     }
 
+    /// Remove worktree snapshot refs whose timestamp in the ref name is over 14 days old.
+    /// Refs without the timestamp format used by `snapshot_worktree` are left untouched.
+    pub async fn prune_snapshots(repo_root: &Path) -> CoreResult<usize> {
+        let output = git_output(
+            repo_root,
+            &["for-each-ref", "--format=%(refname)", "refs/t3/snapshots/"],
+        )
+        .await?;
+        // The ref name stores milliseconds, so leave one millisecond of slack to avoid
+        // expiring a snapshot just before its full retention interval has elapsed.
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::days(SNAPSHOT_RETENTION_DAYS)
+            - chrono::Duration::milliseconds(1);
+        let mut pruned = 0;
+        for reference in String::from_utf8_lossy(&output).lines() {
+            let Some(timestamp) = reference
+                .rsplit_once('-')
+                .and_then(|(_, timestamp)| timestamp.strip_suffix('Z'))
+            else {
+                continue;
+            };
+            let Ok(created_at) =
+                chrono::NaiveDateTime::parse_from_str(timestamp, "%Y%m%dT%H%M%S%3f")
+            else {
+                continue;
+            };
+            if created_at.and_utc() < cutoff {
+                git_output(repo_root, &["update-ref", "-d", reference]).await?;
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
+
     pub async fn create_worktree(
         &self,
         repo_root: &Path,
@@ -485,6 +526,68 @@ impl GitManager {
             MAX_TOTAL_PATCH_BYTES,
         )
         .await
+    }
+
+    /// Read the paths changed by a worktree since it diverged from `base_ref`, plus its dirty files.
+    /// All git commands here are read-only and disable external diff/text conversion drivers.
+    pub async fn worktree_branch_status(
+        worktree: &Path,
+        base_ref: &str,
+    ) -> CoreResult<BranchWorktreeStatus> {
+        let base = resolve_commit(worktree, base_ref).await?;
+        let head = resolve_commit(worktree, "HEAD").await?;
+        let merge_base = git_output(worktree, &["merge-base", &base, &head]).await?;
+        let merge_base = String::from_utf8_lossy(&merge_base).trim().to_owned();
+        let committed = git_output(
+            worktree,
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                &merge_base,
+                &head,
+                "--",
+            ],
+        )
+        .await?;
+        let dirty = git_output(
+            worktree,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--no-renames",
+                "--untracked-files=all",
+            ],
+        )
+        .await?;
+        let behind = git_output(
+            worktree,
+            &["rev-list", "--count", &format!("{head}..{base}")],
+        )
+        .await?;
+        let behind = String::from_utf8_lossy(&behind)
+            .trim()
+            .parse()
+            .map_err(git_error)?;
+        let mut changed_files = nul_fields(&committed)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect::<Vec<_>>();
+        changed_files.extend(
+            status_entries(&dirty)?
+                .into_iter()
+                .map(|entry| String::from_utf8_lossy(entry.path).into_owned()),
+        );
+        changed_files.sort_unstable();
+        changed_files.dedup();
+        Ok(BranchWorktreeStatus {
+            changed_files,
+            behind,
+        })
     }
 
     async fn branch_diff_summary_with_budget(
@@ -953,6 +1056,9 @@ async fn snapshot_worktree(repo_root: &Path, worktree: &Path) -> CoreResult<Opti
     let sha = String::from_utf8_lossy(&sha).trim().to_owned();
     // The empty old value makes update-ref refuse to overwrite an existing snapshot.
     git_output(repo_root, &["update-ref", &refname, &sha, ""]).await?;
+    if let Err(error) = GitManager::prune_snapshots(repo_root).await {
+        tracing::warn!(%error, "Failed to prune expired worktree snapshots");
+    }
     Ok(Some(refname))
 }
 

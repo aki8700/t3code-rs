@@ -90,6 +90,8 @@ pub enum WsServerMessage {
         thread_id: Uuid,
         run_id: Uuid,
         status: RunStatus,
+        #[serde(default)]
+        followup: bool,
         error: Option<String>,
     },
     Delta {
