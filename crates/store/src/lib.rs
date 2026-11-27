@@ -289,6 +289,23 @@ impl SqliteStore {
         .await
     }
 
+    /// Returns threads whose provider processes still need restart cleanup.
+    pub async fn threads_with_pending_orphan_processes(&self) -> CoreResult<Vec<Uuid>> {
+        self.with_reader(|connection| {
+            query_all(
+                connection,
+                "SELECT DISTINCT runs.thread_id
+                 FROM run_orphan_processes
+                 JOIN runs ON runs.id = run_orphan_processes.run_id
+                 WHERE run_orphan_processes.cleanup_pending = 1
+                 ORDER BY runs.thread_id",
+                [],
+                |row| parse(row, 0),
+            )
+        })
+        .await
+    }
+
     pub fn open(db_path: impl AsRef<Path>, storage_cfg: StorageConfig) -> CoreResult<Self> {
         let db_path = std::path::absolute(db_path.as_ref()).map_err(storage_error)?;
         #[cfg(unix)]
