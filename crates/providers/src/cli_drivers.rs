@@ -9,8 +9,8 @@ use t3_core::{
     protocol::StreamEvent,
     traits::{CoreError, CoreResult, ProviderDriver, TurnRequest},
     types::{
-        Attachment, InteractionMode, McpInjectionSpec, PendingResponse, ProviderHealth, ProviderId,
-        RuntimeMode,
+        Attachment, InteractionMode, McpInjectionSpec, McpToolProfile, PendingResponse,
+        ProviderHealth, ProviderId, RuntimeMode,
     },
 };
 use tokio::{process::Command, sync::mpsc};
@@ -262,9 +262,9 @@ fn claude_args(cmd: &mut Command, req: &TurnRequest) -> Input {
             "--permission-prompt-tool",
             "stdio",
         ]);
-        if req.mcp_injection.is_some() {
+        if let Some(spec) = &req.mcp_injection {
             cmd.arg("--allowedTools")
-                .args(preapproved_t3rs_tools(req.runtime_mode));
+                .args(preapproved_t3rs_tools(req.runtime_mode, spec.tool_profile));
         }
     }
     if let Some(spec) = &req.mcp_injection {
@@ -278,7 +278,9 @@ fn claude_args(cmd: &mut Command, req: &TurnRequest) -> Input {
                 "env": { "T3_MCP_TOKEN": "${T3_MCP_TOKEN}" },
             }),
         );
-        if let Some(cua_bin) = &spec.cua_binary_path {
+        if should_inject_swiftcua(req, spec)
+            && let Some(cua_bin) = &spec.cua_binary_path
+        {
             servers.insert(
                 "swiftcua".into(),
                 json!({
@@ -305,10 +307,33 @@ fn claude_args(cmd: &mut Command, req: &TurnRequest) -> Input {
     Input::StreamJson(content)
 }
 
+const WORKER_PREAPPROVED_TOOLS: [&str; 8] = [
+    "swarm_status",
+    "swarm_post_message",
+    "swarm_read_board",
+    "code_index",
+    "code_slice",
+    "code_grep",
+    "code_diff",
+    "compaction_econ",
+];
+
+fn should_inject_swiftcua(req: &TurnRequest, spec: &McpInjectionSpec) -> bool {
+    spec.cua_binary_path.is_some()
+        && req.interaction_mode != InteractionMode::Plan
+        && spec.tool_profile != McpToolProfile::Worker
+}
+
 /// Internal tools that run without a prompt when approvals are relayed. The server caps
 /// delegated children at the caller's modes, so these cannot raise a child above its parent.
 /// `task_merge` writes into the parent workspace, so it is pre-approved only with edits.
-fn preapproved_t3rs_tools(mode: RuntimeMode) -> Vec<String> {
+fn preapproved_t3rs_tools(mode: RuntimeMode, profile: McpToolProfile) -> Vec<String> {
+    if profile == McpToolProfile::Worker {
+        return WORKER_PREAPPROVED_TOOLS
+            .into_iter()
+            .map(|tool| format!("mcp__t3rs__{tool}"))
+            .collect();
+    }
     const TOOLS: [&str; 20] = [
         "orchestrator_capabilities",
         "swarm_status",
@@ -381,7 +406,9 @@ fn codex_args(cmd: &mut Command, req: &TurnRequest) -> Input {
             "-c",
             r#"mcp_servers.t3rs.env_vars=["T3_MCP_TOKEN"]"#,
         ]);
-        if let Some(cua_bin) = &spec.cua_binary_path {
+        if should_inject_swiftcua(req, spec)
+            && let Some(cua_bin) = &spec.cua_binary_path
+        {
             cmd.args([
                 "-c",
                 &format!(
@@ -467,7 +494,9 @@ fn opencode_args(cmd: &mut Command, req: &TurnRequest) -> Input {
                 },
             }),
         );
-        if let Some(cua_bin) = &spec.cua_binary_path {
+        if should_inject_swiftcua(req, spec)
+            && let Some(cua_bin) = &spec.cua_binary_path
+        {
             mcp.insert(
                 "swiftcua".into(),
                 json!({
@@ -539,6 +568,7 @@ mod tests {
             internal_token: "fixture-token".into(),
             thread_id: Uuid::nil(),
             cua_binary_path: None,
+            tool_profile: McpToolProfile::Full,
         });
         req
     }
@@ -585,7 +615,10 @@ mod tests {
             ]
             .into_iter()
             .map(str::to_owned)
-            .chain(preapproved_t3rs_tools(RuntimeMode::AutoAcceptEdits))
+            .chain(preapproved_t3rs_tools(
+                RuntimeMode::AutoAcceptEdits,
+                McpToolProfile::Full,
+            ))
             .chain(["--mcp-config".to_owned()])
             .collect::<Vec<_>>()
         );
@@ -1132,5 +1165,53 @@ mod tests {
                 "command": ["/Applications/SwiftCUA.app/Contents/MacOS/cua", "mcp"],
             })
         );
+    }
+
+    #[test]
+    fn swiftcua_mcp_is_omitted_in_plan_mode_and_worker_profile() {
+        for (interaction_mode, profile) in [
+            (InteractionMode::Plan, McpToolProfile::Full),
+            (InteractionMode::Default, McpToolProfile::Worker),
+        ] {
+            let mut req = request(ProviderId::Claude);
+            req.interaction_mode = interaction_mode;
+            let spec = req.mcp_injection.as_mut().unwrap();
+            spec.cua_binary_path = Some(PathBuf::from(
+                "/Applications/SwiftCUA.app/Contents/MacOS/cua",
+            ));
+            spec.tool_profile = profile;
+
+            let mut claude_cmd = Command::new("claude");
+            claude_args(&mut claude_cmd, &req);
+            let claude_args_vec = args(&claude_cmd);
+            let idx = claude_args_vec
+                .iter()
+                .position(|a| a == "--mcp-config")
+                .unwrap();
+            let mcp: serde_json::Value = serde_json::from_str(&claude_args_vec[idx + 1]).unwrap();
+            assert!(mcp["mcpServers"].get("swiftcua").is_none());
+
+            let mut codex_cmd = Command::new("codex");
+            codex_args(&mut codex_cmd, &req);
+            let codex_args_vec = args(&codex_cmd);
+            assert!(codex_args_vec.iter().all(|arg| !arg.contains("swiftcua")));
+
+            let mut opencode_cmd = Command::new("opencode");
+            opencode_args(&mut opencode_cmd, &req);
+            let oc_env = opencode_cmd
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| *k == "OPENCODE_CONFIG_CONTENT")
+                .and_then(|(_, v)| v)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let oc_json: serde_json::Value = serde_json::from_str(&oc_env).unwrap();
+            assert!(oc_json["mcp"].get("swiftcua").is_none());
+        }
+        let worker_tools =
+            preapproved_t3rs_tools(RuntimeMode::AutoAcceptEdits, McpToolProfile::Worker);
+        assert_eq!(worker_tools.len(), WORKER_PREAPPROVED_TOOLS.len());
+        assert!(worker_tools.iter().all(|t| !t.contains("swarm_add_worker")));
     }
 }

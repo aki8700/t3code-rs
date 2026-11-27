@@ -1063,6 +1063,8 @@ impl RunCoordinator {
             let mut injection = self.0.injection.clone();
             injection.thread_id = thread.id;
             injection.internal_token = token.token.clone();
+            injection.tool_profile =
+                t3_mcp::OrchestratorBackend::tool_profile(self, thread.id).await;
             (Some(token), Some(injection))
         } else {
             (None, None)

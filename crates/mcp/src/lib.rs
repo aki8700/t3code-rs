@@ -170,8 +170,22 @@ struct PauseAllInput {
     paused: bool,
 }
 
+pub const WORKER_ALLOWED_TOOLS: &[&str] = &[
+    "swarm_status",
+    "swarm_post_message",
+    "swarm_read_board",
+    "code_index",
+    "code_slice",
+    "code_grep",
+    "code_diff",
+    "compaction_econ",
+];
+
 #[async_trait]
 pub trait OrchestratorBackend: Send + Sync {
+    async fn tool_profile(&self, _thread_id: Uuid) -> McpToolProfile {
+        McpToolProfile::Full
+    }
     async fn get_thread(&self, id: Uuid) -> CoreResult<Thread>;
     /// Resolve the workspace for a scoped code tool. Backends with shared threads
     /// should also resolve the caller's project root when there is no worktree.
@@ -350,7 +364,23 @@ impl<B: OrchestratorBackend> McpServer<B> {
                 "serverInfo": {"name": "t3code-rs", "version": env!("CARGO_PKG_VERSION")}
             }),
             "ping" => json!({}),
-            "tools/list" => json!({"tools": tools()}),
+            "tools/list" => {
+                let profile = self.caller_profile(context).await;
+                let listed: Vec<Value> = if profile == McpToolProfile::Worker {
+                    tools()
+                        .iter()
+                        .filter(|tool| {
+                            tool.get("name")
+                                .and_then(Value::as_str)
+                                .is_some_and(|name| WORKER_ALLOWED_TOOLS.contains(&name))
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    tools().to_vec()
+                };
+                json!({"tools": listed})
+            }
             "tools/call" => {
                 let Ok(call) = serde_json::from_value::<ToolCall>(request["params"].clone()) else {
                     return Some(rpc_error(id, -32602, "Invalid tool call parameters"));
@@ -367,7 +397,21 @@ impl<B: OrchestratorBackend> McpServer<B> {
         Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
     }
 
+    async fn caller_profile(&self, context: CallContext<'_>) -> McpToolProfile {
+        match context.thread_id {
+            Some(id) => self.backend.tool_profile(id).await,
+            None => McpToolProfile::Full,
+        }
+    }
+
     async fn call(&self, name: &str, args: Value, context: CallContext<'_>) -> CoreResult<Value> {
+        if self.caller_profile(context).await == McpToolProfile::Worker
+            && !WORKER_ALLOWED_TOOLS.contains(&name)
+        {
+            return Err(CoreError::InvalidArgument(format!(
+                "tool `{name}` is not available in worker profile"
+            )));
+        }
         validate_argument_keys(name, &args)?;
         let backend = &self.backend;
         let CallContext { thread_id, caller } = context;
@@ -1734,5 +1778,107 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(spoof_res["result"]["isError"], true);
+    }
+
+    struct WorkerProfileBackend {
+        worker_id: Uuid,
+    }
+
+    #[async_trait]
+    impl OrchestratorBackend for WorkerProfileBackend {
+        async fn tool_profile(&self, thread_id: Uuid) -> McpToolProfile {
+            if thread_id == self.worker_id {
+                McpToolProfile::Worker
+            } else {
+                McpToolProfile::Full
+            }
+        }
+        async fn get_thread(&self, _id: Uuid) -> CoreResult<Thread> {
+            Err(CoreError::NotFound("thread".into()))
+        }
+        async fn capabilities(&self) -> CoreResult<Capabilities> {
+            Ok(Capabilities {
+                providers: Vec::new(),
+                model_tiers: Vec::new(),
+            })
+        }
+        async fn delegate(
+            &self,
+            _spec: DelegationSpec,
+            _mode: DelegateMode,
+        ) -> CoreResult<DelegatedTask> {
+            Err(CoreError::InvalidArgument("stub".into()))
+        }
+        async fn task_status(&self, _task_id: Uuid) -> CoreResult<DelegatedTask> {
+            Err(CoreError::InvalidArgument("stub".into()))
+        }
+        async fn task_cancel(&self, _task_id: Uuid) -> CoreResult<DelegatedTask> {
+            Err(CoreError::InvalidArgument("stub".into()))
+        }
+        async fn thread_list(
+            &self,
+            _project_id: Option<Uuid>,
+            _include_archived: bool,
+            _limit: usize,
+        ) -> CoreResult<Vec<Thread>> {
+            Ok(Vec::new())
+        }
+        async fn thread_read(&self, _thread_id: Uuid, _limit: usize) -> CoreResult<ThreadRead> {
+            Err(CoreError::NotFound("thread".into()))
+        }
+        async fn thread_send(
+            &self,
+            _thread_id: Uuid,
+            _prompt: String,
+            _behavior: Option<FollowUpBehavior>,
+        ) -> CoreResult<Uuid> {
+            Err(CoreError::InvalidArgument("stub".into()))
+        }
+        async fn thread_fork(&self, _thread_id: Uuid, _options: ForkOptions) -> CoreResult<Thread> {
+            Err(CoreError::InvalidArgument("stub".into()))
+        }
+        async fn orch_stats(&self) -> CoreResult<Vec<OrchModelStat>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_tool_profile_narrows_tools_list_and_blocks_disallowed_calls() {
+        let worker_id = Uuid::new_v4();
+        let full_id = Uuid::new_v4();
+        let server = McpServer::new(WorkerProfileBackend { worker_id });
+        let list_req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+
+        let full_res = server
+            .handle(list_req.clone(), Some(full_id))
+            .await
+            .unwrap();
+        let full_len = full_res["result"]["tools"].as_array().unwrap().len();
+        assert!(full_len > WORKER_ALLOWED_TOOLS.len());
+
+        let worker_res = server.handle(list_req, Some(worker_id)).await.unwrap();
+        let worker_tools = worker_res["result"]["tools"].as_array().unwrap();
+        assert_eq!(worker_tools.len(), WORKER_ALLOWED_TOOLS.len());
+        let names: Vec<&str> = worker_tools
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        for allowed in WORKER_ALLOWED_TOOLS {
+            assert!(names.contains(allowed), "missing allowed tool {allowed}");
+        }
+
+        for forbidden in ["swarm_add_worker", "pause_all", "delegate_task"] {
+            let res = server
+                .handle(rpc_call(forbidden, json!({})), Some(worker_id))
+                .await
+                .unwrap();
+            assert_eq!(res["result"]["isError"], true);
+            assert!(
+                res["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not available in worker profile")
+            );
+        }
     }
 }
