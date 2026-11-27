@@ -25,8 +25,14 @@ import {
   getPaletteSuggestions, loadShellHistory, pushShellHistory,
 } from './js/commands.js';
 import {
-  createGenerationFence, createDeltaCoalescer, createNotificationGate,
+  createGenerationFence, createDeltaCoalescer, createNotificationGate, createSeqTracker,
 } from './js/ui-guards.js';
+import {
+  threadCmp, buildTree, treeHas, orderProjects, threadsForProject, visibleProjectTree,
+  searchTerms, plainSnippet, aroundMatch, groupHits,
+  swarmWorkers, bareName, normalizeBoard, swarmCounts, swarmSummaryText, swarmPillLabel,
+  normalizeMonitor, limitsSummaryData, isWorktreeChild,
+} from './js/thread-helpers.js';
 
 // ───────────────────────── state ─────────────────────────
 const S = {
@@ -84,6 +90,8 @@ const S = {
 // Wave 1 (P0-2 / P1-2 / P1-3): pure guards from web/js/ui-guards.js; app.js only wires them in.
 const uiFence = createGenerationFence();
 const notifyGate = createNotificationGate();
+// Wave 2 (P0-1): monotonic server seq tracker; handleWs() resyncs on a gap (see below).
+const seqTracker = createSeqTracker();
 
 const threadById = (id) => S.threads.find((t) => t.id === id) || (S.detail?.thread?.id === id ? S.detail.thread : null)
   || S.detail?.children?.find((t) => t.id === id) || null;
@@ -469,22 +477,7 @@ function monogram(project, cls = '') {
   return el;
 }
 
-const threadCmp = (a, b) => (b.pinned - a.pinned) || (Date.parse(b.updated_at) - Date.parse(a.updated_at));
-function buildTree(list) {
-  const ids = new Set(list.map((t) => t.id));
-  const byParent = new Map();
-  for (const t of list) {
-    const p = t.parent_thread_id && ids.has(t.parent_thread_id) ? t.parent_thread_id : null;
-    if (!byParent.has(p)) byParent.set(p, []);
-    byParent.get(p).push(t);
-  }
-  const mk = (t, seen) => {
-    seen.add(t.id);
-    return { t, kids: (byParent.get(t.id) || []).filter((k) => !seen.has(k.id)).sort(threadCmp).map((k) => mk(k, seen)) };
-  };
-  return (byParent.get(null) || []).sort(threadCmp).map((t) => mk(t, new Set()));
-}
-const treeHas = (node, id) => node.t.id === id || node.kids.some((k) => treeHas(k, id));
+// Thread grouping / sorting (threadCmp, buildTree, treeHas) live in web/js/thread-helpers.js (Wave 2 / G-6).
 
 function threadRow(t, { shelf = false, kids = [] } = {}) {
   const pend = (S.pending.get(t.id) || []).length;
@@ -525,11 +518,11 @@ function threadRow(t, { shelf = false, kids = [] } = {}) {
 
 const THREADS_PER_PROJECT = 10;
 function projectGroup(p) {
-  const list = S.threads.filter((t) => t.project_id === p.id && (S.showArchived || !t.archived));
+  const list = threadsForProject(S.threads, p.id, S.showArchived);
   const tree = buildTree(list);
   const collapsed = S.collapsedProjects.has(p.id);
   const all = S.expandedProjects.has(p.id);
-  const shown = all ? tree : tree.filter((n, i) => i < THREADS_PER_PROJECT || treeHas(n, S.threadId));
+  const shown = visibleProjectTree(tree, S.threadId, all, THREADS_PER_PROJECT);
   const current = p.id === S.projectId;
   return h('div', { class: `pgroup${current ? ' current' : ''}`, dataset: { project: p.id } },
     h('div', { class: 'pg-head' },
@@ -553,16 +546,7 @@ function projectGroup(p) {
 
 /** Projects with threads, most recently active first; projects without threads separately. */
 function orderedProjects() {
-  const latest = new Map();
-  for (const t of S.threads) {
-    if (t.archived && !S.showArchived) continue;
-    const at = Date.parse(t.updated_at) || 0;
-    if (at >= (latest.get(t.project_id) ?? 0)) latest.set(t.project_id, at);
-  }
-  return {
-    active: S.projects.filter((p) => latest.has(p.id)).sort((a, b) => latest.get(b.id) - latest.get(a.id)),
-    empty: S.projects.filter((p) => !latest.has(p.id)),
-  };
+  return orderProjects(S.projects, S.threads, S.showArchived);
 }
 const hasThreads = (projectId) => S.threads.some((t) => t.project_id === projectId && !t.archived);
 /** New threads default to the current project, unless it is empty: then to the most recently active one. */
@@ -931,13 +915,7 @@ function childrenMenu(anchor) {
   openPopover(anchor, h('div', { class: 'menu kids-list', role: 'menu', 'aria-label': '子スレッド' }, rows), { cls: 'kids-pop', below: true });
 }
 
-/** 専用 worktree 子スレッドか: 親と worktree/ブランチが異なる子。親が未読込でも worktree_path があれば対象とする。 */
-function isWorktreeChild(child, parent) {
-  if (!child?.parent_thread_id || !child.worktree_path) return false;
-  if (parent && child.worktree_path === parent.worktree_path) return false;
-  if (parent && child.branch && parent.branch && child.branch === parent.branch) return false;
-  return true;
-}
+// isWorktreeChild lives in web/js/thread-helpers.js (Wave 2 / G-6).
 
 /** 親スレッドとの差分を取得し、#diff-panel にバナー付きで表示する。 */
 async function showParentDiff(parentId, childId) {
@@ -2686,10 +2664,7 @@ async function loadMonitor() {
 }
 
 function renderMonitor(body, d) {
-  const pending = Array.isArray(d.pending_requests) ? d.pending_requests : [];
-  const runs = Array.isArray(d.active_runs) ? d.active_runs : [];
-  const queued = Array.isArray(d.queued_thread_ids) ? d.queued_thread_ids : [];
-  const shells = Number(d.active_shells) || 0;
+  const { pending, runs, queued, shells } = normalizeMonitor(d);
 
   const pendingRows = pending.map((r) => {
     const t = threadById(r.thread_id);
@@ -3073,47 +3048,15 @@ function delegateDialog(initialTask = '') {
   }, { cls: 'form-modal' });
 }
 
-/** Search snippet as plain prose: server highlight tags and Markdown syntax removed. */
-const plainSnippet = (s) => String(s || '')
-  .replace(/<\/?(mark|b)>/gi, '')
-  .replace(/!?\[([^\]\n]*)\]\([^)\n]*\)?/g, '$1')
-  .replace(/```[\w-]*|`|\*\*|__|~~/g, '')
-  .replace(/(^|\n)\s*(#{1,6}\s+|>\s*|[-*+]\s+)/g, '$1')
-  .replace(/\|?\s*:?-{3,}:?\s*\|?|\|/g, ' ')
-  .replace(/\s+/g, ' ').trim();
-const searchTerms = (q) => [...new Set(q.split(/\s+/).map((t) => t.replace(/^["'*]+|["'*]+$/g, '')).filter(Boolean))].sort((a, b) => b.length - a.length);
+// Search helpers (plainSnippet, searchTerms) live in web/js/thread-helpers.js (Wave 2 / G-6).
 /** Text nodes with <mark> around every query term (works for trigram and 1–2 character LIKE searches alike). */
 function highlight(text, terms) {
   if (!terms.length) return [text];
   const re = new RegExp(`(${terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'giu');
   return text.split(re).map((part, i) => (i % 2 ? h('mark', { text: part }) : part)).filter((x) => x !== '');
 }
-/** Starts a long snippet shortly before its first match so the highlight stays inside the two visible lines. */
-function aroundMatch(text, terms) {
-  const low = text.toLowerCase();
-  const at = Math.min(...terms.map((t) => low.indexOf(t.toLowerCase())).filter((i) => i >= 0));
-  return Number.isFinite(at) && at > 50 ? `…${text.slice(at - 30)}` : text;
-}
-/** One group per thread with at most two distinct snippets; snippets that only repeat the title are dropped. */
-function groupHits(rows, terms) {
-  const norm = (s) => s.toLowerCase().replace(/…|\.\.\./g, '').replace(/\s+/g, '');
-  const groups = new Map();
-  for (const r of rows) {
-    let g = groups.get(r.thread_id);
-    if (!g) {
-      g = { thread_id: r.thread_id, title: cleanTitle(r.thread_title), updated_at: r.updated_at, snippets: [], seen: [] };
-      groups.set(r.thread_id, g);
-    }
-    if (g.snippets.length >= 2) continue;
-    const text = plainSnippet(r.snippet);
-    const key = norm(cleanTitle(text));
-    if (!key || norm(g.title).startsWith(key) || norm(plainSnippet(r.thread_title)).startsWith(norm(text))) continue;
-    if (g.seen.some((k) => k.includes(key) || key.includes(k))) continue;
-    g.seen.push(key);
-    g.snippets.push({ text: aroundMatch(text, terms), item_id: r.item_id });
-  }
-  return [...groups.values()];
-}
+// aroundMatch lives in web/js/thread-helpers.js (Wave 2 / G-6).
+// groupHits lives in web/js/thread-helpers.js (Wave 2 / G-6).
 
 function searchDialog(initialQuery = '') {
   const open = $('dialog.search');
@@ -3257,15 +3200,7 @@ function renderLimitSurfaces() { renderUsagePill(); syncLimitAlert(); S.limits.o
 
 /** The sidebar tooltip line (tightest live window per provider) and whether anything is used up. */
 function limitsSummary(now) {
-  const parts = []; let exhausted = false;
-  for (const p of S.limits.data?.providers || []) {
-    const live = p.windows.filter((w) => !limitIsReset(w, now));
-    if (!live.length) continue;
-    const least = Math.min(...live.map((w) => w.remaining));
-    exhausted ||= least <= 0;
-    parts.push(`${p.label} ${fmtLeft(least)}`);
-  }
-  return { text: parts.length ? `上限の残り: ${parts.join(' · ')}` : '', exhausted };
+  return limitsSummaryData(S.limits.data?.providers || [], now);
 }
 
 /** Pill above the textarea while the selected provider is out of quota or nearly so. A live region: touched only on change. */
@@ -4580,8 +4515,7 @@ function diffCommitForm(t) {
 const SWARM_STATE = { working: '稼働中', waiting: '待機', killed: '終了' };
 const curBoard = () => (S.threadId && S.swarms.get(S.threadId)) || null;
 const swarmOverlay = () => matchMedia('(max-width: 1180px)').matches;
-const bareName = (n) => String(n ?? '').replace(/^@/, '');
-const swarmWorkers = (b) => b.members.filter((m) => m.role !== 'coordinator');
+// bareName / swarmWorkers live in web/js/thread-helpers.js (Wave 2 / G-6).
 
 const swarmPushes = new Map();  // threadId -> count of boards pushed by WS / POST (outdates GETs in flight)
 const swarmKilling = new Set(); // `${board_id}:${name}`
@@ -4591,12 +4525,7 @@ let swarmShownBoard = null;     // board_id the panel currently renders
 let swarmRosterSig = '';
 let swarmStick = true;          // the feed follows new posts until the reader scrolls up
 
-function normalizeBoard(b) {
-  if (!b || typeof b !== 'object' || !b.board_id) return null;
-  const objects = (x) => (Array.isArray(x) ? x.filter((v) => v && typeof v === 'object') : []);
-  const messages = objects(b.messages).sort((a, c) => a.seq - c.seq);
-  return { ...b, members: objects(b.members), messages, head_seq: Number(b.head_seq) || Number(messages.at(-1)?.seq) || 0 };
-}
+// normalizeBoard lives in web/js/thread-helpers.js (Wave 2 / G-6).
 /** Stores a snapshot for one thread. A snapshot older than the cached one (by head_seq) is ignored. */
 function storeSwarm(threadId, board) {
   const prev = S.swarms.get(threadId);
@@ -4639,12 +4568,10 @@ function renderSwarmPill(b) {
   const btn = $('#btn-swarm');
   btn.hidden = !b;
   if (!b) return;
-  const workers = swarmWorkers(b);
-  const working = workers.filter((m) => m.state === 'working').length;
-  const alive = workers.filter((m) => m.state !== 'killed').length;
-  $('.swarm-count', btn).textContent = String(alive);
-  $('.pulse', btn).hidden = !working;
-  const label = `Swarm ボード: ワーカー ${alive}（稼働 ${working}） (${IS_MAC ? '⌥S' : 'Alt+S'})`;
+  const counts = swarmCounts(b);
+  $('.swarm-count', btn).textContent = String(counts.alive);
+  $('.pulse', btn).hidden = !counts.working;
+  const label = swarmPillLabel(counts, IS_MAC);
   btn.title = label; btn.setAttribute('aria-label', label);
 }
 
@@ -4755,10 +4682,10 @@ function renderSwarm() {
     input.value = swarmDrafts.get(b.board_id) || '';
   }
   const workers = swarmWorkers(b);
-  const count = (s) => workers.filter((m) => m.state === s).length;
+  const counts = swarmCounts(b);
   const title = $('#swarm-title');
   title.textContent = b.title || 'Swarm ボード'; title.title = title.textContent;
-  const sum = `稼働 ${count('working')} / 待機 ${count('waiting')}${count('killed') ? ` / 終了 ${count('killed')}` : ''}`;
+  const sum = swarmSummaryText(counts);
   if ($('#swarm-sum').textContent !== sum) $('#swarm-sum').textContent = sum;
   $('#swarm-head-seq').textContent = b.head_seq ? `#${b.head_seq}` : '';
 
@@ -4927,6 +4854,11 @@ const deltaCoalescer = createDeltaCoalescer(
 
 function handleWs(m) {
   const cur = S.threadId;
+  // Wave 2 (P0-1): track the monotonic server seq; a gap or an explicit
+  // events_lost means messages were dropped, so resync (debounced by *Soon).
+  // Messages without a seq (legacy events) are ignored by observe().
+  if (m.type === 'hello') seqTracker.reset();
+  else if (m.type === 'events_lost' || seqTracker.observe(m.seq).gap) { loadDetailSoon(); loadThreadsSoon(); }
   switch (m.type) {
     case 'hello':
       if (S.meta) S.meta.version = m.server_version;

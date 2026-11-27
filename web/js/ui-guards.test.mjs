@@ -2,7 +2,7 @@
 // Runs with: node --test web/js/ui-guards.test.mjs  (node:test + node:assert/strict only)
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createGenerationFence, createDeltaCoalescer, createNotificationGate } from './ui-guards.js';
+import { createGenerationFence, createDeltaCoalescer, createNotificationGate, createSeqTracker } from './ui-guards.js';
 
 describe('GenerationFence', () => {
   it('rejects an older token once a newer one was issued for the same scope', () => {
@@ -159,5 +159,86 @@ describe('NotificationGate', () => {
     assert.equal(gate.shouldNotify(hidden), true);
     assert.equal(gate.shouldNotify({ ...hidden, now: 4999 }), false);
     assert.equal(gate.shouldNotify({ ...hidden, now: 5000 }), true);
+  });
+});
+
+describe('SeqTracker', () => {
+  it('records the first seq as the baseline with no gap or duplicate', () => {
+    const tracker = createSeqTracker();
+    assert.deepEqual(tracker.observe(5), { gap: false, duplicate: false });
+  });
+
+  it('reports no gap for consecutive seqs', () => {
+    const tracker = createSeqTracker();
+    tracker.observe(5);
+    assert.deepEqual(tracker.observe(6), { gap: false, duplicate: false });
+    assert.deepEqual(tracker.observe(7), { gap: false, duplicate: false });
+  });
+
+  it('reports a gap with the missed count when seq jumps ahead', () => {
+    const tracker = createSeqTracker();
+    tracker.observe(5);
+    assert.deepEqual(tracker.observe(8), { gap: true, duplicate: false, missed: 2 });
+    assert.deepEqual(tracker.observe(10), { gap: true, duplicate: false, missed: 1 });
+  });
+
+  it('reports a gap of exactly one missed message', () => {
+    const tracker = createSeqTracker();
+    tracker.observe(41);
+    assert.deepEqual(tracker.observe(43), { gap: true, duplicate: false, missed: 1 });
+  });
+
+  it('flags the same seq as a duplicate and does not advance the baseline', () => {
+    const tracker = createSeqTracker();
+    tracker.observe(5);
+    assert.deepEqual(tracker.observe(5), { gap: false, duplicate: true });
+    // Still anchored at 5: the next expected seq is 6, not 7.
+    assert.deepEqual(tracker.observe(6), { gap: false, duplicate: false });
+  });
+
+  it('flags an older seq as a duplicate', () => {
+    const tracker = createSeqTracker();
+    tracker.observe(10);
+    assert.deepEqual(tracker.observe(7), { gap: false, duplicate: true });
+    assert.deepEqual(tracker.observe(11), { gap: false, duplicate: false });
+  });
+
+  it('ignores a non-positive or non-integer seq without moving the baseline', () => {
+    const tracker = createSeqTracker();
+    for (const bad of [0, -1, 1.5, NaN, undefined, null, '5', Infinity]) {
+      assert.deepEqual(tracker.observe(bad), { gap: false, duplicate: false });
+    }
+    // No baseline was set by the bad values: 3 becomes the baseline.
+    assert.deepEqual(tracker.observe(3), { gap: false, duplicate: false });
+    for (const bad of [0, -2, 2.5, '4', undefined]) {
+      assert.deepEqual(tracker.observe(bad), { gap: false, duplicate: false });
+    }
+    assert.deepEqual(tracker.observe(4), { gap: false, duplicate: false });
+  });
+
+  it('reset() clears the baseline so the next seq starts fresh', () => {
+    const tracker = createSeqTracker();
+    tracker.observe(5);
+    tracker.observe(6);
+    tracker.reset();
+    assert.deepEqual(tracker.observe(100), { gap: false, duplicate: false });
+    assert.deepEqual(tracker.observe(101), { gap: false, duplicate: false });
+  });
+
+  it('keeps independent state per tracker instance', () => {
+    const a = createSeqTracker();
+    const b = createSeqTracker();
+    a.observe(5);
+    assert.deepEqual(b.observe(5), { gap: false, duplicate: false });
+    assert.deepEqual(a.observe(8), { gap: true, duplicate: false, missed: 2 });
+    assert.deepEqual(b.observe(6), { gap: false, duplicate: false });
+  });
+
+  it('advances the baseline past a gap so the next seq is consecutive', () => {
+    const tracker = createSeqTracker();
+    tracker.observe(5);
+    tracker.observe(9);
+    assert.deepEqual(tracker.observe(10), { gap: false, duplicate: false });
+    assert.deepEqual(tracker.observe(9), { gap: false, duplicate: true });
   });
 });

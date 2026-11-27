@@ -85,3 +85,29 @@ export function createNotificationGate({ dedupeWindowMs = 5000 } = {}) {
     },
   };
 }
+
+/**
+ * Tracks the server's monotonic per-message `seq` (Wave 2 / P0-1) so a
+ * dropped WebSocket message is noticed and the client can resync.
+ * `observe(seq)` returns `{ gap, duplicate }` (plus `missed` when a gap is
+ * found); `reset()` clears the baseline, e.g. on `hello` after a reconnect.
+ * Messages without a usable `seq` (legacy events) are ignored, so old
+ * servers stay fully compatible.
+ */
+export function createSeqTracker() {
+  let lastSeq = null; // null = no baseline yet
+  return {
+    observe(seq) {
+      if (!Number.isInteger(seq) || seq <= 0) return { gap: false, duplicate: false };
+      if (lastSeq === null) { lastSeq = seq; return { gap: false, duplicate: false }; }
+      if (seq <= lastSeq) return { gap: false, duplicate: true };
+      const prev = lastSeq;
+      lastSeq = seq;
+      if (seq > prev + 1) return { gap: true, duplicate: false, missed: seq - prev - 1 };
+      return { gap: false, duplicate: false };
+    },
+    reset() {
+      lastSeq = null;
+    },
+  };
+}
