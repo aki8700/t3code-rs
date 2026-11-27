@@ -1432,6 +1432,14 @@ impl RunCoordinator {
                 live.auto_resume_limited_threads,
                 live.rate_limit_max_retries,
             );
+            #[cfg(unix)]
+            let worker = {
+                let store = self.0.store.clone();
+                t3_providers::with_spawn_hook(worker, move |pid, start| {
+                    let store = store.clone();
+                    async move { store.record_orphan_process(run_id, pid, start).await }
+                })
+            };
             tokio::pin!(worker);
             loop {
                 tokio::select! {

@@ -11,6 +11,8 @@ mod watchdog;
 pub use catalog::context_window_for;
 pub use cli_drivers::{AntigravityDriver, ClaudeDriver, CodexDriver, OpenCodeDriver};
 pub use mock::MockDriver;
+#[cfg(unix)]
+pub use process::startup::with_spawn_hook;
 pub use retry::{
     FailureClass, MAX_CAPACITY_RETRIES, MAX_RETRY_AFTER_SECS, classify_harness_failure,
     classify_provider_failure, classify_rate_limit, format_delegated_error, format_run_error,
