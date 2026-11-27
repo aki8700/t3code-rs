@@ -270,7 +270,13 @@ impl RunCoordinator {
                 .await?;
             let prompt = format!("Your swarm brief from {}:\n{}", actor.name, spec.brief);
             let run_id = self
-                .send_locked(active, worker.clone(), queued_message(prompt), depth + 1)
+                .send_locked(
+                    active,
+                    worker.clone(),
+                    queued_message(prompt),
+                    depth + 1,
+                    false,
+                )
                 .await?;
             self.record_delivery(worker.id, run_id, board.head_seq, post.seq);
             CoreResult::Ok(())
@@ -434,7 +440,7 @@ impl RunCoordinator {
                     .expect("write to String");
                 }
                 let run_id = self
-                    .send_locked(active, target.clone(), queued_message(prompt), depth)
+                    .send_locked(active, target.clone(), queued_message(prompt), depth, false)
                     .await?;
                 self.record_delivery(target.id, run_id, cursor, last.seq);
                 woken = true;

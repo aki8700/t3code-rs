@@ -5,9 +5,9 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Instant,
@@ -43,6 +43,8 @@ pub(crate) struct Coordinator {
     tokens: McpTokens,
     limits: Arc<crate::limits::UsageLimitsCache>,
     holds: ProviderHolds,
+    user_runs: StdMutex<HashSet<Uuid>>,
+    queued_tickets: StdMutex<HashMap<Uuid, watch::Sender<bool>>>,
     pub(crate) wake_deliveries: crate::swarm::WakeDeliveries,
 }
 
@@ -185,6 +187,8 @@ impl RunCoordinator {
             tokens,
             limits,
             holds: ProviderHolds::default(),
+            user_runs: StdMutex::default(),
+            queued_tickets: StdMutex::default(),
             wake_deliveries: Default::default(),
             events,
             active: Mutex::new(HashMap::new()),
@@ -282,6 +286,8 @@ impl RunCoordinator {
         let _active = self.0.active.lock().await;
         let cancelled = self.0.store.cancel_queued_run(thread_id, run_id).await?;
         if cancelled {
+            self.clear_user_run(run_id);
+            self.complete_queued_ticket(run_id);
             self.emit(WsServerMessage::RunStatusChanged {
                 thread_id,
                 run_id,
@@ -463,6 +469,34 @@ impl RunCoordinator {
         let _ = self.0.events.send(event);
     }
 
+    fn user_run_pending(&self, run_id: Uuid) -> bool {
+        self.0
+            .user_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&run_id)
+    }
+
+    fn clear_user_run(&self, run_id: Uuid) {
+        self.0
+            .user_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id);
+    }
+
+    fn complete_queued_ticket(&self, run_id: Uuid) {
+        if let Some(done) = self
+            .0
+            .queued_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id)
+        {
+            done.send_replace(true);
+        }
+    }
+
     pub(crate) async fn pending(&self, id: Uuid) -> Vec<PendingRequest> {
         self.0
             .active
@@ -476,7 +510,8 @@ impl RunCoordinator {
     pub async fn send(&self, id: Uuid, message: Message) -> CoreResult<Uuid> {
         let mut active = self.0.active.lock().await;
         let thread = self.0.store.get_thread(id).await?;
-        self.send_locked(&mut active, thread, message, 0).await
+        self.send_locked(&mut active, thread, message, 0, true)
+            .await
     }
 
     pub(crate) async fn send_locked(
@@ -485,6 +520,7 @@ impl RunCoordinator {
         thread: Thread,
         message: Message,
         wake_depth: u8,
+        user_requested: bool,
     ) -> CoreResult<Uuid> {
         self.ensure_accepting_runs()?;
         self.validate_message(&thread, &message).await?;
@@ -518,6 +554,13 @@ impl RunCoordinator {
         let run_id = self
             .enqueue(&thread, message, false, wake_depth, busy)
             .await?;
+        if user_requested {
+            self.0
+                .user_runs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(run_id);
+        }
         if !busy && let Some((_, turn)) = self.start_next(active, &thread, Some(run_id)).await? {
             self.spawn(turn);
         }
@@ -546,12 +589,24 @@ impl RunCoordinator {
             )));
         }
         let id = self.enqueue(&thread, message, true, 0, false).await?;
-        let (ticket, turn) = self
-            .start_next(active, &thread, Some(id))
-            .await?
-            .ok_or_else(|| CoreError::Internal("delegated run was not queued".into()))?;
-        self.spawn(turn);
-        Ok(ticket)
+        let (done, completion) = watch::channel(false);
+        self.0
+            .queued_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, done);
+        match self.start_next(active, &thread, Some(id)).await {
+            Ok(Some((_, turn))) => self.spawn(turn),
+            Ok(None) => {}
+            Err(error) => {
+                self.complete_queued_ticket(id);
+                return Err(error);
+            }
+        }
+        Ok(RunTicket {
+            id,
+            done: completion,
+        })
     }
 
     async fn validate_message(&self, thread: &Thread, message: &Message) -> CoreResult<()> {
@@ -692,6 +747,28 @@ impl RunCoordinator {
         Ok(())
     }
 
+    pub async fn set_pause_all(&self, paused: bool) -> CoreResult<bool> {
+        self.0.holds.set_paused(paused);
+        if paused {
+            for thread_id in self.0.store.queued_threads().await? {
+                for run in self.0.store.list_queued_runs(thread_id).await? {
+                    if !self.user_run_pending(run.id)
+                        && let Some(announced) = self.0.holds.pause_blocking(run.id)
+                        && !announced
+                    {
+                        self.announce_pause(thread_id, run.id).await;
+                    }
+                }
+            }
+        }
+        self.resume_queued_runs().await?;
+        Ok(paused)
+    }
+
+    pub fn pause_all(&self) -> bool {
+        self.0.holds.is_paused()
+    }
+
     async fn start_next(
         &self,
         active: &mut HashMap<Uuid, ActiveRun>,
@@ -702,8 +779,29 @@ impl RunCoordinator {
             return Ok(None);
         }
         let store = &self.0.store;
-        while let Some(queued) = store.next_queued_run(thread.id).await? {
+        let mut next = store.next_queued_run(thread.id).await?;
+        if self.0.holds.is_paused()
+            && next
+                .as_ref()
+                .is_some_and(|queued| !self.user_run_pending(queued.id))
+        {
+            for run in store.list_queued_runs(thread.id).await? {
+                if self.user_run_pending(run.id) {
+                    next = store.queued_run(thread.id, run.id).await?;
+                    break;
+                }
+            }
+        }
+        while let Some(queued) = next {
             let run_id = queued.id;
+            if !self.user_run_pending(run_id)
+                && let Some(announced) = self.0.holds.pause_blocking(run_id)
+            {
+                if !announced {
+                    self.announce_pause(thread.id, run_id).await;
+                }
+                return Ok(None);
+            }
             if let Some((hold, announced)) = self
                 .0
                 .holds
@@ -714,10 +812,12 @@ impl RunCoordinator {
                 }
                 return Ok(None);
             }
+            self.clear_user_run(run_id);
             match self.start(active, thread.clone(), queued).await {
                 Ok(Some(started)) => return Ok(Some(started)),
-                Ok(None) => {}
+                Ok(None) => self.complete_queued_ticket(run_id),
                 Err(error) => {
+                    self.complete_queued_ticket(run_id);
                     let message =
                         format_run_error(FailureClass::HarnessError, &error.to_string(), None);
                     store
@@ -745,6 +845,7 @@ impl RunCoordinator {
                     }
                 }
             }
+            next = store.next_queued_run(thread.id).await?;
         }
         Ok(None)
     }
@@ -921,7 +1022,17 @@ impl RunCoordinator {
         // for the swarm's silent-exit check.
         let run_started_at = run.started_at;
         let (cancel, cancellation) = watch::channel(false);
-        let (done, completion) = watch::channel(false);
+        let (done, completion) = self
+            .0
+            .queued_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id)
+            .map(|done| {
+                let completion = done.subscribe();
+                (done, completion)
+            })
+            .unwrap_or_else(|| watch::channel(false));
         active.insert(
             thread.id,
             ActiveRun {
@@ -1058,6 +1169,8 @@ impl RunCoordinator {
             self.cancel(run)
         });
         for run_id in self.0.store.cancel_queued_runs(id).await? {
+            self.clear_user_run(run_id);
+            self.complete_queued_ticket(run_id);
             self.emit(WsServerMessage::RunStatusChanged {
                 thread_id: id,
                 run_id,
@@ -2241,30 +2354,60 @@ impl RunCoordinator {
         let until = hold.until.to_rfc3339();
         let notice =
             format!("{target} の利用上限が {until} に解除されるまで、この run は待機します");
-        let appended = self
-            .append(NewTurnItem {
+        self.announce_queued_reason(
+            thread_id,
+            run_id,
+            notice.clone(),
+            json!({
+                "message": notice,
+                "held_until": until,
+                "provider": hold.provider,
+                "model": hold.model,
+                "reason": hold.reason,
+            }),
+            Some(ThreadStatus::RateLimited),
+        )
+        .await;
+    }
+
+    async fn announce_pause(&self, thread_id: Uuid, run_id: Uuid) {
+        let notice = "自動実行は一時停止中です。この実行はキューで待機します。";
+        self.announce_queued_reason(
+            thread_id,
+            run_id,
+            notice.into(),
+            json!({"message": notice, "reason": "pause_all"}),
+            None,
+        )
+        .await;
+    }
+
+    async fn announce_queued_reason(
+        &self,
+        thread_id: Uuid,
+        run_id: Uuid,
+        notice: String,
+        payload: Value,
+        status: Option<ThreadStatus>,
+    ) {
+        let result = async {
+            self.append(NewTurnItem {
                 thread_id,
                 run_id,
                 kind: TurnItemKind::SystemNotice,
-                summary: Some(notice.clone()),
-                payload: json!({
-                    "message": notice,
-                    "held_until": until,
-                    "provider": hold.provider,
-                    "model": hold.model,
-                    "reason": hold.reason,
-                }),
+                summary: Some(notice),
+                payload,
                 searchable_text: None,
             })
-            .await;
-        if let Err(error) = async {
-            appended?;
-            self.thread_status(thread_id, ThreadStatus::RateLimited)
-                .await
+            .await?;
+            if let Some(status) = status {
+                self.thread_status(thread_id, status).await?;
+            }
+            CoreResult::Ok(())
         }
-        .await
-        {
-            tracing::warn!(%error, %run_id, "Could not report a run held for a provider limit");
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(%error, %run_id, "Could not report a held queued run");
         }
     }
 

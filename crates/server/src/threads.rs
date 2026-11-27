@@ -478,18 +478,13 @@ impl RunCoordinator {
                 return Err(error);
             }
         };
+        let status = self.0.store.get_thread(thread.id).await?.status;
         self.emit(WsServerMessage::SubagentUpdated {
             parent_thread_id: parent.id,
             child_thread_id: thread.id,
-            status: ThreadStatus::Running,
+            status,
         });
-        Ok((
-            Thread {
-                status: ThreadStatus::Running,
-                ..thread
-            },
-            ticket,
-        ))
+        Ok((Thread { status, ..thread }, ticket))
     }
 
     pub async fn fork_thread(&self, id: Uuid, options: ForkOptions) -> CoreResult<Thread> {
@@ -1005,6 +1000,10 @@ fn workspace_merge_lock(canonical_workspace: &Path) -> Arc<tokio::sync::Mutex<()
 
 #[async_trait]
 impl OrchestratorBackend for RunCoordinator {
+    async fn pause_all(&self, paused: bool) -> CoreResult<bool> {
+        self.set_pause_all(paused).await
+    }
+
     async fn swarm_status(&self, thread_id: Uuid) -> CoreResult<Option<SwarmStatusResult>> {
         let Some(board) = self.get_board(thread_id).await? else {
             return Ok(None);
@@ -1097,7 +1096,7 @@ impl OrchestratorBackend for RunCoordinator {
         mode: DelegateMode,
     ) -> CoreResult<DelegatedTask> {
         let (thread, mut ticket) = self.launch_child(spec).await?;
-        if matches!(mode, DelegateMode::Wait) {
+        if matches!(mode, DelegateMode::Wait) && thread.status == ThreadStatus::Running {
             let _ = ticket.done.wait_for(|done| *done).await;
             return self.task_status(thread.id).await;
         }

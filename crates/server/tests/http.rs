@@ -3486,6 +3486,79 @@ async fn tier4_streaming_shell_cancel_monitor_and_worktree_merge_routes() {
     assert!(detail["context"]["compaction"]["recommended"].is_boolean());
 }
 
+#[tokio::test]
+async fn pause_all_holds_delegated_runs_but_keeps_user_messages_dispatchable() {
+    let tmp = TempDir::new();
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let parent_id = create_parent(&app, &tmp.0).await;
+
+    assert_eq!(
+        json_req(&app, Method::GET, "/api/pause-all", None).await["paused"],
+        false
+    );
+    assert_eq!(
+        json_req(
+            &app,
+            Method::PUT,
+            "/api/pause-all",
+            Some(json!({"paused":true})),
+        )
+        .await["paused"],
+        true
+    );
+    let delegated = json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{parent_id}/delegate"),
+        Some(json!({
+            "parent_thread_id": parent_id,
+            "title": "Held child",
+            "task": "unattended work",
+            "model_selection": {"provider":"mock","model":"mock"},
+            "runtime_mode": "approval-required",
+            "interaction_mode": "default",
+            "isolation": "shared"
+        })),
+    )
+    .await;
+    let child_id: Uuid = serde_json::from_value(delegated["thread"]["id"].clone()).unwrap();
+    let held = json_req(&app, Method::GET, &format!("/api/threads/{child_id}"), None).await;
+    assert_eq!(held["runs"][0]["status"], "queued");
+    assert_eq!(
+        held["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(
+                |item| item["kind"] == "system_notice" && item["payload"]["reason"] == "pause_all"
+            )
+            .count(),
+        1
+    );
+
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{child_id}/messages"),
+        Some(json!({"prompt":"direct user message"})),
+    )
+    .await;
+    wait_for_thread(&mut events, child_id, ThreadStatus::Completed).await;
+    let after_user = json_req(&app, Method::GET, &format!("/api/threads/{child_id}"), None).await;
+    assert_eq!(after_user["runs"][0]["status"], "queued");
+    assert_eq!(after_user["runs"][1]["status"], "completed");
+
+    assert_eq!(
+        mcp_tool(&app, "pause_all", json!({"paused":false})).await,
+        false
+    );
+    wait_for_thread(&mut events, child_id, ThreadStatus::Completed).await;
+    let resumed = json_req(&app, Method::GET, &format!("/api/threads/{child_id}"), None).await;
+    assert_eq!(resumed["runs"][0]["status"], "completed");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn limited_provider_holds_queued_runs_until_reset_while_other_providers_dispatch() {
