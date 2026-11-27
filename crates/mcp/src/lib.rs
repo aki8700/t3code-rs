@@ -355,6 +355,7 @@ impl<B: OrchestratorBackend> McpServer<B> {
     }
 
     async fn call(&self, name: &str, args: Value, context: CallContext<'_>) -> CoreResult<Value> {
+        validate_argument_keys(name, &args)?;
         let backend = &self.backend;
         let CallContext { thread_id, caller } = context;
         match name {
@@ -633,6 +634,65 @@ struct ToolCall {
 fn empty_object() -> Value {
     json!({})
 }
+
+fn validate_argument_keys(name: &str, args: &Value) -> CoreResult<()> {
+    let Some(schema) = tools()
+        .into_iter()
+        .find(|tool| tool["name"] == name)
+        .map(|tool| tool["inputSchema"].clone())
+    else {
+        return Ok(());
+    };
+    let aliases: &[&str] = match name {
+        "task_diff" | "task_merge" => &["task_id"],
+        _ => &[],
+    };
+    validate_schema_argument_keys(&schema, args, name, aliases)
+}
+
+fn validate_schema_argument_keys(
+    schema: &Value,
+    args: &Value,
+    path: &str,
+    aliases: &[&str],
+) -> CoreResult<()> {
+    let Some(properties) = schema["properties"].as_object() else {
+        return Ok(());
+    };
+    let Some(arguments) = args.as_object() else {
+        return Ok(());
+    };
+
+    let mut valid_keys = properties.keys().cloned().collect::<Vec<_>>();
+    valid_keys.extend(aliases.iter().map(|alias| (*alias).to_owned()));
+    valid_keys.sort();
+    valid_keys.dedup();
+
+    let unknown = arguments
+        .keys()
+        .filter(|key| valid_keys.binary_search(key).is_err())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        let valid = if valid_keys.is_empty() {
+            "(none)".to_owned()
+        } else {
+            valid_keys.join(", ")
+        };
+        return Err(CoreError::InvalidArgument(format!(
+            "unknown argument key(s) for {path}: {}; valid keys: {valid}",
+            unknown.join(", ")
+        )));
+    }
+
+    for (key, value) in arguments {
+        if let Some(property_schema) = properties.get(key) {
+            validate_schema_argument_keys(property_schema, value, &format!("{path}.{key}"), &[])?;
+        }
+    }
+    Ok(())
+}
+
 fn default_limit() -> usize {
     50
 }
@@ -777,7 +837,8 @@ fn tools() -> Vec<Value> {
         json!({"enum": ["claude", "codex", "antigravity", "open-code", "opencode", "mock"]});
     let make = |name: &str, description: &str, properties: Value, required: &[&str]| {
         json!({"name": name, "description": description, "inputSchema": {
-            "type": "object", "properties": properties, "required": required
+            "type": "object", "properties": properties, "required": required,
+            "additionalProperties": false
         }})
     };
     vec![
@@ -885,7 +946,7 @@ fn tools() -> Vec<Value> {
                 "thread_id": uuid, "title": string, "provider": provider, "model": string,
                 "effort": string, "handoff_summary": string, "target_model": {
                     "type": "object", "properties": {"provider": provider, "model": string, "effort": string, "agent": string},
-                    "required": ["provider", "model"]
+                    "required": ["provider", "model"], "additionalProperties": false
                 }
             }),
             &[],
@@ -934,7 +995,8 @@ fn tools() -> Vec<Value> {
                         "input": {"type": "number"}, "output": {"type": "number"},
                         "cache_read": {"type": "number"}, "cache_write": {"type": "number"}
                     },
-                    "required": ["input", "output", "cache_read", "cache_write"]
+                    "required": ["input", "output", "cache_read", "cache_write"],
+                    "additionalProperties": false
                 },
                 "remaining_turns": {"type": "number", "minimum": 0}
             }),
@@ -1187,6 +1249,254 @@ mod tests {
             "method": "tools/call",
             "params": {"name": name, "arguments": arguments}
         })
+    }
+
+    #[test]
+    fn tool_argument_fields_match_the_declared_schemas() {
+        let expected = [
+            ("orchestrator_capabilities", &[][..]),
+            ("swarm_status", &["thread_id"][..]),
+            (
+                "swarm_add_worker",
+                &[
+                    "thread_id",
+                    "name",
+                    "brief",
+                    "provider",
+                    "model",
+                    "effort",
+                    "isolation",
+                ][..],
+            ),
+            ("swarm_post_message", &["thread_id", "text"][..]),
+            (
+                "swarm_read_board",
+                &["thread_id", "since_seq", "limit", "seq"][..],
+            ),
+            ("swarm_kill_worker", &["thread_id", "name"][..]),
+            (
+                "delegate_task",
+                &[
+                    "parent_thread_id",
+                    "title",
+                    "task",
+                    "provider",
+                    "model",
+                    "effort",
+                    "isolation",
+                    "base_ref",
+                    "mode",
+                    "runtime_mode",
+                    "interaction_mode",
+                ][..],
+            ),
+            ("task_status", &["task_id"][..]),
+            ("task_cancel", &["task_id"][..]),
+            ("task_diff", &["child_thread_id", "parent_thread_id"][..]),
+            (
+                "task_merge",
+                &[
+                    "child_thread_id",
+                    "parent_thread_id",
+                    "commit_message",
+                    "cleanup",
+                ][..],
+            ),
+            (
+                "thread_list",
+                &["project_id", "include_archived", "limit"][..],
+            ),
+            ("thread_read", &["thread_id", "limit"][..]),
+            ("thread_send", &["thread_id", "prompt", "behavior"][..]),
+            (
+                "thread_fork",
+                &[
+                    "thread_id",
+                    "title",
+                    "target_model",
+                    "provider",
+                    "model",
+                    "effort",
+                    "handoff_summary",
+                ][..],
+            ),
+            ("orch_stats", &[][..]),
+            ("code_index", &["path", "max_depth", "max_lines"][..]),
+            (
+                "code_slice",
+                &["path", "symbol", "max_bytes", "start", "end"][..],
+            ),
+            (
+                "code_grep",
+                &["path", "pattern", "glob", "max_hits", "max_bytes"][..],
+            ),
+            ("code_diff", &["cwd", "rev", "path", "max_bytes"][..]),
+            (
+                "compaction_econ",
+                &[
+                    "prefix",
+                    "replaced",
+                    "summary",
+                    "tail",
+                    "instruction",
+                    "summarizer_reuses_prefix",
+                    "prices",
+                    "remaining_turns",
+                ][..],
+            ),
+        ];
+        let listed = tools();
+        assert_eq!(listed.len(), expected.len());
+        for tool in &listed {
+            let name = tool["name"].as_str().unwrap();
+            let mut schema_keys = tool["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let mut struct_fields = expected
+                .iter()
+                .find(|(tool_name, _)| *tool_name == name)
+                .unwrap_or_else(|| panic!("missing argument struct fields for {name}"))
+                .1
+                .to_vec();
+            schema_keys.sort_unstable();
+            struct_fields.sort_unstable();
+            assert_eq!(schema_keys, struct_fields, "{name}");
+        }
+
+        for (tool_name, property, fields) in [
+            (
+                "thread_fork",
+                "target_model",
+                &["provider", "model", "effort", "agent"][..],
+            ),
+            (
+                "compaction_econ",
+                "prices",
+                &["input", "output", "cache_read", "cache_write"][..],
+            ),
+        ] {
+            let schema = listed_schema(&listed, tool_name);
+            let mut actual = schema["properties"][property]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let mut expected = fields.to_vec();
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "{tool_name}.{property}");
+        }
+    }
+
+    #[test]
+    fn every_tool_schema_closes_object_properties() {
+        fn check(schema: &Value, path: &str) {
+            if schema["type"] == "object" {
+                assert_eq!(schema["additionalProperties"], false, "{path}");
+                if let Some(properties) = schema["properties"].as_object() {
+                    for (key, value) in properties {
+                        check(value, &format!("{path}.{key}"));
+                    }
+                }
+            }
+        }
+
+        for tool in tools() {
+            check(&tool["inputSchema"], tool["name"].as_str().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_argument_is_rejected_with_valid_keys() {
+        let parent = make_thread(
+            Uuid::new_v4(),
+            RuntimeMode::FullAccess,
+            InteractionMode::Default,
+        );
+        let server = McpServer::new(DefaultUnsupportedBackend(parent.clone()));
+        let response = server
+            .handle(
+                rpc_call("task_status", json!({"taskid": Uuid::new_v4()})),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        let error = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(error.contains("taskid"), "{error}");
+        assert!(error.contains("task_id"), "{error}");
+        assert!(error.contains("valid keys"), "{error}");
+
+        let mistyped_target = server
+            .handle(
+                rpc_call(
+                    "thread_send",
+                    json!({"prompt": "send this", "threadid": Uuid::new_v4()}),
+                ),
+                Some(parent.id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mistyped_target["result"]["isError"], true);
+        let error = mistyped_target["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(error.contains("threadid"), "{error}");
+        assert!(error.contains("thread_id"), "{error}");
+        assert!(error.contains("valid keys"), "{error}");
+
+        let nested = server
+            .handle(
+                rpc_call(
+                    "compaction_econ",
+                    json!({"prices": {
+                        "input": 0.1,
+                        "output": 0.1,
+                        "cache_read": 0.1,
+                        "cache_wirte": 0.1
+                    }}),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let error = nested["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(error.contains("compaction_econ.prices"), "{error}");
+        assert!(error.contains("cache_write"), "{error}");
+        assert!(error.contains("valid keys"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn declared_serde_argument_aliases_remain_valid() {
+        let parent = make_thread(
+            Uuid::new_v4(),
+            RuntimeMode::FullAccess,
+            InteractionMode::Default,
+        );
+        let server = McpServer::new(DefaultUnsupportedBackend(parent.clone()));
+        for name in ["task_diff", "task_merge"] {
+            let response = server
+                .handle(
+                    rpc_call(name, json!({"task_id": Uuid::new_v4()})),
+                    Some(parent.id),
+                )
+                .await
+                .unwrap();
+            let error = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(error.contains("unsupported"), "{error}");
+            assert!(!error.contains("valid keys"), "{error}");
+        }
+    }
+
+    fn listed_schema<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+        &tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool schema for {name}"))["inputSchema"]
     }
 
     #[tokio::test]
