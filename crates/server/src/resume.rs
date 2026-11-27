@@ -106,6 +106,51 @@ where
 }
 
 #[cfg(unix)]
+const SIGTERM_GRACE_MAX: std::time::Duration = std::time::Duration::from_millis(1500);
+#[cfg(unix)]
+const SIGTERM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[cfg(unix)]
+async fn wait_for_groups_exit(groups: &[OrphanProcess]) {
+    wait_for_exit_with(
+        || {
+            groups
+                .iter()
+                .any(|target| group_alive(target.process_group_id))
+        },
+        SIGTERM_GRACE_MAX,
+        SIGTERM_POLL_INTERVAL,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+async fn wait_for_exit_with<F>(
+    mut any_alive: F,
+    max_wait: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> bool
+where
+    F: FnMut() -> bool,
+{
+    if !any_alive() {
+        return true;
+    }
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return !any_alive();
+        }
+        let sleep_for = poll_interval.min(deadline.saturating_duration_since(now));
+        tokio::time::sleep(sleep_for).await;
+        if !any_alive() {
+            return true;
+        }
+    }
+}
+
+#[cfg(unix)]
 async fn stop_verified_groups(
     targets: &[OrphanProcess],
     groups: &[OrphanProcess],
@@ -119,7 +164,7 @@ async fn stop_verified_groups(
         }
     }
     if !groups.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        wait_for_groups_exit(groups).await;
     }
     let survivors: Vec<_> = groups
         .iter()
@@ -144,7 +189,7 @@ async fn stop_verified_groups(
         }
     }
     if !survivors.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        wait_for_groups_exit(&survivors).await;
     }
     targets
         .iter()
@@ -335,5 +380,28 @@ garbage line
         let status = waiter.join().unwrap();
         assert_eq!(stopped.len(), 1);
         assert!(!status.success());
+    }
+
+    #[tokio::test]
+    async fn wait_for_exit_returns_quickly_once_process_exits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let checks = AtomicUsize::new(0);
+        let start = std::time::Instant::now();
+        let exited = wait_for_exit_with(
+            || checks.fetch_add(1, Ordering::SeqCst) < 2,
+            std::time::Duration::from_millis(1500),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert!(exited);
+        assert!(start.elapsed() < std::time::Duration::from_millis(300));
+        assert!(
+            !wait_for_exit_with(
+                || true,
+                std::time::Duration::from_millis(60),
+                std::time::Duration::from_millis(20),
+            )
+            .await
+        );
     }
 }

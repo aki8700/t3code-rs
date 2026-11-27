@@ -399,3 +399,37 @@ fn grep_counts_binary_reads_against_the_total_byte_budget() {
     assert_eq!(result["hits"], 0);
     assert_eq!(result["truncated"], true);
 }
+
+#[test]
+fn code_index_cache_hits_and_invalidates_on_content_change() {
+    let dir = tempdir().unwrap();
+    let file = fixture(&dir, "demo.rs", "pub fn alpha() {}\npub fn beta() {}\n");
+    let first = code_index(&file, 1, 1).unwrap();
+    assert_eq!(first["truncated"], true);
+    assert_eq!(first["files"][0]["symbols"].as_array().unwrap().len(), 1);
+
+    let second = code_index(&file, 1, 10).unwrap();
+    assert_eq!(second["truncated"], false);
+    assert_eq!(second["files"][0]["symbols"].as_array().unwrap().len(), 2);
+
+    fs::write(&file, "pub fn gamma() {}\n").unwrap();
+    let third = code_index(&file, 1, 10).unwrap();
+    assert_eq!(third["files"][0]["symbols"][0]["name"], "gamma");
+}
+
+#[test]
+fn cap_section_utf8_preserves_multibyte_boundaries_and_marks_truncation() {
+    let (unchanged, truncated) = cap_section_utf8("hello world", 11);
+    assert_eq!(unchanged, "hello world");
+    assert!(!truncated);
+
+    let jp = "あいうえおかきくけこ";
+    let (capped, was_truncated) = cap_section_utf8(jp, 19);
+    assert!(was_truncated);
+    assert_eq!(capped, "あい\n[truncated]");
+    assert!(capped.len() <= 19);
+
+    let (tiny, tiny_truncated) = cap_section_utf8(jp, 5);
+    assert!(tiny_truncated);
+    assert_eq!(tiny, "\n[truncated]");
+}

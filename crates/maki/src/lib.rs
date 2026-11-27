@@ -12,8 +12,52 @@ use globset::GlobBuilder;
 use ignore::{Walk, WalkBuilder};
 use regex::Regex;
 use serde_json::{Value, json};
-use std::{fs, io::Read, path::Path};
+use std::{
+    collections::{HashMap, hash_map::DefaultHasher},
+    fs,
+    hash::{Hash, Hasher},
+    io::Read,
+    path::Path,
+    sync::{Mutex, OnceLock},
+};
 use syntax::{Grammar, enclosing_symbol, symbols};
+
+const INDEX_CACHE_MAX_ENTRIES: usize = 512;
+
+#[derive(Clone)]
+struct CachedFileIndex {
+    declarations: Vec<Value>,
+    outline: Vec<String>,
+}
+
+type IndexCacheKey = (Option<&'static str>, u64, usize);
+
+static INDEX_CACHE: OnceLock<Mutex<HashMap<IndexCacheKey, CachedFileIndex>>> = OnceLock::new();
+
+fn index_cache() -> &'static Mutex<HashMap<IndexCacheKey, CachedFileIndex>> {
+    INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn content_hash(source: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Cap a UTF-8 context section at `max_bytes` on a char boundary, appending `"\n[truncated]"`
+/// when truncated so callers can enforce per-item and total context budgets safely.
+pub fn cap_section_utf8(text: &str, max_bytes: usize) -> (String, bool) {
+    const SUFFIX: &str = "\n[truncated]";
+    if text.len() <= max_bytes {
+        return (text.to_owned(), false);
+    }
+    let budget = max_bytes.saturating_sub(SUFFIX.len());
+    let prefix = utf8_prefix(text, budget);
+    let mut out = String::with_capacity(prefix.len() + SUFFIX.len());
+    out.push_str(prefix);
+    out.push_str(SUFFIX);
+    (out, true)
+}
 
 pub const DEFAULT_MAX_BYTES: usize = 32 * 1024;
 pub const DEFAULT_MAX_DEPTH: usize = 4;
@@ -154,17 +198,20 @@ pub fn code_index(path: &Path, max_depth: usize, max_lines: usize) -> Result<Val
     Ok(json!({"files": files, "truncated": truncated}))
 }
 
-fn index_file(path: &Path, label: &Path, source: &str, remaining: &mut usize) -> (Value, bool) {
-    let grammar = Grammar::for_path(path);
+fn parse_file_index_cached(grammar: Option<&Grammar>, source: &str) -> CachedFileIndex {
+    let key: IndexCacheKey = (grammar.map(|g| g.name), content_hash(source), source.len());
+    {
+        let cache = index_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(hit) = cache.get(&key) {
+            return hit.clone();
+        }
+    }
     let mut declarations = Vec::new();
     let mut outline = Vec::new();
-    let mut truncated = false;
-    if let Some(tree) = grammar.as_ref().and_then(|grammar| grammar.parse(source)) {
+    if let Some(tree) = grammar.and_then(|grammar| grammar.parse(source)) {
         for symbol in symbols(&tree, source) {
-            if *remaining == 0 {
-                truncated = true;
-                break;
-            }
             let (start, end) = symbol.lines();
             declarations.push(json!({
                 "kind": symbol.kind,
@@ -172,7 +219,6 @@ fn index_file(path: &Path, label: &Path, source: &str, remaining: &mut usize) ->
                 "signature": symbol.signature(source),
                 "range": line_range(start, end),
             }));
-            *remaining -= 1;
         }
     } else {
         for (index, line) in source.lines().enumerate() {
@@ -182,11 +228,45 @@ fn index_file(path: &Path, label: &Path, source: &str, remaining: &mut usize) ->
             {
                 continue;
             }
+            outline.push(format!("L{}: {}", index + 1, utf8_prefix(heading, 240)));
+        }
+    }
+    let entry = CachedFileIndex {
+        declarations,
+        outline,
+    };
+    let mut cache = index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= INDEX_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, entry.clone());
+    entry
+}
+
+fn index_file(path: &Path, label: &Path, source: &str, remaining: &mut usize) -> (Value, bool) {
+    let grammar = Grammar::for_path(path);
+    let cached = parse_file_index_cached(grammar.as_ref(), source);
+    let mut declarations = Vec::new();
+    let mut outline = Vec::new();
+    let mut truncated = false;
+    if !cached.declarations.is_empty() {
+        for decl in cached.declarations {
             if *remaining == 0 {
                 truncated = true;
                 break;
             }
-            outline.push(format!("L{}: {}", index + 1, utf8_prefix(heading, 240)));
+            declarations.push(decl);
+            *remaining -= 1;
+        }
+    } else {
+        for line in cached.outline {
+            if *remaining == 0 {
+                truncated = true;
+                break;
+            }
+            outline.push(line);
             *remaining -= 1;
         }
     }
