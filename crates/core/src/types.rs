@@ -611,6 +611,14 @@ pub struct ProviderHealth {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpToolProfile {
+    #[default]
+    Full,
+    Worker,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpInjectionSpec {
     pub binary_path: PathBuf,
@@ -619,6 +627,8 @@ pub struct McpInjectionSpec {
     pub thread_id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cua_binary_path: Option<PathBuf>,
+    #[serde(default)]
+    pub tool_profile: McpToolProfile,
 }
 
 #[cfg(test)]

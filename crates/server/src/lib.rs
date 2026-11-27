@@ -83,6 +83,7 @@ impl ServerState {
                 .computer_use_enabled
                 .then(|| config.resolved_cua_bin())
                 .flatten(),
+            tool_profile: t3_core::McpToolProfile::Full,
         };
         let limits_cache = Arc::new(limits::UsageLimitsCache::default());
         let coordinator = RunCoordinator::with_tokens_and_limits(

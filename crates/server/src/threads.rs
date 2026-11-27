@@ -1099,6 +1099,31 @@ impl RunCoordinator {
 
 #[async_trait]
 impl OrchestratorBackend for RunCoordinator {
+    async fn tool_profile(&self, thread_id: Uuid) -> McpToolProfile {
+        if let Ok(Some(board)) = self.get_board(thread_id).await
+            && board
+                .members
+                .iter()
+                .any(|member| member.thread_id == thread_id && member.role == "worker")
+        {
+            return McpToolProfile::Worker;
+        }
+        if self
+            .0
+            .store
+            .get_thread(thread_id)
+            .await
+            .ok()
+            .and_then(|thread| thread.relationship)
+            .as_deref()
+            == Some("swarm-worker")
+        {
+            McpToolProfile::Worker
+        } else {
+            McpToolProfile::Full
+        }
+    }
+
     async fn pause_all(&self, paused: bool) -> CoreResult<bool> {
         self.set_pause_all(paused).await
     }
@@ -1521,6 +1546,7 @@ mod tests {
                 internal_token: "token".into(),
                 thread_id: Uuid::nil(),
                 cua_binary_path: None,
+                tool_profile: McpToolProfile::Full,
             },
         );
         (root, repo, coordinator, project)

@@ -1213,6 +1213,7 @@ exit 7
             internal_token: "fixture-token".into(),
             thread_id: req.thread_id,
             cua_binary_path: None,
+            tool_profile: t3_core::McpToolProfile::Full,
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
         driver.run_turn(req, tx).await.unwrap();
