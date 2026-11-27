@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use t3_core::*;
 use uuid::Uuid;
 
@@ -365,6 +366,7 @@ impl<B: OrchestratorBackend> McpServer<B> {
     }
 
     async fn call(&self, name: &str, args: Value, context: CallContext<'_>) -> CoreResult<Value> {
+        validate_argument_keys(name, &args)?;
         let backend = &self.backend;
         let CallContext { thread_id, caller } = context;
         match name {
@@ -647,6 +649,65 @@ struct ToolCall {
 fn empty_object() -> Value {
     json!({})
 }
+
+fn validate_argument_keys(name: &str, args: &Value) -> CoreResult<()> {
+    let Some(schema) = tools()
+        .iter()
+        .find(|tool| tool["name"] == name)
+        .map(|tool| &tool["inputSchema"])
+    else {
+        return Ok(());
+    };
+    let aliases: &[&str] = match name {
+        "task_diff" | "task_merge" => &["task_id"],
+        _ => &[],
+    };
+    validate_schema_argument_keys(schema, args, name, aliases)
+}
+
+fn validate_schema_argument_keys(
+    schema: &Value,
+    args: &Value,
+    path: &str,
+    aliases: &[&str],
+) -> CoreResult<()> {
+    let Some(properties) = schema["properties"].as_object() else {
+        return Ok(());
+    };
+    let Some(arguments) = args.as_object() else {
+        return Ok(());
+    };
+
+    let mut valid_keys = properties.keys().cloned().collect::<Vec<_>>();
+    valid_keys.extend(aliases.iter().map(|alias| (*alias).to_owned()));
+    valid_keys.sort();
+    valid_keys.dedup();
+
+    let unknown = arguments
+        .keys()
+        .filter(|key| valid_keys.binary_search(key).is_err())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        let valid = if valid_keys.is_empty() {
+            "(none)".to_owned()
+        } else {
+            valid_keys.join(", ")
+        };
+        return Err(CoreError::InvalidArgument(format!(
+            "unknown argument key(s) for {path}: {}; valid keys: {valid}",
+            unknown.join(", ")
+        )));
+    }
+
+    for (key, value) in arguments {
+        if let Some(property_schema) = properties.get(key) {
+            validate_schema_argument_keys(property_schema, value, &format!("{path}.{key}"), &[])?;
+        }
+    }
+    Ok(())
+}
+
 fn default_limit() -> usize {
     50
 }
@@ -782,7 +843,12 @@ fn parse_provider<E: serde::de::Error>(id: &str) -> Result<ProviderId, E> {
     }
 }
 
-fn tools() -> Vec<Value> {
+fn tools() -> &'static [Value] {
+    static TOOLS: OnceLock<Vec<Value>> = OnceLock::new();
+    TOOLS.get_or_init(build_tools).as_slice()
+}
+
+fn build_tools() -> Vec<Value> {
     let string = json!({"type": "string"});
     let uuid = json!({"type": "string", "format": "uuid"});
     let limit = json!({"type": "integer", "minimum": 0});
@@ -791,7 +857,8 @@ fn tools() -> Vec<Value> {
         json!({"enum": ["claude", "codex", "antigravity", "open-code", "opencode", "mock"]});
     let make = |name: &str, description: &str, properties: Value, required: &[&str]| {
         json!({"name": name, "description": description, "inputSchema": {
-            "type": "object", "properties": properties, "required": required
+            "type": "object", "properties": properties, "required": required,
+            "additionalProperties": false
         }})
     };
     vec![
@@ -905,7 +972,7 @@ fn tools() -> Vec<Value> {
                 "thread_id": uuid, "title": string, "provider": provider, "model": string,
                 "effort": string, "handoff_summary": string, "target_model": {
                     "type": "object", "properties": {"provider": provider, "model": string, "effort": string, "agent": string},
-                    "required": ["provider", "model"]
+                    "required": ["provider", "model"], "additionalProperties": false
                 }
             }),
             &[],
@@ -954,7 +1021,8 @@ fn tools() -> Vec<Value> {
                         "input": {"type": "number"}, "output": {"type": "number"},
                         "cache_read": {"type": "number"}, "cache_write": {"type": "number"}
                     },
-                    "required": ["input", "output", "cache_read", "cache_write"]
+                    "required": ["input", "output", "cache_read", "cache_write"],
+                    "additionalProperties": false
                 },
                 "remaining_turns": {"type": "number", "minimum": 0}
             }),
@@ -972,9 +1040,10 @@ fn tools() -> Vec<Value> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use t3_maki::{CompactionEconInput, Prices};
 
     #[derive(Debug, PartialEq, Eq)]
     struct RecordedMerge {
@@ -1207,6 +1276,277 @@ mod tests {
             "method": "tools/call",
             "params": {"name": name, "arguments": arguments}
         })
+    }
+
+    /// Field names of an argument struct. The pattern has no `..`, so adding a
+    /// field without listing it here (and in the schema) fails to compile.
+    macro_rules! fields {
+        ($ty:ident { $($field:ident),+ }) => {{
+            let _ = |$ty { $($field: _),+ }: $ty| {};
+            vec![$(stringify!($field)),+]
+        }};
+    }
+    pub(crate) use fields;
+
+    fn assert_schema_keys(schema: &Value, mut fields: Vec<&str>, path: &str) {
+        let mut keys = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        fields.sort_unstable();
+        assert_eq!(keys, fields, "{path}");
+    }
+
+    #[test]
+    fn tool_argument_fields_match_the_declared_schemas() {
+        // `SwarmArgs` flattens `input` and `ForkArgs` flattens `options`.
+        let _ = |SwarmArgs::<()> {
+                     thread_id: _,
+                     input: _,
+                 }| {};
+        let swarm = |input: Vec<&'static str>| [vec!["thread_id"], input].concat();
+        let mut fork = fields!(ForkArgs {
+            thread_id,
+            options,
+            provider,
+            model,
+            effort
+        });
+        fork.retain(|field| *field != "options");
+        fork.extend(fields!(ForkOptions {
+            title,
+            target_model,
+            handoff_summary
+        }));
+        let mut expected = vec![
+            ("orchestrator_capabilities", vec![]),
+            ("pause_all", fields!(PauseAllInput { paused })),
+            ("swarm_status", fields!(SwarmStatus { thread_id })),
+            (
+                "swarm_add_worker",
+                swarm(fields!(SwarmWorkerSpec {
+                    name,
+                    brief,
+                    provider,
+                    model,
+                    effort,
+                    isolation
+                })),
+            ),
+            ("swarm_post_message", swarm(fields!(SwarmPost { text }))),
+            (
+                "swarm_read_board",
+                swarm(fields!(SwarmRead {
+                    since_seq,
+                    limit,
+                    seq
+                })),
+            ),
+            ("swarm_kill_worker", swarm(fields!(SwarmKill { name }))),
+            (
+                "delegate_task",
+                fields!(DelegateArgs {
+                    parent_thread_id,
+                    title,
+                    task,
+                    provider,
+                    model,
+                    effort,
+                    isolation,
+                    base_ref,
+                    mode,
+                    runtime_mode,
+                    interaction_mode
+                }),
+            ),
+            ("task_status", fields!(TaskArgs { task_id })),
+            ("task_cancel", fields!(TaskArgs { task_id })),
+            (
+                "task_diff",
+                fields!(TaskDiffArgs {
+                    child_thread_id,
+                    parent_thread_id
+                }),
+            ),
+            (
+                "task_merge",
+                fields!(TaskMergeArgs {
+                    child_thread_id,
+                    parent_thread_id,
+                    commit_message,
+                    cleanup
+                }),
+            ),
+            (
+                "thread_list",
+                fields!(ListArgs {
+                    project_id,
+                    include_archived,
+                    limit
+                }),
+            ),
+            ("thread_read", fields!(ReadArgs { thread_id, limit })),
+            (
+                "thread_send",
+                fields!(SendArgs {
+                    thread_id,
+                    prompt,
+                    behavior
+                }),
+            ),
+            ("thread_fork", fork),
+            ("orch_stats", vec![]),
+            (
+                "compaction_econ",
+                fields!(CompactionEconInput {
+                    prefix,
+                    replaced,
+                    summary,
+                    tail,
+                    instruction,
+                    summarizer_reuses_prefix,
+                    prices,
+                    remaining_turns
+                }),
+            ),
+        ];
+        expected.extend(code_tools::argument_fields());
+
+        let listed = tools();
+        assert_eq!(listed.len(), expected.len());
+        for (name, fields) in expected {
+            assert_schema_keys(listed_schema(listed, name), fields, name);
+        }
+        assert_schema_keys(
+            &listed_schema(listed, "thread_fork")["properties"]["target_model"],
+            fields!(ModelSelection {
+                provider,
+                model,
+                effort,
+                agent
+            }),
+            "thread_fork.target_model",
+        );
+        assert_schema_keys(
+            &listed_schema(listed, "compaction_econ")["properties"]["prices"],
+            fields!(Prices {
+                input,
+                output,
+                cache_read,
+                cache_write
+            }),
+            "compaction_econ.prices",
+        );
+    }
+
+    #[test]
+    fn every_tool_schema_closes_object_properties() {
+        fn check(schema: &Value, path: &str) {
+            if schema["type"] == "object" {
+                assert_eq!(schema["additionalProperties"], false, "{path}");
+                if let Some(properties) = schema["properties"].as_object() {
+                    for (key, value) in properties {
+                        check(value, &format!("{path}.{key}"));
+                    }
+                }
+            }
+        }
+
+        for tool in tools() {
+            check(&tool["inputSchema"], tool["name"].as_str().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_argument_is_rejected_with_valid_keys() {
+        let parent = make_thread(
+            Uuid::new_v4(),
+            RuntimeMode::FullAccess,
+            InteractionMode::Default,
+        );
+        let server = McpServer::new(DefaultUnsupportedBackend(parent.clone()));
+        let response = server
+            .handle(
+                rpc_call("task_status", json!({"taskid": Uuid::new_v4()})),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        let error = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(error.contains("taskid"), "{error}");
+        assert!(error.contains("task_id"), "{error}");
+        assert!(error.contains("valid keys"), "{error}");
+
+        let mistyped_target = server
+            .handle(
+                rpc_call(
+                    "thread_send",
+                    json!({"prompt": "send this", "threadid": Uuid::new_v4()}),
+                ),
+                Some(parent.id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mistyped_target["result"]["isError"], true);
+        let error = mistyped_target["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(error.contains("threadid"), "{error}");
+        assert!(error.contains("thread_id"), "{error}");
+        assert!(error.contains("valid keys"), "{error}");
+
+        let nested = server
+            .handle(
+                rpc_call(
+                    "compaction_econ",
+                    json!({"prices": {
+                        "input": 0.1,
+                        "output": 0.1,
+                        "cache_read": 0.1,
+                        "cache_wirte": 0.1
+                    }}),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let error = nested["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(error.contains("compaction_econ.prices"), "{error}");
+        assert!(error.contains("cache_write"), "{error}");
+        assert!(error.contains("valid keys"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn declared_serde_argument_aliases_remain_valid() {
+        let parent = make_thread(
+            Uuid::new_v4(),
+            RuntimeMode::FullAccess,
+            InteractionMode::Default,
+        );
+        let server = McpServer::new(DefaultUnsupportedBackend(parent.clone()));
+        for name in ["task_diff", "task_merge"] {
+            let response = server
+                .handle(
+                    rpc_call(name, json!({"task_id": Uuid::new_v4()})),
+                    Some(parent.id),
+                )
+                .await
+                .unwrap();
+            let error = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(error.contains("unsupported"), "{error}");
+            assert!(!error.contains("valid keys"), "{error}");
+        }
+    }
+
+    fn listed_schema<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+        &tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool schema for {name}"))["inputSchema"]
     }
 
     #[tokio::test]
