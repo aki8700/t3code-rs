@@ -1025,13 +1025,30 @@ impl RunCoordinator {
             .ok()
             .flatten()
             .or_else(|| parent.branch.clone());
+        let live_swarm_workers = if relationship == "swarm-worker" {
+            self.get_board(parent_id).await?.map(|board| {
+                board
+                    .members
+                    .into_iter()
+                    .filter(|member| member.state != "killed")
+                    .map(|member| member.thread_id)
+                    .collect::<std::collections::HashSet<_>>()
+            })
+        } else {
+            None
+        };
         let children = self
             .0
             .store
             .list_child_threads(parent_id)
             .await?
             .into_iter()
-            .filter(|child| child.relationship.as_deref() == Some(relationship));
+            .filter(|child| child.relationship.as_deref() == Some(relationship))
+            .filter(|child| {
+                live_swarm_workers
+                    .as_ref()
+                    .is_none_or(|live| live.contains(&child.id))
+            });
         let mut by_file = BTreeMap::<String, Vec<(Uuid, String)>>::new();
         let mut worktrees = Vec::new();
         for child in children {
@@ -1094,13 +1111,14 @@ impl OrchestratorBackend for RunCoordinator {
         let (worktrees, overlaps) = self
             .worktree_changes(board.coordinator_thread_id, "swarm-worker")
             .await?;
+        let (killed, live): (Vec<_>, Vec<_>) = board
+            .members
+            .into_iter()
+            .partition(|member| member.state == "killed");
         Ok(Some(SwarmStatusResult {
             board_id: board.board_id,
-            members: board
-                .members
-                .into_iter()
-                .map(SwarmMemberSummary::from)
-                .collect(),
+            members: live.into_iter().map(SwarmMemberSummary::from).collect(),
+            killed_count: killed.len(),
             head_seq: board.head_seq,
             message_count,
             worktrees,

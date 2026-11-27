@@ -4844,8 +4844,10 @@ function handleWs(m) {
       const run = (S.detail?.runs || []).find((r) => r.id === m.run_id);
       if (run) run.status = m.status;
       if (TERMINAL_RUN.has(m.status)) {
-        S.live.delete(m.thread_id);
-        S.liveUsage.delete(m.thread_id);
+        const live = S.live.get(m.thread_id);
+        if (!live || !live.runId || live.runId === m.run_id) S.live.delete(m.thread_id);
+        const usage = S.liveUsage.get(m.thread_id);
+        if (!usage || !usage.runId || usage.runId === m.run_id) S.liveUsage.delete(m.thread_id);
         if (m.status === 'completed' || m.status === 'failed') notifyRunOutcome(m.status === 'completed' ? '実行完了' : '実行失敗', m.thread_id, m.status === 'completed' && m.followup);
         if (m.status === 'failed' && m.error) toast(`実行失敗: ${m.error}`, 'err', 6000);
         if (m.thread_id === cur) { loadDetailSoon(); refreshDiffSoon(); loadSwarm(cur); }

@@ -15,6 +15,7 @@ const MAX_WAKE_DEPTH: u8 = 8;
 const MAX_MESSAGE_BYTES: usize = 4096;
 const MAX_ACTIVE_WORKERS: usize = 8;
 const WAKE_BATCH: usize = 16;
+const MAX_WAKE_REDELIVERIES: u8 = 1;
 const ENDED_ERROR_CHARS: usize = 200;
 const READ_MESSAGE_MAX_CHARS: usize = 2_000;
 
@@ -24,10 +25,14 @@ const READ_MESSAGE_MAX_CHARS: usize = 2_000;
 /// Lost on restart, which can only cause a duplicate delivery.
 pub(crate) type WakeDeliveries = std::sync::Mutex<HashMap<Uuid, Vec<WakeDelivery>>>;
 
+#[derive(Clone, Copy)]
 pub(crate) struct WakeDelivery {
     run_id: Uuid,
     from: i64,
     to: i64,
+    redeliveries: u8,
+    wake_depth: u8,
+    mode_ceiling: Option<(RuntimeMode, InteractionMode)>,
 }
 
 pub(crate) fn is_swarm_command(prompt: &str) -> bool {
@@ -278,7 +283,17 @@ impl RunCoordinator {
                     false,
                 )
                 .await?;
-            self.record_delivery(worker.id, run_id, board.head_seq, post.seq);
+            self.record_delivery(
+                worker.id,
+                WakeDelivery {
+                    run_id,
+                    from: board.head_seq,
+                    to: post.seq,
+                    redeliveries: 0,
+                    wake_depth: depth + 1,
+                    mode_ceiling: None,
+                },
+            );
             CoreResult::Ok(())
         }
         .await;
@@ -378,7 +393,7 @@ impl RunCoordinator {
         } else {
             for member in targets {
                 match self
-                    .wake_member(active, member, caller.as_ref(), depth + 1)
+                    .wake_member(active, member, caller.as_ref(), next_wake_depth(depth))
                     .await
                 {
                     Ok(true) => woken.push(member.name.clone()),
@@ -408,21 +423,40 @@ impl RunCoordinator {
         caller: Option<&Thread>,
         depth: u8,
     ) -> CoreResult<bool> {
+        self.wake_member_with_retry(active, member, caller, depth, None, 0)
+            .await
+    }
+
+    async fn wake_member_with_retry(
+        &self,
+        active: &mut HashMap<Uuid, ActiveRun>,
+        member: &SwarmMember,
+        caller: Option<&Thread>,
+        depth: u8,
+        mode_ceiling: Option<(RuntimeMode, InteractionMode)>,
+        redeliveries: u8,
+    ) -> CoreResult<bool> {
         let store = &self.0.store;
         let target = store.get_thread(member.thread_id).await?;
         if target.archived || caller.is_some_and(|caller| !can_dispatch(caller, &target)) {
             return Ok(false);
         }
-        let mut cursor = self
-            .in_flight_seq(active, target.id)
-            .await?
-            .max(member.last_read_seq);
+        let effective_ceiling = stricter_mode_ceiling(
+            mode_ceiling,
+            Some((target.runtime_mode, target.interaction_mode)),
+        );
+        // At most one queued wake per member: a wake still waiting in the queue is replaced
+        // by one that carries every unread post, so posts arriving while the member is busy
+        // cost one turn instead of one turn each. Only the running run's posts are skipped.
+        let (running_range, mut preserved) = self.supersede_queued_wakes(active, target.id).await?;
+        let mut cursor = skip_contiguous_running_range(member.last_read_seq, running_range);
         let mut woken = false;
         loop {
             let messages = store
                 .list_swarm_messages(member.board_id, cursor, WAKE_BATCH)
                 .await?;
             let Some(last) = messages.last() else {
+                self.cancel_trailing_wakes(target.id, preserved).await?;
                 return Ok(woken);
             };
             let unread = messages
@@ -439,10 +473,66 @@ impl RunCoordinator {
                     )
                     .expect("write to String");
                 }
-                let run_id = self
-                    .send_locked(active, target.clone(), queued_message(prompt), depth, false)
-                    .await?;
-                self.record_delivery(target.id, run_id, cursor, last.seq);
+                let queued = if preserved.is_empty() {
+                    None
+                } else {
+                    Some(preserved.remove(0))
+                };
+                let run_id = if let Some(delivery) = queued {
+                    let Some(mut run) = store.queued_run(target.id, delivery.run_id).await? else {
+                        continue;
+                    };
+                    run.input.mode_ceiling =
+                        stricter_mode_ceiling(run.input.mode_ceiling, effective_ceiling);
+                    run.input.wake_depth = coalesced_wake_depth(run.input.wake_depth, depth);
+                    if store
+                        .update_queued_run(target.id, run.id, prompt.clone(), run.input.clone())
+                        .await?
+                    {
+                        self.record_delivery(
+                            target.id,
+                            WakeDelivery {
+                                run_id: run.id,
+                                from: cursor,
+                                to: last.seq,
+                                redeliveries: delivery.redeliveries.max(redeliveries),
+                                wake_depth: run.input.wake_depth,
+                                mode_ceiling: run.input.mode_ceiling,
+                            },
+                        );
+                        run.id
+                    } else {
+                        let mut message = queued_message(prompt);
+                        message.mode_ceiling =
+                            stricter_mode_ceiling(delivery.mode_ceiling, effective_ceiling);
+                        self.send_locked(
+                            active,
+                            target.clone(),
+                            message,
+                            coalesced_wake_depth(delivery.wake_depth, depth),
+                            false,
+                        )
+                        .await?
+                    }
+                } else {
+                    let mut message = queued_message(prompt);
+                    message.mode_ceiling = effective_ceiling;
+                    self.send_locked(active, target.clone(), message, depth, false)
+                        .await?
+                };
+                if queued.is_none() {
+                    self.record_delivery(
+                        target.id,
+                        WakeDelivery {
+                            run_id,
+                            from: cursor,
+                            to: last.seq,
+                            redeliveries,
+                            wake_depth: depth,
+                            mode_ceiling: effective_ceiling,
+                        },
+                    );
+                }
                 woken = true;
             } else {
                 // Only the member's own posts: nothing to deliver.
@@ -452,6 +542,7 @@ impl RunCoordinator {
             }
             cursor = last.seq;
             if messages.len() < WAKE_BATCH {
+                self.cancel_trailing_wakes(target.id, preserved).await?;
                 return Ok(woken);
             }
         }
@@ -464,42 +555,78 @@ impl RunCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn record_delivery(&self, thread_id: Uuid, run_id: Uuid, from: i64, to: i64) {
+    fn record_delivery(&self, thread_id: Uuid, delivery: WakeDelivery) {
         self.deliveries()
             .entry(thread_id)
             .or_default()
-            .push(WakeDelivery { run_id, from, to });
+            .push(delivery);
     }
 
-    /// Highest post seq already handed to a queued or running run of the thread. Deliveries
-    /// whose run was dropped from the queue without running are forgotten here.
-    async fn in_flight_seq(
+    /// Keeps the earliest queued wake so coalescing can update it without moving its queue
+    /// position, and cancels later queued wakes. Returns the running run's delivered range
+    /// and the preserved queued delivery.
+    async fn supersede_queued_wakes(
         &self,
         active: &HashMap<Uuid, ActiveRun>,
         thread_id: Uuid,
-    ) -> CoreResult<i64> {
-        let queued = self.0.store.list_queued_runs(thread_id).await?;
+    ) -> CoreResult<((i64, i64), Vec<WakeDelivery>)> {
         let running = active.get(&thread_id).map(|run| run.id);
-        let mut deliveries = self.deliveries();
-        let Some(list) = deliveries.get_mut(&thread_id) else {
-            return Ok(0);
+        let result = {
+            let mut deliveries = self.deliveries();
+            let Some(list) = deliveries.get_mut(&thread_id) else {
+                return Ok(((0, 0), Vec::new()));
+            };
+            let (current, superseded): (Vec<_>, Vec<_>) = std::mem::take(list)
+                .into_iter()
+                .partition(|delivery| Some(delivery.run_id) == running);
+            let running_from = current
+                .iter()
+                .map(|delivery| delivery.from)
+                .min()
+                .unwrap_or(0);
+            let running_to = current
+                .iter()
+                .map(|delivery| delivery.to)
+                .max()
+                .unwrap_or(0);
+            if current.is_empty() {
+                deliveries.remove(&thread_id);
+            } else {
+                *list = current;
+            }
+            ((running_from, running_to), superseded)
         };
-        list.retain(|delivery| {
-            Some(delivery.run_id) == running || queued.iter().any(|run| run.id == delivery.run_id)
-        });
-        Ok(list.iter().map(|delivery| delivery.to).max().unwrap_or(0))
+        let (running_range, preserved) = result;
+        Ok((running_range, preserved))
     }
 
-    /// Called when a run ends. A completed run acknowledges the posts it delivered. Any
-    /// other outcome drops every pending delivery of the thread, so the next wake starts
-    /// again from the acknowledged cursor and includes the posts this run never finished.
+    async fn cancel_trailing_wakes(
+        &self,
+        thread_id: Uuid,
+        trailing: Vec<WakeDelivery>,
+    ) -> CoreResult<()> {
+        let mut ids = trailing
+            .into_iter()
+            .map(|delivery| delivery.run_id)
+            .collect::<Vec<_>>();
+        ids.dedup();
+        for id in ids {
+            self.cancel_queued_locked(thread_id, id).await?;
+        }
+        Ok(())
+    }
+
+    /// Called when a run ends. A completed run acknowledges the posts it delivered. When the
+    /// run did not complete, a wake queued behind it lacks the posts this run never finished,
+    /// so that wake is rebuilt from the acknowledged cursor.
     pub(crate) async fn settle_wake(
         &self,
+        active: &mut HashMap<Uuid, ActiveRun>,
         thread_id: Uuid,
         run_id: Uuid,
         status: RunStatus,
     ) -> CoreResult<()> {
-        let delivered = {
+        let (delivered, remaining) = {
             let mut deliveries = self.deliveries();
             let Some(list) = deliveries.get_mut(&thread_id) else {
                 return Ok(());
@@ -507,12 +634,13 @@ impl RunCoordinator {
             let (delivered, rest) = std::mem::take(list)
                 .into_iter()
                 .partition::<Vec<_>, _>(|delivery| delivery.run_id == run_id);
-            if status == RunStatus::Completed && !rest.is_empty() {
-                *list = rest;
-            } else {
+            let remaining = rest.clone();
+            if rest.is_empty() {
                 deliveries.remove(&thread_id);
+            } else {
+                *list = rest;
             }
-            delivered
+            (delivered, remaining)
         };
         if status == RunStatus::Completed {
             for delivery in delivered {
@@ -521,6 +649,58 @@ impl RunCoordinator {
                     .ack_swarm_member_read_seq(thread_id, delivery.from, delivery.to)
                     .await?;
             }
+            return Ok(());
+        }
+        if delivered.is_empty() || remaining.is_empty() {
+            return Ok(());
+        }
+        let mut live_queued = Vec::new();
+        for delivery in &remaining {
+            if let Some(queued) = self.0.store.queued_run(thread_id, delivery.run_id).await? {
+                live_queued.push((delivery, queued));
+            }
+        }
+        if live_queued.is_empty() {
+            return Ok(());
+        }
+        let depth = delivered
+            .iter()
+            .map(|delivery| delivery.wake_depth)
+            .chain(
+                live_queued
+                    .iter()
+                    .map(|(delivery, queued)| delivery.wake_depth.max(queued.input.wake_depth)),
+            )
+            .max()
+            .unwrap_or(0);
+        let mode_ceiling =
+            delivered
+                .iter()
+                .map(|delivery| delivery.mode_ceiling)
+                .chain(live_queued.iter().flat_map(|(delivery, queued)| {
+                    [delivery.mode_ceiling, queued.input.mode_ceiling]
+                }))
+                .fold(None, stricter_mode_ceiling);
+        let attempts = delivered
+            .iter()
+            .map(|delivery| delivery.redeliveries)
+            .max()
+            .unwrap_or(0);
+        // A failed redelivery with no new posts is terminal. Otherwise a multi-batch
+        // follow-up can restart the same unread range forever.
+        if attempts >= MAX_WAKE_REDELIVERIES {
+            return Ok(());
+        }
+        let Some(board) = self.get_board(thread_id).await? else {
+            return Ok(());
+        };
+        if let Some(member) = board
+            .members
+            .iter()
+            .find(|member| member.thread_id == thread_id && member.state != "killed")
+        {
+            self.wake_member_with_retry(active, member, None, depth, mode_ceiling, attempts + 1)
+                .await?;
         }
         Ok(())
     }
@@ -810,6 +990,7 @@ fn queued_message(prompt: String) -> Message {
     Message {
         prompt,
         behavior: Some(FollowUpBehavior::Queue),
+        auto_wake: true,
         ..Default::default()
     }
 }
@@ -875,6 +1056,46 @@ fn held_wake_text(seq: i64, targets: &[&SwarmMember]) -> String {
 
 fn wake_depth(active: &HashMap<Uuid, ActiveRun>, id: Uuid) -> u8 {
     active.get(&id).map_or(0, |run| run.wake_depth)
+}
+
+fn stricter_mode_ceiling(
+    left: Option<(RuntimeMode, InteractionMode)>,
+    right: Option<(RuntimeMode, InteractionMode)>,
+) -> Option<(RuntimeMode, InteractionMode)> {
+    match (left, right) {
+        (Some((left_runtime, left_interaction)), Some((right_runtime, right_interaction))) => {
+            Some((
+                left_runtime.min(right_runtime),
+                if left_interaction == InteractionMode::Plan
+                    || right_interaction == InteractionMode::Plan
+                {
+                    InteractionMode::Plan
+                } else {
+                    InteractionMode::Default
+                },
+            ))
+        }
+        (Some(ceiling), None) | (None, Some(ceiling)) => Some(ceiling),
+        (None, None) => None,
+    }
+}
+
+fn coalesced_wake_depth(existing: u8, incoming: u8) -> u8 {
+    existing.max(incoming)
+}
+
+fn skip_contiguous_running_range(last_read_seq: i64, range: (i64, i64)) -> i64 {
+    if range.0 == last_read_seq {
+        range.1
+    } else {
+        last_read_seq
+    }
+}
+
+/// Every automated handoff carries depth forward. Independent workers assigned in one
+/// coordinator run share that run's depth; exchanges with one worker ratchet and terminate.
+fn next_wake_depth(depth: u8) -> u8 {
+    depth.saturating_add(1)
 }
 
 fn live_worker_count(board: &SwarmBoardSnapshot) -> usize {
@@ -987,6 +1208,29 @@ fn mentions_in(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_wake_redelivery_intersects_both_mode_ceilings() {
+        assert_eq!(
+            stricter_mode_ceiling(
+                Some((RuntimeMode::ApprovalRequired, InteractionMode::Plan)),
+                Some((RuntimeMode::FullAccess, InteractionMode::Default)),
+            ),
+            Some((RuntimeMode::ApprovalRequired, InteractionMode::Plan)),
+        );
+    }
+
+    #[test]
+    fn coalesced_wake_keeps_deepest_post_depth() {
+        assert_eq!(coalesced_wake_depth(2, 8), 8);
+        assert_eq!(coalesced_wake_depth(8, 2), 8);
+    }
+
+    #[test]
+    fn a_later_running_batch_does_not_skip_an_earlier_unacked_batch() {
+        assert_eq!(skip_contiguous_running_range(0, (8, 16)), 0);
+        assert_eq!(skip_contiguous_running_range(8, (8, 16)), 16);
+    }
 
     #[test]
     fn preserves_user_prompt_prefix_and_uses_stable_board_marker() {
@@ -1161,6 +1405,27 @@ mod tests {
             head_seq: 0,
         };
         assert_eq!(live_worker_count(&board), MAX_ACTIVE_WORKERS);
+    }
+
+    #[test]
+    fn automated_wakes_increment_depth() {
+        assert_eq!(next_wake_depth(7), 8);
+    }
+
+    #[test]
+    fn coordinator_worker_ping_pong_reaches_the_wake_depth_limit() {
+        let mut depth = 0;
+        for _ in 0..MAX_WAKE_DEPTH {
+            depth = next_wake_depth(depth);
+        }
+        assert_eq!(depth, MAX_WAKE_DEPTH);
+        assert!(depth >= MAX_WAKE_DEPTH);
+    }
+
+    #[test]
+    fn independent_worker_reports_share_their_coordinator_turn_depth() {
+        let reports = (0..12).map(|_| next_wake_depth(1)).collect::<Vec<_>>();
+        assert_eq!(reports, vec![2; 12]);
     }
 
     #[test]

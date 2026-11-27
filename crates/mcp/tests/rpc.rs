@@ -269,6 +269,16 @@ async fn handshake_discovery_batches_and_protocol_errors() {
         assert_eq!(tool["inputSchema"]["type"], "object");
         assert!(tool["name"].is_string());
     }
+    let status = tools
+        .iter()
+        .find(|tool| tool["name"] == "swarm_status")
+        .unwrap();
+    assert!(
+        status["description"]
+            .as_str()
+            .unwrap()
+            .contains("killed_count")
+    );
     let read = tools
         .iter()
         .find(|tool| tool["name"] == "swarm_read_board")
