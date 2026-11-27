@@ -337,16 +337,7 @@ impl GitManager {
         #[cfg(unix)]
         dir.mode(0o700);
         dir.create(&root).await.map_err(git_error)?;
-        let safe: String = branch_name
-            .chars()
-            .take(64)
-            .map(|ch| match ch {
-                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
-                _ => '-',
-            })
-            .collect();
-        let stem = safe.trim_matches('-');
-        let stem = if stem.is_empty() { "worktree" } else { stem };
+        let stem = ref_safe_name(branch_name);
         let suffix = Uuid::new_v4().simple().to_string();
         let name = format!("{stem}-{}", &suffix[..12]);
         let branch = format!("t3rs/{name}");
@@ -378,14 +369,33 @@ impl GitManager {
         Ok((path, branch))
     }
 
-    pub async fn remove_worktree(&self, repo_root: &Path, worktree_path: &Path) -> CoreResult<()> {
+    /// Remove a worktree without losing its uncommitted work. Tracked edits and untracked,
+    /// non-ignored files are first committed (on top of the worktree's HEAD, so the branch's
+    /// commits stay reachable even if the branch is deleted later) and pinned in the main
+    /// repository as `refs/t3/snapshots/<branch>-<UTC time>`; that ref is returned. A clean
+    /// worktree gets no ref. When the snapshot cannot be written the worktree is kept and the
+    /// error returned, because `--force` would otherwise destroy the changes.
+    ///
+    /// To restore: `git for-each-ref refs/t3/snapshots` lists them, `git show --stat <ref>`
+    /// shows one, and `git worktree add -b <new-branch> <dir> <ref>^` followed by
+    /// `git -C <dir> restore --source=<ref> --worktree -- .` brings the files back as
+    /// uncommitted changes. `git update-ref -d <ref>` drops a snapshot.
+    pub async fn remove_worktree(
+        &self,
+        repo_root: &Path,
+        worktree_path: &Path,
+    ) -> CoreResult<Option<String>> {
+        let snapshot = snapshot_worktree(repo_root, worktree_path).await?;
+        if let Some(snapshot) = &snapshot {
+            tracing::info!(%snapshot, path = %worktree_path.display(), "Saved worktree changes before removal");
+        }
         let mut command = git(repo_root);
         command
             .args(["worktree", "remove", "--force", "--"])
             .arg(worktree_path);
         checked_output(command, false).await?;
         tracing::debug!("Removed Git worktree");
-        Ok(())
+        Ok(snapshot)
     }
 
     pub async fn diff_summary(dir: &Path, ignore_whitespace: bool) -> CoreResult<DiffSummary> {
@@ -882,6 +892,82 @@ fn git_path(bytes: &[u8]) -> PathBuf {
 #[cfg(not(unix))]
 fn git_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).as_ref())
+}
+
+/// Commit the worktree's uncommitted state and pin it under `refs/t3/snapshots/`.
+/// `None` when the path is gone, is not a Git worktree, or has nothing uncommitted.
+async fn snapshot_worktree(repo_root: &Path, worktree: &Path) -> CoreResult<Option<String>> {
+    if !tokio::fs::try_exists(worktree).await.map_err(git_error)? {
+        return Ok(None);
+    }
+    let Some(tree) = GitManager::snapshot_tree(worktree).await? else {
+        return Ok(None);
+    };
+    let rev = |spec: &'static str| async move {
+        let output = git(worktree)
+            .args(["rev-parse", "--verify", "--quiet", spec])
+            .output()
+            .await
+            .map_err(git_error)?;
+        match output.status.code() {
+            Some(0) => Ok(Some(
+                String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            )),
+            Some(1) => Ok(None),
+            _ => Err(command_error(&output)),
+        }
+    };
+    if rev("HEAD^{tree}").await?.as_deref() == Some(tree.as_str()) {
+        return Ok(None);
+    }
+    let head = rev("HEAD^{commit}").await?;
+    let branch = GitManager::current_branch(worktree).await?;
+    let name = branch.clone().unwrap_or_else(|| {
+        worktree
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    let refname = format!(
+        "refs/t3/snapshots/{}-{}",
+        ref_safe_name(&name),
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ")
+    );
+    let message = format!(
+        "t3 snapshot of {}\n\nbranch: {}\nhead: {}\n",
+        worktree.display(),
+        branch.as_deref().unwrap_or("(detached)"),
+        head.as_deref().unwrap_or("(none)"),
+    );
+    let mut commit = git(repo_root);
+    for (key, value) in [("NAME", "t3 snapshot"), ("EMAIL", "snapshot@t3.invalid")] {
+        commit.env(format!("GIT_AUTHOR_{key}"), value);
+        commit.env(format!("GIT_COMMITTER_{key}"), value);
+    }
+    commit.args(["-c", "commit.gpgSign=false", "commit-tree", "-m", &message]);
+    if let Some(head) = &head {
+        commit.args(["-p", head]);
+    }
+    commit.arg(&tree);
+    let sha = checked_output(commit, false).await?;
+    let sha = String::from_utf8_lossy(&sha).trim().to_owned();
+    // The empty old value makes update-ref refuse to overwrite an existing snapshot.
+    git_output(repo_root, &["update-ref", &refname, &sha, ""]).await?;
+    Ok(Some(refname))
+}
+
+/// Up to 64 characters of `name` with everything outside `[A-Za-z0-9_-]` turned into `-`.
+fn ref_safe_name(name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .take(64)
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '-',
+        })
+        .collect();
+    let stem = safe.trim_matches('-');
+    if stem.is_empty() { "worktree" } else { stem }.to_owned()
 }
 
 fn git(dir: &Path) -> Command {

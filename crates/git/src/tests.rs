@@ -449,3 +449,113 @@ async fn untracked_binary_and_symlink_are_reported_without_reading_the_link_targ
     assert_eq!(link.additions, 1);
     assert!(!link.patch.contains("outside content"));
 }
+
+async fn snapshot_refs(repo: &Path) -> Vec<String> {
+    let out = git_output(
+        repo,
+        &["for-each-ref", "--format=%(refname)", "refs/t3/snapshots/"],
+    )
+    .await
+    .unwrap();
+    String::from_utf8_lossy(&out)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+async fn show(repo: &Path, spec: String) -> CoreResult<Vec<u8>> {
+    git_output(repo, &["show", &spec]).await
+}
+
+#[tokio::test]
+async fn remove_worktree_pins_uncommitted_work_under_snapshot_ref() {
+    let fixture = TempRepo::new().await;
+    fixture.write(".gitignore", "ignored.log\n");
+    fixture.write("tracked.txt", "base\n");
+    fixture.commit().await;
+    let manager = GitManager::new(fixture.root.join("worktrees"));
+    let (worktree, branch) = manager
+        .create_worktree(&fixture.repo, "dirty", None)
+        .await
+        .unwrap();
+    fs::write(worktree.join("tracked.txt"), "edited\n").unwrap();
+    fs::write(worktree.join("new.txt"), "untracked\n").unwrap();
+    fs::write(worktree.join("ignored.log"), "noise\n").unwrap();
+
+    let snapshot = manager
+        .remove_worktree(&fixture.repo, &worktree)
+        .await
+        .unwrap()
+        .expect("dirty worktree is snapshotted");
+
+    assert!(!worktree.exists());
+    assert_eq!(snapshot_refs(&fixture.repo).await, vec![snapshot.clone()]);
+    assert!(snapshot.starts_with("refs/t3/snapshots/t3rs-dirty-"));
+    let repo = &fixture.repo;
+    assert_eq!(
+        show(repo, format!("{snapshot}:tracked.txt")).await.unwrap(),
+        b"edited\n"
+    );
+    assert_eq!(
+        show(repo, format!("{snapshot}:new.txt")).await.unwrap(),
+        b"untracked\n"
+    );
+    assert!(show(repo, format!("{snapshot}:ignored.log")).await.is_err());
+    // The snapshot sits on the branch head, and the branch itself is kept.
+    let parent = git_output(repo, &["rev-parse", &format!("{snapshot}^")])
+        .await
+        .unwrap();
+    let head = git_output(repo, &["rev-parse", &branch]).await.unwrap();
+    assert_eq!(parent, head);
+}
+
+#[tokio::test]
+async fn remove_worktree_skips_snapshot_for_clean_worktree() {
+    let fixture = TempRepo::new().await;
+    fixture.write(".gitignore", "ignored.log\n");
+    fixture.write("tracked.txt", "base\n");
+    fixture.commit().await;
+    let manager = GitManager::new(fixture.root.join("worktrees"));
+    let (worktree, _) = manager
+        .create_worktree(&fixture.repo, "clean", None)
+        .await
+        .unwrap();
+    fs::write(worktree.join("ignored.log"), "noise\n").unwrap();
+
+    let snapshot = manager
+        .remove_worktree(&fixture.repo, &worktree)
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot, None);
+    assert!(!worktree.exists());
+    assert!(snapshot_refs(&fixture.repo).await.is_empty());
+}
+
+#[tokio::test]
+async fn remove_worktree_keeps_worktree_when_snapshot_fails() {
+    let fixture = TempRepo::new().await;
+    fixture.write("tracked.txt", "base\n");
+    fixture.commit().await;
+    // A ref named refs/t3/snapshots blocks every ref below it (directory/file conflict).
+    git_output(&fixture.repo, &["update-ref", "refs/t3/snapshots", "HEAD"])
+        .await
+        .unwrap();
+    let manager = GitManager::new(fixture.root.join("worktrees"));
+    let (worktree, _) = manager
+        .create_worktree(&fixture.repo, "blocked", None)
+        .await
+        .unwrap();
+    fs::write(worktree.join("tracked.txt"), "edited\n").unwrap();
+
+    let error = manager
+        .remove_worktree(&fixture.repo, &worktree)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("refs/t3/snapshots"), "{error}");
+
+    assert_eq!(
+        fs::read_to_string(worktree.join("tracked.txt")).unwrap(),
+        "edited\n"
+    );
+}

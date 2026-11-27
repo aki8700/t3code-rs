@@ -704,24 +704,48 @@ impl RunCoordinator {
         };
         let coordinator = self.clone();
         let project_id = worker.project_id;
+        let board_id = board.board_id;
         tokio::spawn(async move {
             if let Some(mut done) = done {
                 let _ = done.wait_for(|completed| *completed).await;
             }
-            coordinator.remove_worker_worktree(project_id, &path).await;
+            let note = coordinator.remove_worker_worktree(project_id, &path).await;
+            if let Some(text) = note {
+                let posted = coordinator
+                    .0
+                    .store
+                    .append_swarm_message(board_id, "system".into(), text, Vec::new())
+                    .await;
+                if posted.is_ok()
+                    && let Ok(board) = coordinator.require_board(thread_id).await
+                {
+                    coordinator.emit_board(&board);
+                }
+            }
         });
     }
 
-    async fn remove_worker_worktree(&self, project_id: Uuid, path: &Path) {
+    /// Returns a board note when the worktree was snapshotted or had to be kept.
+    /// `remove_worktree` saves uncommitted work under `refs/t3/snapshots/` first.
+    async fn remove_worker_worktree(&self, project_id: Uuid, path: &Path) -> Option<String> {
         let workspace = match self.0.store.get_project(project_id).await {
             Ok(project) => project.workspace_root,
             Err(error) => {
                 tracing::warn!(%error, %project_id, "Could not load project for worktree cleanup");
-                return;
+                return None;
             }
         };
-        if let Err(error) = self.0.git.remove_worktree(&workspace, path).await {
-            tracing::warn!(%error, path = %path.display(), "Could not remove killed worker worktree");
+        match self.0.git.remove_worktree(&workspace, path).await {
+            Ok(snapshot) => snapshot.map(|snapshot| {
+                format!("Killed worker's uncommitted changes were saved as {snapshot}")
+            }),
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "Kept killed worker worktree");
+                Some(format!(
+                    "Kept killed worker worktree {}: {error}",
+                    path.display()
+                ))
+            }
         }
     }
 

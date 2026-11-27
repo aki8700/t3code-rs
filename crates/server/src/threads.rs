@@ -252,6 +252,8 @@ impl RunCoordinator {
                             .git
                             .remove_worktree(&ctx.parent_workspace, &ctx.child_worktree)
                             .await;
+                        // A dirty child is snapshotted on top of its merged head before removal.
+                        let remove_res = remove_res.map(drop);
                         let branch_res =
                             if remove_res.is_ok() && ctx.child_branch.starts_with("t3rs/") {
                                 GitManager::delete_branch(&ctx.parent_workspace, &ctx.child_branch)
