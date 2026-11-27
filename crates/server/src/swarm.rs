@@ -31,6 +31,8 @@ pub(crate) struct WakeDelivery {
     from: i64,
     to: i64,
     redeliveries: u8,
+    wake_depth: u8,
+    mode_ceiling: Option<(RuntimeMode, InteractionMode)>,
 }
 
 pub(crate) fn is_swarm_command(prompt: &str) -> bool {
@@ -281,7 +283,17 @@ impl RunCoordinator {
                     false,
                 )
                 .await?;
-            self.record_delivery(worker.id, run_id, board.head_seq, post.seq, 0);
+            self.record_delivery(
+                worker.id,
+                WakeDelivery {
+                    run_id,
+                    from: board.head_seq,
+                    to: post.seq,
+                    redeliveries: 0,
+                    wake_depth: depth + 1,
+                    mode_ceiling: None,
+                },
+            );
             CoreResult::Ok(())
         }
         .await;
@@ -432,15 +444,15 @@ impl RunCoordinator {
         // At most one queued wake per member: a wake still waiting in the queue is replaced
         // by one that carries every unread post, so posts arriving while the member is busy
         // cost one turn instead of one turn each. Only the running run's posts are skipped.
-        let (running_to, preserved) = self.supersede_queued_wakes(active, target.id).await?;
-        let mut preserve_next = preserved;
-        let mut cursor = member.last_read_seq.max(running_to);
+        let (running_range, mut preserved) = self.supersede_queued_wakes(active, target.id).await?;
+        let mut cursor = skip_contiguous_running_range(member.last_read_seq, running_range);
         let mut woken = false;
         loop {
             let messages = store
                 .list_swarm_messages(member.board_id, cursor, WAKE_BATCH)
                 .await?;
             let Some(last) = messages.last() else {
+                self.cancel_trailing_wakes(target.id, preserved).await?;
                 return Ok(woken);
             };
             let unread = messages
@@ -457,31 +469,46 @@ impl RunCoordinator {
                     )
                     .expect("write to String");
                 }
-                let queued = preserve_next.take();
+                let queued = if preserved.is_empty() {
+                    None
+                } else {
+                    Some(preserved.remove(0))
+                };
                 let run_id = if let Some(delivery) = queued {
                     let Some(mut run) = store.queued_run(target.id, delivery.run_id).await? else {
                         continue;
                     };
-                    if mode_ceiling.is_some() {
-                        run.input.mode_ceiling = mode_ceiling;
-                    }
+                    run.input.mode_ceiling =
+                        stricter_mode_ceiling(run.input.mode_ceiling, mode_ceiling);
+                    run.input.wake_depth = coalesced_wake_depth(run.input.wake_depth, depth);
                     if store
                         .update_queued_run(target.id, run.id, prompt.clone(), run.input.clone())
                         .await?
                     {
                         self.record_delivery(
                             target.id,
-                            run.id,
-                            cursor,
-                            last.seq,
-                            delivery.redeliveries.max(redeliveries),
+                            WakeDelivery {
+                                run_id: run.id,
+                                from: cursor,
+                                to: last.seq,
+                                redeliveries: delivery.redeliveries.max(redeliveries),
+                                wake_depth: run.input.wake_depth,
+                                mode_ceiling: run.input.mode_ceiling,
+                            },
                         );
                         run.id
                     } else {
                         let mut message = queued_message(prompt);
-                        message.mode_ceiling = mode_ceiling;
-                        self.send_locked(active, target.clone(), message, depth, false)
-                            .await?
+                        message.mode_ceiling =
+                            stricter_mode_ceiling(delivery.mode_ceiling, mode_ceiling);
+                        self.send_locked(
+                            active,
+                            target.clone(),
+                            message,
+                            coalesced_wake_depth(delivery.wake_depth, depth),
+                            false,
+                        )
+                        .await?
                     }
                 } else {
                     let mut message = queued_message(prompt);
@@ -490,7 +517,17 @@ impl RunCoordinator {
                         .await?
                 };
                 if queued.is_none() {
-                    self.record_delivery(target.id, run_id, cursor, last.seq, redeliveries);
+                    self.record_delivery(
+                        target.id,
+                        WakeDelivery {
+                            run_id,
+                            from: cursor,
+                            to: last.seq,
+                            redeliveries,
+                            wake_depth: depth,
+                            mode_ceiling,
+                        },
+                    );
                 }
                 woken = true;
             } else {
@@ -501,6 +538,7 @@ impl RunCoordinator {
             }
             cursor = last.seq;
             if messages.len() < WAKE_BATCH {
+                self.cancel_trailing_wakes(target.id, preserved).await?;
                 return Ok(woken);
             }
         }
@@ -513,16 +551,11 @@ impl RunCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn record_delivery(&self, thread_id: Uuid, run_id: Uuid, from: i64, to: i64, redeliveries: u8) {
+    fn record_delivery(&self, thread_id: Uuid, delivery: WakeDelivery) {
         self.deliveries()
             .entry(thread_id)
             .or_default()
-            .push(WakeDelivery {
-                run_id,
-                from,
-                to,
-                redeliveries,
-            });
+            .push(delivery);
     }
 
     /// Keeps the earliest queued wake so coalescing can update it without moving its queue
@@ -532,41 +565,51 @@ impl RunCoordinator {
         &self,
         active: &HashMap<Uuid, ActiveRun>,
         thread_id: Uuid,
-    ) -> CoreResult<(i64, Option<WakeDelivery>)> {
+    ) -> CoreResult<((i64, i64), Vec<WakeDelivery>)> {
         let running = active.get(&thread_id).map(|run| run.id);
         let result = {
             let mut deliveries = self.deliveries();
             let Some(list) = deliveries.get_mut(&thread_id) else {
-                return Ok((0, None));
+                return Ok(((0, 0), Vec::new()));
             };
             let (current, superseded): (Vec<_>, Vec<_>) = std::mem::take(list)
                 .into_iter()
                 .partition(|delivery| Some(delivery.run_id) == running);
+            let running_from = current
+                .iter()
+                .map(|delivery| delivery.from)
+                .min()
+                .unwrap_or(0);
             let running_to = current
                 .iter()
                 .map(|delivery| delivery.to)
                 .max()
                 .unwrap_or(0);
-            let preserved = superseded.first().copied();
-            let keep_id = preserved.map(|delivery| delivery.run_id);
-            let queued_to_cancel = superseded
-                .iter()
-                .filter(|delivery| Some(delivery.run_id) != keep_id)
-                .map(|delivery| delivery.run_id);
-            let mut superseded = queued_to_cancel.collect::<Vec<_>>();
-            superseded.dedup();
             if current.is_empty() {
                 deliveries.remove(&thread_id);
             } else {
                 *list = current;
             }
-            (running_to, superseded, preserved)
+            ((running_from, running_to), superseded)
         };
-        let (running_to, superseded, preserved) = result;
-        for run_id in superseded {
-            self.cancel_queued_locked(thread_id, run_id).await?;
+        let (running_range, preserved) = result;
+        Ok((running_range, preserved))
+    }
+
+    async fn cancel_trailing_wakes(
+        &self,
+        thread_id: Uuid,
+        trailing: Vec<WakeDelivery>,
+    ) -> CoreResult<()> {
+        let mut ids = trailing
+            .into_iter()
+            .map(|delivery| delivery.run_id)
+            .collect::<Vec<_>>();
+        ids.dedup();
+        for id in ids {
+            self.cancel_queued_locked(thread_id, id).await?;
         }
-        Ok((running_to, preserved))
+        Ok(())
     }
 
     /// Called when a run ends. A completed run acknowledges the posts it delivered. When the
@@ -610,7 +653,17 @@ impl RunCoordinator {
         let Some(queued) = self.0.store.queued_run(thread_id, queued_wake).await? else {
             return Ok(());
         };
-        let depth = queued.input.wake_depth;
+        let depth = delivered
+            .iter()
+            .map(|delivery| delivery.wake_depth)
+            .max()
+            .unwrap_or(0)
+            .max(queued.input.wake_depth);
+        let mode_ceiling = delivered
+            .iter()
+            .fold(queued.input.mode_ceiling, |ceiling, delivery| {
+                stricter_mode_ceiling(ceiling, delivery.mode_ceiling)
+            });
         let attempts = delivered
             .iter()
             .map(|delivery| delivery.redeliveries)
@@ -629,15 +682,8 @@ impl RunCoordinator {
             .iter()
             .find(|member| member.thread_id == thread_id && member.state != "killed")
         {
-            self.wake_member_with_retry(
-                active,
-                member,
-                None,
-                depth,
-                queued.input.mode_ceiling,
-                attempts + 1,
-            )
-            .await?;
+            self.wake_member_with_retry(active, member, None, depth, mode_ceiling, attempts + 1)
+                .await?;
         }
         Ok(())
     }
@@ -995,6 +1041,40 @@ fn wake_depth(active: &HashMap<Uuid, ActiveRun>, id: Uuid) -> u8 {
     active.get(&id).map_or(0, |run| run.wake_depth)
 }
 
+fn stricter_mode_ceiling(
+    left: Option<(RuntimeMode, InteractionMode)>,
+    right: Option<(RuntimeMode, InteractionMode)>,
+) -> Option<(RuntimeMode, InteractionMode)> {
+    match (left, right) {
+        (Some((left_runtime, left_interaction)), Some((right_runtime, right_interaction))) => {
+            Some((
+                left_runtime.min(right_runtime),
+                if left_interaction == InteractionMode::Plan
+                    || right_interaction == InteractionMode::Plan
+                {
+                    InteractionMode::Plan
+                } else {
+                    InteractionMode::Default
+                },
+            ))
+        }
+        (Some(ceiling), None) | (None, Some(ceiling)) => Some(ceiling),
+        (None, None) => None,
+    }
+}
+
+fn coalesced_wake_depth(existing: u8, incoming: u8) -> u8 {
+    existing.max(incoming)
+}
+
+fn skip_contiguous_running_range(last_read_seq: i64, range: (i64, i64)) -> i64 {
+    if range.0 == last_read_seq {
+        range.1
+    } else {
+        last_read_seq
+    }
+}
+
 /// Every automated handoff carries depth forward. Independent workers assigned in one
 /// coordinator run share that run's depth; exchanges with one worker ratchet and terminate.
 fn next_wake_depth(depth: u8) -> u8 {
@@ -1111,6 +1191,29 @@ fn mentions_in(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_wake_redelivery_intersects_both_mode_ceilings() {
+        assert_eq!(
+            stricter_mode_ceiling(
+                Some((RuntimeMode::ApprovalRequired, InteractionMode::Plan)),
+                Some((RuntimeMode::FullAccess, InteractionMode::Default)),
+            ),
+            Some((RuntimeMode::ApprovalRequired, InteractionMode::Plan)),
+        );
+    }
+
+    #[test]
+    fn coalesced_wake_keeps_deepest_post_depth() {
+        assert_eq!(coalesced_wake_depth(2, 8), 8);
+        assert_eq!(coalesced_wake_depth(8, 2), 8);
+    }
+
+    #[test]
+    fn a_later_running_batch_does_not_skip_an_earlier_unacked_batch() {
+        assert_eq!(skip_contiguous_running_range(0, (8, 16)), 0);
+        assert_eq!(skip_contiguous_running_range(8, (8, 16)), 16);
+    }
 
     #[test]
     fn preserves_user_prompt_prefix_and_uses_stable_board_marker() {

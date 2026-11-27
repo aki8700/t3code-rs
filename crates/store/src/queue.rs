@@ -152,6 +152,7 @@ impl SqliteStore {
         prompt: String,
         input: QueuedRunInput,
     ) -> CoreResult<bool> {
+        let cfg = self.storage_cfg.clone();
         self.with_writer(move |connection| {
             let tx = connection.transaction().map_err(storage_error)?;
             let changed = tx
@@ -171,6 +172,39 @@ impl SqliteStore {
                     params![run_id.to_string(), encode(&input)?],
                 )
                 .map_err(storage_error)?;
+                let payload = serde_json::json!({"text": prompt});
+                let text = serde_json::to_string(&payload).map_err(storage_error)?;
+                let raw_bytes = text.len();
+                let (blob_hash, compressed_bytes) =
+                    store_item_blob(&tx, &text, raw_bytes, &cfg)?;
+                let item_id: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM turn_items WHERE run_id = ?1 AND thread_id = ?2 AND kind = ?3
+                         ORDER BY ordinal LIMIT 1",
+                        params![run_id.to_string(), thread_id.to_string(), encode(&t3_core::TurnItemKind::UserMessage)?],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(storage_error)?;
+                if let Some(item_id) = item_id {
+                    tx.execute(
+                        "UPDATE turn_items SET payload_text = ?2, blob_hash = ?3, raw_bytes = ?4,
+                         compressed_bytes = ?5 WHERE id = ?1",
+                        params![
+                            item_id,
+                            blob_hash.is_none().then_some(text.as_str()),
+                            blob_hash,
+                            raw_bytes,
+                            compressed_bytes
+                        ],
+                    )
+                    .map_err(storage_error)?;
+                    tx.execute(
+                        "UPDATE fts_entries SET body = ?3 WHERE thread_id = ?1 AND item_id = ?2",
+                        params![thread_id.to_string(), item_id, prompt],
+                    )
+                    .map_err(storage_error)?;
+                }
             }
             tx.commit().map_err(storage_error)?;
             Ok(changed != 0)
@@ -412,6 +446,46 @@ mod tests {
             .await
             .unwrap();
         (store, thread.id)
+    }
+
+    #[tokio::test]
+    async fn updating_queued_run_updates_user_history_and_search_index() {
+        let (store, thread_id) = fixture().await;
+        let run = queued_run(thread_id);
+        let item = NewTurnItem {
+            thread_id,
+            run_id: run.id,
+            kind: t3_core::TurnItemKind::UserMessage,
+            summary: None,
+            payload: serde_json::json!({"text": "stale prompt"}),
+            searchable_text: None,
+        };
+        let input = QueuedRunInput {
+            model_selection: mock_selection(),
+            attachment_ids: Vec::new(),
+            notify_parent: true,
+            wake_depth: 0,
+            mode_ceiling: None,
+            verify_fix_depth: 0,
+            last_verify_signature: None,
+            verify_dead_ends: Vec::new(),
+            fallback_attempts: 0,
+        };
+        let (run, item) = store.enqueue_run(run, item, input.clone()).await.unwrap();
+
+        assert!(
+            store
+                .update_queued_run(thread_id, run.id, "coalesced prompt needle".into(), input,)
+                .await
+                .unwrap()
+        );
+
+        let history = store.list_turn_items(thread_id, 10, 0).await.unwrap();
+        let updated = history.iter().find(|entry| entry.id == item.id).unwrap();
+        assert_eq!(updated.payload["text"], "coalesced prompt needle");
+        let hits = store.search_fts("needle", 10).await.unwrap();
+        assert!(hits.iter().any(|hit| hit.item_id == Some(item.id)));
+        assert!(store.search_fts("stale", 10).await.unwrap().is_empty());
     }
 
     fn queued_run(thread_id: Uuid) -> Run {

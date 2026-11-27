@@ -2787,13 +2787,14 @@ printf '{"type":"result","subtype":"success","result":"noted"}\n'
         json!({"thread_id":id,"name":"w1","brief":"check","provider":"mock","model":"mock"}),
     )
     .await;
-    let worker_id = worker["thread_id"].clone();
-    mcp_tool(
-        &app,
-        "swarm_post_message",
-        json!({"thread_id":worker_id,"text":"@coordinator report one"}),
-    )
-    .await;
+    for index in 0..20 {
+        mcp_tool(
+            &app,
+            "swarm_post_message",
+            json!({"thread_id":worker["thread_id"],"text":format!("@coordinator report-{index}")}),
+        )
+        .await;
+    }
     json_req(
         &app,
         Method::POST,
@@ -2804,33 +2805,44 @@ printf '{"type":"result","subtype":"success","result":"noted"}\n'
     mcp_tool(
         &app,
         "swarm_post_message",
-        json!({"thread_id":worker["thread_id"],"text":"@coordinator report two"}),
+        json!({"thread_id":worker["thread_id"],"text":"@coordinator report-after-user"}),
     )
     .await;
     std::fs::write(tmp.0.join("release-coordinator"), "ready").unwrap();
     let detail = wait_for_runs(&app, id, 3).await;
     let runs = detail["runs"].as_array().unwrap();
-    let queued_wake = runs
+    let queued_wakes = runs
         .iter()
-        .find(|run| {
+        .filter(|run| {
             run["prompt"]
                 .as_str()
                 .unwrap()
                 .contains("Unread swarm board posts")
         })
-        .unwrap();
+        .collect::<Vec<_>>();
     let user = runs
         .iter()
         .find(|run| run["prompt"] == "user follow-up")
         .unwrap();
     assert!(
-        queued_wake["ordinal"].as_u64() < user["ordinal"].as_u64(),
+        queued_wakes.len() >= 2,
+        "multi-batch wakes were not queued: {runs:?}"
+    );
+    assert!(
+        queued_wakes
+            .iter()
+            .all(|wake| wake["ordinal"].as_u64() < user["ordinal"].as_u64()),
         "{runs:?}"
     );
-    let prompt = queued_wake["prompt"].as_str().unwrap();
+    let prompts = queued_wakes
+        .iter()
+        .map(|wake| wake["prompt"].as_str().unwrap())
+        .collect::<String>();
     assert!(
-        prompt.contains("report one") && prompt.contains("report two"),
-        "{prompt}"
+        prompts.contains("report-0")
+            && prompts.contains("report-19")
+            && prompts.contains("report-after-user"),
+        "{prompts}"
     );
 }
 
@@ -2842,9 +2854,14 @@ async fn repeated_failed_first_batch_does_not_redeliver_more_than_once() {
         &tmp,
         r#"#!/bin/sh
 IFS= read -r prompt
+echo x >> calls
 case "$prompt" in
   *"Unread swarm board posts"*)
     echo x >> wake_calls
+    if [ "$(wc -l < wake_calls)" -eq 1 ]; then
+      touch first-wake-started
+      while [ ! -f release-wake ]; do sleep 0.01; done
+    fi
     echo boom >&2; exit 1 ;;
 esac
 printf '{"type":"result","subtype":"success","result":"noted"}\n'
@@ -2859,7 +2876,20 @@ printf '{"type":"result","subtype":"success","result":"noted"}\n'
         json!({"thread_id":id,"name":"w1","brief":"check","provider":"mock","model":"mock"}),
     )
     .await;
-    for index in 0..20 {
+    mcp_tool(
+        &app,
+        "swarm_post_message",
+        json!({"thread_id":worker["thread_id"],"text":"@coordinator post-0"}),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !tmp.0.join("first-wake-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first wake did not start");
+    for index in 1..20 {
         mcp_tool(
             &app,
             "swarm_post_message",
@@ -2867,6 +2897,30 @@ printf '{"type":"result","subtype":"success","result":"noted"}\n'
         )
         .await;
     }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
+            let queued = detail["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|run| {
+                    run["status"] == "queued"
+                        && run["prompt"]
+                            .as_str()
+                            .unwrap()
+                            .contains("Unread swarm board posts")
+                })
+                .count();
+            if queued >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("multiple wake batches were not queued");
+    std::fs::write(tmp.0.join("release-wake"), "ready").unwrap();
     let calls = settled_calls(&tmp).await;
     assert!(
         calls <= 4,
