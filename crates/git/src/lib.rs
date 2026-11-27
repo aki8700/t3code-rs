@@ -31,6 +31,12 @@ pub enum MergeOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchWorktreeStatus {
+    pub changed_files: Vec<String>,
+    pub behind: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct GitManager {
     worktrees_root: PathBuf,
@@ -485,6 +491,68 @@ impl GitManager {
             MAX_TOTAL_PATCH_BYTES,
         )
         .await
+    }
+
+    /// Read the paths changed by a worktree since it diverged from `base_ref`, plus its dirty files.
+    /// All git commands here are read-only and disable external diff/text conversion drivers.
+    pub async fn worktree_branch_status(
+        worktree: &Path,
+        base_ref: &str,
+    ) -> CoreResult<BranchWorktreeStatus> {
+        let base = resolve_commit(worktree, base_ref).await?;
+        let head = resolve_commit(worktree, "HEAD").await?;
+        let merge_base = git_output(worktree, &["merge-base", &base, &head]).await?;
+        let merge_base = String::from_utf8_lossy(&merge_base).trim().to_owned();
+        let committed = git_output(
+            worktree,
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                &merge_base,
+                &head,
+                "--",
+            ],
+        )
+        .await?;
+        let dirty = git_output(
+            worktree,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--no-renames",
+                "--untracked-files=all",
+            ],
+        )
+        .await?;
+        let behind = git_output(
+            worktree,
+            &["rev-list", "--count", &format!("{head}..{base}")],
+        )
+        .await?;
+        let behind = String::from_utf8_lossy(&behind)
+            .trim()
+            .parse()
+            .map_err(git_error)?;
+        let mut changed_files = nul_fields(&committed)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect::<Vec<_>>();
+        changed_files.extend(
+            status_entries(&dirty)?
+                .into_iter()
+                .map(|entry| String::from_utf8_lossy(entry.path).into_owned()),
+        );
+        changed_files.sort_unstable();
+        changed_files.dedup();
+        Ok(BranchWorktreeStatus {
+            changed_files,
+            behind,
+        })
     }
 
     async fn branch_diff_summary_with_budget(

@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex, OnceLock},
 };
@@ -18,7 +18,7 @@ use t3_git::{GitManager, MergeOutcome};
 use t3_mcp::{
     Capabilities, DelegateMode, DelegatedTask, ForkOptions, OrchestratorBackend, SwarmMemberResult,
     SwarmMemberSummary, SwarmPostResult, SwarmReadMessage, SwarmStatusResult, SwarmWorkerResult,
-    TaskMergeResult, ThreadRead,
+    TaskMergeResult, ThreadRead, WorktreeChange, WorktreeOverlap,
 };
 use t3_providers::{ProviderRegistry, format_delegated_error};
 use uuid::Uuid;
@@ -1003,6 +1003,68 @@ fn workspace_merge_lock(canonical_workspace: &Path) -> Arc<tokio::sync::Mutex<()
     )
 }
 
+impl RunCoordinator {
+    async fn worktree_changes(
+        &self,
+        parent_id: Uuid,
+        relationship: &str,
+    ) -> CoreResult<(Vec<WorktreeChange>, Vec<WorktreeOverlap>)> {
+        let parent = self.0.store.get_thread(parent_id).await?;
+        let parent_workspace = self.workspace(&parent).await?;
+        let base_ref = GitManager::current_branch(&parent_workspace)
+            .await
+            .ok()
+            .flatten()
+            .or_else(|| parent.branch.clone());
+        let children = self
+            .0
+            .store
+            .list_child_threads(parent_id)
+            .await?
+            .into_iter()
+            .filter(|child| child.relationship.as_deref() == Some(relationship));
+        let mut by_file = BTreeMap::<String, Vec<(Uuid, String)>>::new();
+        let mut worktrees = Vec::new();
+        for child in children {
+            let Some(path) = child.worktree_path.as_deref() else {
+                continue;
+            };
+            if path == parent_workspace.as_path() {
+                continue;
+            }
+            let status = match base_ref.as_deref() {
+                Some(base_ref) => GitManager::worktree_branch_status(path, base_ref).await.ok(),
+                None => None,
+            };
+            let report = WorktreeChange {
+                thread_id: child.id,
+                worker: child.title,
+                changed_files: status
+                    .as_ref()
+                    .map_or_else(Vec::new, |status| status.changed_files.clone()),
+                behind: status.map(|status| status.behind),
+            };
+            for file in &report.changed_files {
+                by_file
+                    .entry(file.clone())
+                    .or_default()
+                    .push((report.thread_id, report.worker.clone()));
+            }
+            worktrees.push(report);
+        }
+        let overlaps = by_file
+            .into_iter()
+            .filter(|(_, workers)| workers.len() > 1)
+            .map(|(file, workers)| WorktreeOverlap {
+                file,
+                worker_ids: workers.iter().map(|(id, _)| *id).collect(),
+                workers: workers.into_iter().map(|(_, name)| name).collect(),
+            })
+            .collect();
+        Ok((worktrees, overlaps))
+    }
+}
+
 #[async_trait]
 impl OrchestratorBackend for RunCoordinator {
     async fn swarm_status(&self, thread_id: Uuid) -> CoreResult<Option<SwarmStatusResult>> {
@@ -1010,6 +1072,9 @@ impl OrchestratorBackend for RunCoordinator {
             return Ok(None);
         };
         let message_count = self.0.store.count_swarm_messages(board.board_id).await?;
+        let (worktrees, overlaps) = self
+            .worktree_changes(board.coordinator_thread_id, "swarm-worker")
+            .await?;
         Ok(Some(SwarmStatusResult {
             board_id: board.board_id,
             members: board
@@ -1019,6 +1084,8 @@ impl OrchestratorBackend for RunCoordinator {
                 .collect(),
             head_seq: board.head_seq,
             message_count,
+            worktrees,
+            overlaps,
         }))
     }
 
@@ -1108,6 +1175,8 @@ impl OrchestratorBackend for RunCoordinator {
             status: thread.status,
             worktree_path: thread.worktree_path,
             summary: None,
+            worktree: None,
+            overlaps: Vec::new(),
         })
     }
 
@@ -1138,6 +1207,18 @@ impl OrchestratorBackend for RunCoordinator {
                 .await?
                 .or(run.error_message),
         };
+        let (worktree, overlaps) = if let Some(parent_id) = thread.parent_thread_id {
+            let (worktrees, overlaps) = self.worktree_changes(parent_id, "delegated").await?;
+            (
+                worktrees
+                    .iter()
+                    .find(|change| change.thread_id == thread.id)
+                    .cloned(),
+                overlaps,
+            )
+        } else {
+            (None, Vec::new())
+        };
         Ok(DelegatedTask {
             task_id,
             child_thread_id: thread.id,
@@ -1145,6 +1226,8 @@ impl OrchestratorBackend for RunCoordinator {
             status: thread.status,
             worktree_path: thread.worktree_path,
             summary,
+            worktree,
+            overlaps,
         })
     }
 

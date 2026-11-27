@@ -69,6 +69,8 @@ impl OrchestratorBackend for Backend {
             status: ThreadStatus::Completed,
             worktree_path: None,
             summary: Some("complete".into()),
+            worktree: None,
+            overlaps: vec![],
         })
     }
 
@@ -321,10 +323,10 @@ async fn dispatches_tools_with_thread_context_and_validates_arguments() {
         .await,
     );
     assert_eq!(task["run_id"], json!(id));
-    assert_eq!(
-        payload(call(&server, "task_status", json!({"task_id":id})).await)["summary"],
-        "complete"
-    );
+    let status = payload(call(&server, "task_status", json!({"task_id":id})).await);
+    assert_eq!(status["summary"], "complete");
+    assert!(status["worktree"].is_null());
+    assert_eq!(status["overlaps"], json!([]));
     assert_eq!(
         payload(call(&server, "task_cancel", json!({"task_id":id})).await)["status"],
         "interrupted"
