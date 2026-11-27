@@ -41,6 +41,51 @@ struct DiffArgs {
     max_bytes: Option<usize>,
 }
 
+/// Argument struct fields per code tool, compared against the tool schemas.
+#[cfg(test)]
+pub(crate) fn argument_fields() -> [(&'static str, Vec<&'static str>); 4] {
+    use crate::tests::fields;
+    [
+        (
+            "code_index",
+            fields!(IndexArgs {
+                path,
+                max_depth,
+                max_lines
+            }),
+        ),
+        (
+            "code_slice",
+            fields!(SliceArgs {
+                path,
+                symbol,
+                start,
+                end,
+                max_bytes
+            }),
+        ),
+        (
+            "code_grep",
+            fields!(GrepArgs {
+                pattern,
+                path,
+                glob,
+                max_hits,
+                max_bytes
+            }),
+        ),
+        (
+            "code_diff",
+            fields!(DiffArgs {
+                cwd,
+                rev,
+                path,
+                max_bytes
+            }),
+        ),
+    ]
+}
+
 pub(crate) async fn call(
     name: String,
     args: Value,
