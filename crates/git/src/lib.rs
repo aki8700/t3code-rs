@@ -59,12 +59,14 @@ impl GitManager {
     }
 
     pub async fn current_branch(dir: &Path) -> CoreResult<Option<String>> {
+        let dir = &worktree_repo(dir).await?;
         let output = git_output(dir, &["branch", "--show-current"]).await?;
         let name = output.strip_suffix(b"\n").unwrap_or(&output);
         Ok((!name.is_empty()).then(|| String::from_utf8_lossy(name).into_owned()))
     }
 
     pub async fn list_branches(dir: &Path) -> CoreResult<Vec<String>> {
+        let dir = &worktree_repo(dir).await?;
         let output = git_output(dir, &["branch", "--format=%(refname:short)"]).await?;
         Ok(String::from_utf8_lossy(&output)
             .lines()
@@ -223,6 +225,7 @@ impl GitManager {
     }
 
     pub async fn has_merge_in_progress(workspace: &Path) -> CoreResult<bool> {
+        let workspace = &worktree_repo(workspace).await?;
         let output = git(workspace)
             .args(["rev-parse", "--verify", "-q", "MERGE_HEAD"])
             .output()
@@ -244,6 +247,7 @@ impl GitManager {
     }
 
     pub async fn merge_branch(repo_root: &Path, branch: &str) -> CoreResult<String> {
+        let repo_root = &worktree_repo(repo_root).await?;
         validate_branch(repo_root, branch).await?;
         if Self::has_merge_in_progress(repo_root).await? {
             return Err(git_error("a merge is already in progress"));
@@ -270,6 +274,7 @@ impl GitManager {
         branch: &str,
         commit_message: Option<&str>,
     ) -> CoreResult<MergeOutcome> {
+        let repo_root = &worktree_repo(repo_root).await?;
         validate_branch(repo_root, branch).await?;
         if Self::has_merge_in_progress(repo_root).await? {
             return Err(git_error("a merge is already in progress"));
@@ -322,6 +327,7 @@ impl GitManager {
     }
 
     pub async fn delete_branch(repo_root: &Path, branch: &str) -> CoreResult<()> {
+        let repo_root = &worktree_repo(repo_root).await?;
         validate_branch(repo_root, branch).await?;
         let mut command = git(repo_root);
         command.args(["branch", "-D", "--", branch]);
@@ -330,6 +336,7 @@ impl GitManager {
     }
 
     pub async fn prune_worktrees(&self, repo_root: &Path) -> CoreResult<()> {
+        let repo_root = &worktree_repo(repo_root).await?;
         let mut command = git(repo_root);
         command.args(["worktree", "prune"]);
         checked_output(command, false).await?;
@@ -376,6 +383,7 @@ impl GitManager {
         branch_name: &str,
         base_ref: Option<&str>,
     ) -> CoreResult<(PathBuf, String)> {
+        let repo_root = &worktree_repo(repo_root).await?;
         let root = std::path::absolute(&self.worktrees_root).map_err(git_error)?;
         let mut dir = tokio::fs::DirBuilder::new();
         dir.recursive(true);
@@ -430,6 +438,7 @@ impl GitManager {
         repo_root: &Path,
         worktree_path: &Path,
     ) -> CoreResult<Option<String>> {
+        let repo_root = &worktree_repo(repo_root).await?;
         let snapshot = snapshot_worktree(repo_root, worktree_path).await?;
         if let Some(snapshot) = &snapshot {
             tracing::info!(%snapshot, path = %worktree_path.display(), "Saved worktree changes before removal");
@@ -532,6 +541,7 @@ impl GitManager {
         head_ref: &str,
         ignore_whitespace: bool,
     ) -> CoreResult<DiffSummary> {
+        let workspace = &worktree_repo(workspace).await?;
         Self::branch_diff_summary_with_budget(
             workspace,
             base_ref,
@@ -1090,6 +1100,63 @@ fn ref_safe_name(name: &str) -> String {
     if stem.is_empty() { "worktree" } else { stem }.to_owned()
 }
 
+/// Prefer the supplied repository (including a subdirectory or an explicit bare repo).
+/// Only a workspace outside Git needs discovery, limited to its immediate checkouts.
+async fn worktree_repo(workspace: &Path) -> CoreResult<PathBuf> {
+    if tokio::fs::try_exists(workspace.join(".git"))
+        .await
+        .map_err(git_error)?
+    {
+        return Ok(workspace.to_owned());
+    }
+    let probe = git(workspace)
+        .env("LC_ALL", "C")
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .await
+        .map_err(git_error)?;
+    if probe.status.success() {
+        return Ok(workspace.to_owned());
+    }
+    // Preserve Git errors such as dubious ownership or a malformed gitfile.
+    if !probe.stderr.starts_with(b"fatal: not a git repository (") {
+        return Err(command_error(&probe));
+    }
+
+    let mut entries = tokio::fs::read_dir(workspace).await.map_err(git_error)?;
+    let mut candidates = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(git_error)? {
+        if !entry.file_type().await.map_err(git_error)?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if tokio::fs::try_exists(path.join(".git"))
+            .await
+            .map_err(git_error)?
+            && GitManager::is_git_repo(&path).await
+        {
+            candidates.push(path);
+        }
+    }
+    candidates.sort();
+    match candidates.len() {
+        0 => Err(git_error(format!(
+            "no Git checkout in {} or its immediate children; select a repository as the project workspace",
+            workspace.display()
+        ))),
+        1 => Ok(candidates.pop().unwrap()),
+        _ => Err(git_error(format!(
+            "multiple Git checkouts under {}; select one as the project workspace: {}",
+            workspace.display(),
+            candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
 fn git(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command
@@ -1414,29 +1481,36 @@ mod primitive_tests {
     struct Repo(PathBuf);
 
     impl Repo {
-        async fn new() -> Self {
+        fn temp_dir() -> Self {
             let path = std::env::temp_dir().join(format!("t3-git-primitives-{}", Uuid::new_v4()));
             fs::create_dir_all(&path).unwrap();
-            git_output(&path, &["init", "--initial-branch=main"])
-                .await
-                .unwrap();
-            git_output(&path, &["config", "user.name", "Git tests"])
-                .await
-                .unwrap();
-            git_output(
-                &path,
-                &["config", "user.email", "git-tests@example.invalid"],
-            )
-            .await
-            .unwrap();
-            fs::write(path.join("tracked.txt"), "base\n").unwrap();
-            git_output(&path, &["add", "--", "tracked.txt"])
-                .await
-                .unwrap();
-            git_output(&path, &["commit", "-m", "initial"])
-                .await
-                .unwrap();
             Self(path)
+        }
+
+        async fn new() -> Self {
+            let repo = Self::temp_dir();
+            Self::init(&repo.0).await;
+            repo
+        }
+
+        async fn init(path: &Path) {
+            fs::create_dir_all(path).unwrap();
+            git_output(path, &["init", "--initial-branch=main"])
+                .await
+                .unwrap();
+            git_output(path, &["config", "user.name", "Git tests"])
+                .await
+                .unwrap();
+            git_output(path, &["config", "user.email", "git-tests@example.invalid"])
+                .await
+                .unwrap();
+            fs::write(path.join("tracked.txt"), "base\n").unwrap();
+            git_output(path, &["add", "--", "tracked.txt"])
+                .await
+                .unwrap();
+            git_output(path, &["commit", "-m", "initial"])
+                .await
+                .unwrap();
         }
     }
 
@@ -1444,6 +1518,115 @@ mod primitive_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn parent_workspace_resolves_one_checkout_through_worktree_cleanup() {
+        let temp = Repo::temp_dir();
+        let workspace = temp.0.join("workspace");
+        let checkout = workspace.join("my repo");
+        Repo::init(&checkout).await;
+        fs::create_dir(workspace.join("documents")).unwrap();
+        let manager = GitManager::new(temp.0.join("worktrees"));
+        let (tree, branch) = manager
+            .create_worktree(&workspace, "child", Some("main"))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(tree.join("tracked.txt")).unwrap(),
+            "base\n"
+        );
+        assert_eq!(
+            GitManager::current_branch(&workspace)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("main")
+        );
+        assert!(!GitManager::has_merge_in_progress(&workspace).await.unwrap());
+        fs::write(tree.join("tracked.txt"), "edited\n").unwrap();
+        GitManager::stage_file(&tree, "tracked.txt").await.unwrap();
+        GitManager::commit(&tree, "child edit").await.unwrap();
+        let diff = GitManager::branch_diff_summary(&workspace, "HEAD", &branch, false)
+            .await
+            .unwrap();
+        assert_eq!(diff.files.len(), 1);
+        assert!(matches!(
+            GitManager::merge_branch_checked(&workspace, &branch, None)
+                .await
+                .unwrap(),
+            MergeOutcome::Merged { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
+            "edited\n"
+        );
+        assert!(
+            manager
+                .remove_worktree(&workspace, &tree)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        GitManager::delete_branch(&workspace, &branch)
+            .await
+            .unwrap();
+        manager.prune_worktrees(&workspace).await.unwrap();
+        assert!(!tree.exists());
+        assert_eq!(
+            GitManager::list_branches(&checkout).await.unwrap(),
+            ["main"]
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_workspace_lists_only_immediate_checkouts_in_a_stable_order() {
+        let temp = Repo::temp_dir();
+        let workspace = temp.0.join("projects");
+        let manager = GitManager::new(temp.0.join("worktrees"));
+        Repo::init(&workspace.join("archive/nested")).await;
+        let err = manager
+            .create_worktree(&workspace, "task", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no Git checkout"), "{err}");
+        assert!(err.contains("select a repository"), "{err}");
+
+        let zeta = workspace.join("zeta");
+        Repo::init(&zeta).await;
+        let alpha = workspace.join("alpha worker");
+        let mut add = git(&zeta);
+        add.args(["worktree", "add", "--detach", "--"]).arg(&alpha);
+        checked_output(add, false).await.unwrap();
+        let err = manager
+            .create_worktree(&workspace, "task", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("select one as the project workspace"), "{err}");
+        assert!(
+            err.ends_with(&format!("{}, {}", alpha.display(), zeta.display())),
+            "{err}"
+        );
+        assert!(!manager.worktrees_root.exists());
+
+        // Selecting a checkout explicitly takes precedence over its nested repositories.
+        Repo::init(&zeta.join("nested")).await;
+        let (tree, branch) = manager.create_worktree(&zeta, "task", None).await.unwrap();
+        assert!(
+            GitManager::list_branches(&zeta)
+                .await
+                .unwrap()
+                .contains(&branch)
+        );
+        assert!(
+            !GitManager::list_branches(&zeta.join("nested"))
+                .await
+                .unwrap()
+                .contains(&branch)
+        );
+        manager.remove_worktree(&zeta, &tree).await.unwrap();
     }
 
     #[tokio::test]

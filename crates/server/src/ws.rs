@@ -7,7 +7,7 @@ use axum::{
     },
     response::Response,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use std::collections::{HashSet, VecDeque};
 use t3_core::{AuthIdentity, TELEMETRY_ENABLED, WsClientMessage, WsServerMessage};
 use tokio_stream::wrappers::BroadcastStream;
@@ -50,7 +50,9 @@ impl ClientLaneQueue {
         self.events_lost
     }
 
-    pub(crate) fn push(&mut self, msg: WsServerMessage) {
+    /// When the control lane is full, send its oldest message before accepting more input.
+    #[must_use = "send the returned control message before accepting more input"]
+    pub(crate) fn push(&mut self, msg: WsServerMessage) -> Option<WsServerMessage> {
         match &msg {
             WsServerMessage::RunUsageUpdated { thread_id, .. } => {
                 let thread_id = *thread_id;
@@ -85,22 +87,16 @@ impl ClientLaneQueue {
             | WsServerMessage::SubagentUpdated { .. }
             | WsServerMessage::SwarmUpdated { .. }
             | WsServerMessage::ShellFinished { .. } => {
-                if self.control.len() >= CONTROL_LANE_CAP {
-                    self.events_lost = true;
-                    if !self
-                        .control
-                        .iter()
-                        .any(|m| matches!(m, WsServerMessage::Resync { thread_id: None }))
-                    {
-                        self.control.pop_front();
-                        self.control
-                            .push_back(WsServerMessage::Resync { thread_id: None });
-                    }
-                    return;
-                }
+                let ready = if self.control.len() == CONTROL_LANE_CAP {
+                    self.control.pop_front()
+                } else {
+                    None
+                };
                 self.control.push_back(msg);
+                return ready;
             }
         }
+        None
     }
 
     pub(crate) fn pop(&mut self) -> Option<WsServerMessage> {
@@ -116,6 +112,27 @@ impl ClientLaneQueue {
             return Some(msg);
         }
         self.delta.pop_front()
+    }
+
+    async fn send_batch(
+        &mut self,
+        socket: &mut (impl Sink<Message> + Unpin),
+        messages: impl IntoIterator<Item = WsServerMessage>,
+        seq: &mut u64,
+    ) -> bool {
+        for msg in messages {
+            if let Some(ready) = self.push(msg)
+                && !send(socket, &ready, seq).await
+            {
+                return false;
+            }
+        }
+        while let Some(msg) = self.pop() {
+            if !send(socket, &msg, seq).await {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -149,44 +166,40 @@ async fn run(mut socket: WebSocket, coordinator: RunCoordinator, identity: AuthI
         return;
     }
     loop {
-        tokio::select! {
+        let mut pending = Vec::new();
+        let message = tokio::select! {
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str(&text) {
                             Ok(WsClientMessage::Subscribe { thread_id }) if subscriptions.insert(thread_id) => {
-                                for request in coordinator.pending(thread_id).await {
-                                    queue.push(WsServerMessage::PendingRequest { request });
-                                }
+                                pending = coordinator.pending(thread_id).await;
+                                None
                             }
                             Ok(WsClientMessage::Unsubscribe { thread_id }) => {
                                 subscriptions.remove(&thread_id);
+                                None
                             }
                             Ok(WsClientMessage::Ping) => {
                                 if socket.send(Message::Text(r#"{"type":"pong"}"#.into())).await.is_err() { return; }
+                                None
                             }
-                            Ok(_) => {}
-                            Err(_) => {
-                                queue.push(WsServerMessage::Error { message: "invalid WebSocket message".into() });
-                            }
+                            Ok(_) => None,
+                            Err(_) => Some(WsServerMessage::Error { message: "invalid WebSocket message".into() }),
                         }
                     }
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
-                    _ => {}
+                    _ => None,
                 }
             }
             event = events.next() => {
                 match event {
-                    Some(Ok(event)) => {
-                        if is_visible(&event, &subscriptions) {
-                            queue.push(event);
-                        }
-                    }
+                    Some(Ok(event)) => is_visible(&event, &subscriptions).then_some(event),
                     Some(Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(
                         skipped,
                     ))) => {
                         tracing::debug!(skipped, "WebSocket client lagged behind broadcast channel");
-                        queue.push(WsServerMessage::Resync { thread_id: None });
+                        Some(WsServerMessage::Resync { thread_id: None })
                     }
                     None => {
                         let _ = socket.close().await;
@@ -194,11 +207,13 @@ async fn run(mut socket: WebSocket, coordinator: RunCoordinator, identity: AuthI
                     }
                 }
             }
-        }
-        while let Some(msg) = queue.pop() {
-            if !send(&mut socket, &msg, &mut seq).await {
-                return;
-            }
+        };
+        let messages = pending
+            .into_iter()
+            .map(|request| WsServerMessage::PendingRequest { request })
+            .chain(message);
+        if !queue.send_batch(&mut socket, messages, &mut seq).await {
+            return;
         }
     }
 }
@@ -220,7 +235,11 @@ fn is_visible(event: &WsServerMessage, subscriptions: &HashSet<Uuid>) -> bool {
     }
 }
 
-async fn send(socket: &mut WebSocket, message: &WsServerMessage, seq: &mut u64) -> bool {
+async fn send(
+    socket: &mut (impl Sink<Message> + Unpin),
+    message: &WsServerMessage,
+    seq: &mut u64,
+) -> bool {
     *seq = seq.saturating_add(1);
     match serialize_with_seq(message, *seq) {
         Ok(text) => socket.send(Message::Text(text.into())).await.is_ok(),
@@ -232,49 +251,130 @@ async fn send(socket: &mut WebSocket, message: &WsServerMessage, seq: &mut u64) 
 mod lane_queue_tests {
     use super::*;
 
-    #[test]
-    fn delta_overflow_drops_oldest_and_never_drops_or_delays_control() {
+    #[tokio::test]
+    async fn pending_controls_survive_a_burst_larger_than_the_control_lane() {
+        let mut queue = ClientLaneQueue::new();
+        let mut wire = Vec::<Message>::new();
+        let mut seq = 0;
+        let thread_id = Uuid::new_v4();
+        let controls = (1..=CONTROL_LANE_CAP + 2).map(|n| WsServerMessage::PendingResolved {
+            thread_id,
+            request_id: Uuid::from_u128(n as u128),
+        });
+        assert!(queue.send_batch(&mut wire, controls, &mut seq).await);
+        assert!(!queue.events_lost());
+        assert_eq!(wire.len(), CONTROL_LANE_CAP + 2);
+        for (index, frame) in wire.iter().enumerate() {
+            let data: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            let n = index + 1;
+            assert_eq!(data["type"], "pending_resolved");
+            assert_eq!(data["request_id"], Uuid::from_u128(n as u128).to_string());
+            assert_eq!(data["seq"], n);
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_bursts_resync_once_each_and_sequence_only_the_delivered_frames() {
+        use t3_core::{TurnItem, TurnItemKind};
         let mut queue = ClientLaneQueue::new();
         let thread_id = Uuid::new_v4();
         let run_id = Uuid::new_v4();
-
-        for i in 0..200 {
-            queue.push(WsServerMessage::Delta {
-                thread_id,
-                run_id,
-                channel: "assistant".into(),
-                text: format!("delta-{i}"),
-            });
+        let deltas: Vec<_> = (0..DELTA_LANE_CAP + 3)
+            .map(|i| match i % 3 {
+                0 => WsServerMessage::Delta {
+                    thread_id,
+                    run_id,
+                    channel: "assistant".into(),
+                    text: i.to_string(),
+                },
+                1 => WsServerMessage::ShellOutput {
+                    exec_id: run_id,
+                    thread_id: Some(thread_id),
+                    stream: "stdout".into(),
+                    chunk: i.to_string(),
+                },
+                _ => WsServerMessage::TurnItemAdded {
+                    thread_id,
+                    item: TurnItem {
+                        id: Uuid::new_v4(),
+                        thread_id,
+                        run_id,
+                        ordinal: i as i64,
+                        kind: TurnItemKind::AssistantMessage,
+                        summary: None,
+                        payload: serde_json::Value::Null,
+                        raw_bytes: 0,
+                        compressed_bytes: None,
+                        created_at: chrono::Utc::now(),
+                    },
+                },
+            })
+            .collect();
+        let control = WsServerMessage::PendingResolved {
+            thread_id,
+            request_id: Uuid::new_v4(),
+        };
+        let usage = |input_tokens| WsServerMessage::RunUsageUpdated {
+            thread_id,
+            run_id,
+            input_tokens,
+            context_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        let mut wire = Vec::<Message>::new();
+        let mut seq = 0;
+        for _ in 0..2 {
+            let batch = [usage(10)]
+                .into_iter()
+                .chain(deltas.iter().cloned())
+                .chain([control.clone(), usage(20)]);
+            assert!(queue.send_batch(&mut wire, batch, &mut seq).await);
+            assert!(queue.events_lost());
         }
-        queue.push(WsServerMessage::Error {
-            message: "ctrl-err".to_owned(),
-        });
-        assert!(queue.events_lost());
 
-        let first = queue.pop().expect("control must drain before delta");
-        assert!(matches!(first, WsServerMessage::Error { .. }));
-
-        let second = queue.pop().expect("resync must follow control on overflow");
-        assert!(matches!(
-            second,
-            WsServerMessage::Resync { thread_id: None }
-        ));
-
-        let mut remaining_deltas = Vec::new();
-        while let Some(msg) = queue.pop() {
-            if let WsServerMessage::Delta { text, .. } = msg {
-                remaining_deltas.push(text);
-            }
+        // The first three events span all droppable variants. The rest retain FIFO order.
+        let expected = [
+            control,
+            WsServerMessage::Resync { thread_id: None },
+            usage(20),
+        ];
+        let one_burst = expected.iter().chain(&deltas[3..]);
+        assert_eq!(wire.len(), 2 * (3 + DELTA_LANE_CAP));
+        for (index, (frame, msg)) in wire.iter().zip(one_burst.cycle()).enumerate() {
+            let mut data: serde_json::Value =
+                serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(
+                data.as_object_mut().unwrap().remove("seq"),
+                Some((index + 1).into())
+            );
+            assert_eq!(data, serde_json::to_value(msg).unwrap());
         }
-        assert_eq!(remaining_deltas.len(), DELTA_LANE_CAP);
-        assert_eq!(
-            remaining_deltas.first().map(String::as_str),
-            Some("delta-72")
-        );
-        assert_eq!(
-            remaining_deltas.last().map(String::as_str),
-            Some("delta-199")
-        );
+    }
+
+    #[test]
+    fn filling_the_delta_lane_exactly_preserves_every_event_without_a_resync() {
+        let mut queue = ClientLaneQueue::new();
+        for i in 0..DELTA_LANE_CAP {
+            assert!(
+                queue
+                    .push(WsServerMessage::Delta {
+                        thread_id: Uuid::nil(),
+                        run_id: Uuid::nil(),
+                        channel: "assistant".into(),
+                        text: i.to_string(),
+                    })
+                    .is_none()
+            );
+        }
+        assert!(!queue.events_lost());
+        for i in 0..DELTA_LANE_CAP {
+            assert!(
+                matches!(queue.pop(), Some(WsServerMessage::Delta { text, .. }) if text == i.to_string())
+            );
+        }
+        assert!(queue.pop().is_none());
     }
 
     #[test]
@@ -284,33 +384,45 @@ mod lane_queue_tests {
         let thread_b = Uuid::new_v4();
         let run_id = Uuid::new_v4();
 
-        queue.push(WsServerMessage::RunUsageUpdated {
-            thread_id: thread_a,
-            run_id,
-            context_tokens: 100,
-            input_tokens: 100,
-            output_tokens: 10,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-        });
-        queue.push(WsServerMessage::RunUsageUpdated {
-            thread_id: thread_b,
-            run_id,
-            context_tokens: 200,
-            input_tokens: 200,
-            output_tokens: 20,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-        });
-        queue.push(WsServerMessage::RunUsageUpdated {
-            thread_id: thread_a,
-            run_id,
-            context_tokens: 999,
-            input_tokens: 999,
-            output_tokens: 88,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-        });
+        assert!(
+            queue
+                .push(WsServerMessage::RunUsageUpdated {
+                    thread_id: thread_a,
+                    run_id,
+                    context_tokens: 100,
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                })
+                .is_none()
+        );
+        assert!(
+            queue
+                .push(WsServerMessage::RunUsageUpdated {
+                    thread_id: thread_b,
+                    run_id,
+                    context_tokens: 200,
+                    input_tokens: 200,
+                    output_tokens: 20,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                })
+                .is_none()
+        );
+        assert!(
+            queue
+                .push(WsServerMessage::RunUsageUpdated {
+                    thread_id: thread_a,
+                    run_id,
+                    context_tokens: 999,
+                    input_tokens: 999,
+                    output_tokens: 88,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                })
+                .is_none()
+        );
 
         let msg1 = queue.pop().expect("coalesced thread_a usage");
         assert!(matches!(

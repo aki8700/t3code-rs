@@ -250,9 +250,11 @@ async fn cloudflare_rs256_header_cookie_websocket_and_rotation() {
         allowed_emails: vec!["test@example.test".into()],
         jwks_url_override: Some(url),
     }));
+    // JWT validation uses the wall clock even when the Tokio JWKS clock advances.
+    // Leave the not-yet-valid token well outside the 60-second leeway through network I/O.
     let now = jsonwebtoken::get_current_timestamp();
     let claims = json!({"sub":"test-subject","email":"TEST@EXAMPLE.TEST",
-        "aud":["another-audience","t3-audience"],"exp":now+120,"nbf":now-1,"iss":"https://issuer.example.test"});
+        "aud":["another-audience","t3-audience"],"exp":now+7200,"nbf":now-1,"iss":"https://issuer.example.test"});
     let token = jwt("first", FIRST_PEM, &claims);
     assert_eq!(
         status(
@@ -319,7 +321,7 @@ async fn cloudflare_rs256_header_cookie_websocket_and_rotation() {
     for (key, value) in [
         ("aud", json!("wrong")),
         ("exp", json!(now - 61)),
-        ("nbf", json!(now + 61)),
+        ("nbf", json!(now + 3600)),
         ("email", json!("blocked@example.test")),
     ] {
         let mut claims = claims.clone();
@@ -417,11 +419,11 @@ async fn cloudflare_retries_a_failed_jwks_fetch_only_after_cooldown() {
         allowed_emails: vec![],
         jwks_url_override: Some(url),
     }));
-    let claims = json!({"aud":"fixture", "exp":jsonwebtoken::get_current_timestamp()+120});
+    let claims = json!({"aud":"fixture", "exp":jsonwebtoken::get_current_timestamp()+7200});
     let token = jwt("first", FIRST_PEM, &claims);
     let headers = &[("cf-access-jwt-assertion", token.as_str())];
     let (first_app, first_token) = (app.clone(), token.clone());
-    let first = tokio::spawn(async move {
+    let mut first = tokio::spawn(async move {
         status(
             &first_app,
             "/api/meta",
@@ -430,15 +432,17 @@ async fn cloudflare_retries_a_failed_jwks_fetch_only_after_cooldown() {
         )
         .await
     });
-    tokio::time::timeout(Duration::from_secs(2), started.notified())
-        .await
-        .unwrap();
-    let competing = tokio::time::timeout(
-        Duration::from_secs(2),
-        status(&app, "/api/meta", REMOTE, headers),
-    )
-    .await
-    .expect("another request waited for the JWKS fetch");
+    tokio::select! {
+        () = started.notified() => {}
+        result = &mut first => panic!("first request finished before the fixture received it: {result:?}"),
+    }
+    // The fixture only releases the first fetch after the competing request returns.
+    // The fetch's own timeout also makes a blocked competitor fail this assertion.
+    let competing = tokio::select! {
+        biased;
+        result = &mut first => panic!("first fetch finished before the competing request: {result:?}"),
+        status = status(&app, "/api/meta", REMOTE, headers) => status,
+    };
     assert_eq!(competing, StatusCode::UNAUTHORIZED);
     release.notify_one();
     assert_eq!(first.await.unwrap(), StatusCode::UNAUTHORIZED);
@@ -3369,6 +3373,7 @@ esac
 async fn thread_detail_returns_context_and_items_breakdown() {
     let tmp = TempDir::new();
     let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
     let app = router(state);
     let providers = json_req(&app, Method::GET, "/api/providers", None).await;
     let mock_models = providers
@@ -3389,15 +3394,8 @@ async fn thread_detail_returns_context_and_items_breakdown() {
         Some(json!({ "prompt": "context panel check" })),
     )
     .await;
-    // Wait briefly for the mock run to complete.
-    let mut detail = Value::Null;
-    for _ in 0..40 {
-        detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
-        if detail["thread"]["status"] == "completed" {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
+    let detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
     assert_eq!(detail["thread"]["status"], "completed");
     let ctx = &detail["context"];
     assert_eq!(ctx["context_window"], 200_000);
@@ -3453,6 +3451,7 @@ async fn thread_detail_returns_context_and_items_breakdown() {
 async fn shell_exec_runs_in_thread_and_project_and_records_history() {
     let tmp = TempDir::new();
     let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
     let app = router(state);
     let project = json_req(
         &app,
@@ -3547,20 +3546,19 @@ async fn shell_exec_runs_in_thread_and_project_and_records_history() {
         Some(json!({"prompt": "after shell"})),
     )
     .await;
-    let mut after = Value::Null;
-    for _ in 0..40 {
-        after = json_req(
-            &app,
-            Method::GET,
-            &format!("/api/threads/{thread_id}"),
-            None,
-        )
-        .await;
-        if after["thread"]["status"] == "completed" {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_thread(
+        &mut events,
+        thread_id.parse().unwrap(),
+        ThreadStatus::Completed,
+    )
+    .await;
+    let after = json_req(
+        &app,
+        Method::GET,
+        &format!("/api/threads/{thread_id}"),
+        None,
+    )
+    .await;
     assert_eq!(after["thread"]["status"], "completed");
 }
 
