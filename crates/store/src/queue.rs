@@ -12,7 +12,7 @@ pub struct VerifyDeadEnd {
     pub summary: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct QueuedRunInput {
     pub model_selection: ModelSelection,
     pub attachment_ids: Vec<Uuid>,
@@ -140,6 +140,40 @@ impl SqliteStore {
                 )
                 .optional()
                 .map_err(storage_error)
+        })
+        .await
+    }
+
+    /// Replaces the prompt and persisted input for a queued run without changing its ordinal.
+    pub async fn update_queued_run(
+        &self,
+        thread_id: Uuid,
+        run_id: Uuid,
+        prompt: String,
+        input: QueuedRunInput,
+    ) -> CoreResult<bool> {
+        self.with_writer(move |connection| {
+            let tx = connection.transaction().map_err(storage_error)?;
+            let changed = tx
+                .execute(
+                    "UPDATE runs SET prompt = ?3 WHERE id = ?1 AND thread_id = ?2 AND status = ?4",
+                    params![
+                        run_id.to_string(),
+                        thread_id.to_string(),
+                        prompt,
+                        encode(&RunStatus::Queued)?
+                    ],
+                )
+                .map_err(storage_error)?;
+            if changed != 0 {
+                tx.execute(
+                    "UPDATE queued_run_inputs SET input_json = ?2 WHERE run_id = ?1",
+                    params![run_id.to_string(), encode(&input)?],
+                )
+                .map_err(storage_error)?;
+            }
+            tx.commit().map_err(storage_error)?;
+            Ok(changed != 0)
         })
         .await
     }

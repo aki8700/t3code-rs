@@ -100,6 +100,12 @@ pub struct Message {
     #[serde(default)]
     pub attachment_ids: Vec<Uuid>,
     pub model_selection: Option<ModelSelection>,
+    /// Internal queue marker: automated swarm deliveries retain their enqueue-time mode cap
+    /// even when their wake depth is zero.
+    #[serde(skip)]
+    pub(crate) auto_wake: bool,
+    #[serde(skip)]
+    pub(crate) mode_ceiling: Option<(RuntimeMode, InteractionMode)>,
 }
 
 pub(crate) struct RunTicket {
@@ -693,14 +699,18 @@ impl RunCoordinator {
         wake_depth: u8,
         busy: bool,
     ) -> CoreResult<Uuid> {
+        let mode_ceiling = enqueue_mode_ceiling(
+            (thread.runtime_mode, thread.interaction_mode),
+            &message,
+            wake_depth,
+        );
         self.enqueue_with_meta(
             thread,
             message,
             QueuedMeta {
                 notify_parent,
                 wake_depth,
-                mode_ceiling: (wake_depth != 0)
-                    .then_some((thread.runtime_mode, thread.interaction_mode)),
+                mode_ceiling,
                 verify_fix_depth: 0,
                 last_verify_signature: None,
                 verify_dead_ends: Vec::new(),
@@ -1639,6 +1649,8 @@ impl RunCoordinator {
                         behavior: None,
                         attachment_ids: Vec::new(),
                         model_selection: Some(current_selection.clone()),
+                        auto_wake: false,
+                        mode_ceiling: None,
                     },
                     QueuedMeta {
                         notify_parent,
@@ -1729,6 +1741,8 @@ impl RunCoordinator {
                     behavior: None,
                     attachment_ids,
                     model_selection: Some(fallback_model),
+                    auto_wake: false,
+                    mode_ceiling: None,
                 },
                 QueuedMeta {
                     notify_parent,
@@ -2510,6 +2524,16 @@ struct QueuedMeta {
     fallback_attempts: u8,
 }
 
+fn enqueue_mode_ceiling(
+    current: (RuntimeMode, InteractionMode),
+    message: &Message,
+    wake_depth: u8,
+) -> Option<(RuntimeMode, InteractionMode)> {
+    message
+        .mode_ceiling
+        .or_else(|| (wake_depth != 0 || message.auto_wake).then_some(current))
+}
+
 struct RunningTurn {
     thread: Thread,
     request: TurnRequest,
@@ -2608,6 +2632,39 @@ pub(crate) fn text_value(value: &Value) -> Option<&str> {
 #[cfg(test)]
 mod output_tail_tests {
     use super::*;
+
+    #[test]
+    fn auto_wake_at_depth_zero_keeps_enqueue_time_mode_ceiling() {
+        let message = Message {
+            auto_wake: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            enqueue_mode_ceiling(
+                (RuntimeMode::ApprovalRequired, InteractionMode::Plan),
+                &message,
+                0
+            ),
+            Some((RuntimeMode::ApprovalRequired, InteractionMode::Plan))
+        );
+    }
+
+    #[test]
+    fn redelivery_keeps_an_existing_mode_ceiling() {
+        let message = Message {
+            auto_wake: true,
+            mode_ceiling: Some((RuntimeMode::ApprovalRequired, InteractionMode::Plan)),
+            ..Default::default()
+        };
+        assert_eq!(
+            enqueue_mode_ceiling(
+                (RuntimeMode::FullAccess, InteractionMode::Default),
+                &message,
+                0
+            ),
+            Some((RuntimeMode::ApprovalRequired, InteractionMode::Plan))
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]

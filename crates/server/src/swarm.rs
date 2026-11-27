@@ -15,6 +15,7 @@ const MAX_WAKE_DEPTH: u8 = 8;
 const MAX_MESSAGE_BYTES: usize = 4096;
 const MAX_ACTIVE_WORKERS: usize = 8;
 const WAKE_BATCH: usize = 16;
+const MAX_WAKE_REDELIVERIES: u8 = 1;
 const ENDED_ERROR_CHARS: usize = 200;
 const READ_MESSAGE_MAX_CHARS: usize = 2_000;
 
@@ -24,10 +25,12 @@ const READ_MESSAGE_MAX_CHARS: usize = 2_000;
 /// Lost on restart, which can only cause a duplicate delivery.
 pub(crate) type WakeDeliveries = std::sync::Mutex<HashMap<Uuid, Vec<WakeDelivery>>>;
 
+#[derive(Clone, Copy)]
 pub(crate) struct WakeDelivery {
     run_id: Uuid,
     from: i64,
     to: i64,
+    redeliveries: u8,
 }
 
 pub(crate) fn is_swarm_command(prompt: &str) -> bool {
@@ -278,7 +281,7 @@ impl RunCoordinator {
                     false,
                 )
                 .await?;
-            self.record_delivery(worker.id, run_id, board.head_seq, post.seq);
+            self.record_delivery(worker.id, run_id, board.head_seq, post.seq, 0);
             CoreResult::Ok(())
         }
         .await;
@@ -362,12 +365,6 @@ impl RunCoordinator {
         self.emit_board(&board);
         let mut woken = Vec::new();
         let targets = mentioned_members(&board, &sender, &post.mentions);
-        let worker_report = caller.as_ref().is_some_and(|caller| {
-            board
-                .members
-                .iter()
-                .any(|member| member.thread_id == caller.id && member.role == "worker")
-        });
         if depth >= MAX_WAKE_DEPTH {
             if !targets.is_empty() {
                 // No mention in the notice: it must not wake anyone itself.
@@ -384,12 +381,7 @@ impl RunCoordinator {
         } else {
             for member in targets {
                 match self
-                    .wake_member(
-                        active,
-                        member,
-                        caller.as_ref(),
-                        next_wake_depth(depth, member, worker_report),
-                    )
+                    .wake_member(active, member, caller.as_ref(), next_wake_depth(depth))
                     .await
                 {
                     Ok(true) => woken.push(member.name.clone()),
@@ -419,6 +411,19 @@ impl RunCoordinator {
         caller: Option<&Thread>,
         depth: u8,
     ) -> CoreResult<bool> {
+        self.wake_member_with_retry(active, member, caller, depth, None, 0)
+            .await
+    }
+
+    async fn wake_member_with_retry(
+        &self,
+        active: &mut HashMap<Uuid, ActiveRun>,
+        member: &SwarmMember,
+        caller: Option<&Thread>,
+        depth: u8,
+        mode_ceiling: Option<(RuntimeMode, InteractionMode)>,
+        redeliveries: u8,
+    ) -> CoreResult<bool> {
         let store = &self.0.store;
         let target = store.get_thread(member.thread_id).await?;
         if target.archived || caller.is_some_and(|caller| !can_dispatch(caller, &target)) {
@@ -427,7 +432,8 @@ impl RunCoordinator {
         // At most one queued wake per member: a wake still waiting in the queue is replaced
         // by one that carries every unread post, so posts arriving while the member is busy
         // cost one turn instead of one turn each. Only the running run's posts are skipped.
-        let running_to = self.supersede_queued_wakes(active, target.id).await?;
+        let (running_to, preserved) = self.supersede_queued_wakes(active, target.id).await?;
+        let mut preserve_next = preserved;
         let mut cursor = member.last_read_seq.max(running_to);
         let mut woken = false;
         loop {
@@ -451,10 +457,41 @@ impl RunCoordinator {
                     )
                     .expect("write to String");
                 }
-                let run_id = self
-                    .send_locked(active, target.clone(), queued_message(prompt), depth, false)
-                    .await?;
-                self.record_delivery(target.id, run_id, cursor, last.seq);
+                let queued = preserve_next.take();
+                let run_id = if let Some(delivery) = queued {
+                    let Some(mut run) = store.queued_run(target.id, delivery.run_id).await? else {
+                        continue;
+                    };
+                    if mode_ceiling.is_some() {
+                        run.input.mode_ceiling = mode_ceiling;
+                    }
+                    if store
+                        .update_queued_run(target.id, run.id, prompt.clone(), run.input.clone())
+                        .await?
+                    {
+                        self.record_delivery(
+                            target.id,
+                            run.id,
+                            cursor,
+                            last.seq,
+                            delivery.redeliveries.max(redeliveries),
+                        );
+                        run.id
+                    } else {
+                        let mut message = queued_message(prompt);
+                        message.mode_ceiling = mode_ceiling;
+                        self.send_locked(active, target.clone(), message, depth, false)
+                            .await?
+                    }
+                } else {
+                    let mut message = queued_message(prompt);
+                    message.mode_ceiling = mode_ceiling;
+                    self.send_locked(active, target.clone(), message, depth, false)
+                        .await?
+                };
+                if queued.is_none() {
+                    self.record_delivery(target.id, run_id, cursor, last.seq, redeliveries);
+                }
                 woken = true;
             } else {
                 // Only the member's own posts: nothing to deliver.
@@ -476,26 +513,31 @@ impl RunCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn record_delivery(&self, thread_id: Uuid, run_id: Uuid, from: i64, to: i64) {
+    fn record_delivery(&self, thread_id: Uuid, run_id: Uuid, from: i64, to: i64, redeliveries: u8) {
         self.deliveries()
             .entry(thread_id)
             .or_default()
-            .push(WakeDelivery { run_id, from, to });
+            .push(WakeDelivery {
+                run_id,
+                from,
+                to,
+                redeliveries,
+            });
     }
 
-    /// Cancels the member's queued wake runs and forgets their deliveries, which a new wake
-    /// takes over. Returns the highest post seq handed to the member's running run. Records
-    /// of runs that left the queue without running are dropped too.
+    /// Keeps the earliest queued wake so coalescing can update it without moving its queue
+    /// position, and cancels later queued wakes. Returns the running run's delivered range
+    /// and the preserved queued delivery.
     async fn supersede_queued_wakes(
         &self,
         active: &HashMap<Uuid, ActiveRun>,
         thread_id: Uuid,
-    ) -> CoreResult<i64> {
+    ) -> CoreResult<(i64, Option<WakeDelivery>)> {
         let running = active.get(&thread_id).map(|run| run.id);
-        let (running_to, superseded) = {
+        let result = {
             let mut deliveries = self.deliveries();
             let Some(list) = deliveries.get_mut(&thread_id) else {
-                return Ok(0);
+                return Ok((0, None));
             };
             let (current, superseded): (Vec<_>, Vec<_>) = std::mem::take(list)
                 .into_iter()
@@ -505,22 +547,26 @@ impl RunCoordinator {
                 .map(|delivery| delivery.to)
                 .max()
                 .unwrap_or(0);
+            let preserved = superseded.first().copied();
+            let keep_id = preserved.map(|delivery| delivery.run_id);
+            let queued_to_cancel = superseded
+                .iter()
+                .filter(|delivery| Some(delivery.run_id) != keep_id)
+                .map(|delivery| delivery.run_id);
+            let mut superseded = queued_to_cancel.collect::<Vec<_>>();
+            superseded.dedup();
             if current.is_empty() {
                 deliveries.remove(&thread_id);
             } else {
                 *list = current;
             }
-            let mut superseded = superseded
-                .into_iter()
-                .map(|delivery| delivery.run_id)
-                .collect::<Vec<_>>();
-            superseded.dedup();
-            (running_to, superseded)
+            (running_to, superseded, preserved)
         };
+        let (running_to, superseded, preserved) = result;
         for run_id in superseded {
             self.cancel_queued_locked(thread_id, run_id).await?;
         }
-        Ok(running_to)
+        Ok((running_to, preserved))
     }
 
     /// Called when a run ends. A completed run acknowledges the posts it delivered. When the
@@ -561,15 +607,20 @@ impl RunCoordinator {
         let Some(queued_wake) = queued_wake.filter(|_| !delivered.is_empty()) else {
             return Ok(());
         };
-        let Some(depth) = self
-            .0
-            .store
-            .queued_run(thread_id, queued_wake)
-            .await?
-            .map(|run| run.input.wake_depth)
-        else {
+        let Some(queued) = self.0.store.queued_run(thread_id, queued_wake).await? else {
             return Ok(());
         };
+        let depth = queued.input.wake_depth;
+        let attempts = delivered
+            .iter()
+            .map(|delivery| delivery.redeliveries)
+            .max()
+            .unwrap_or(0);
+        // A failed redelivery with no new posts is terminal. Otherwise a multi-batch
+        // follow-up can restart the same unread range forever.
+        if attempts >= MAX_WAKE_REDELIVERIES {
+            return Ok(());
+        }
         let Some(board) = self.get_board(thread_id).await? else {
             return Ok(());
         };
@@ -578,7 +629,15 @@ impl RunCoordinator {
             .iter()
             .find(|member| member.thread_id == thread_id && member.state != "killed")
         {
-            self.wake_member(active, member, None, depth).await?;
+            self.wake_member_with_retry(
+                active,
+                member,
+                None,
+                depth,
+                queued.input.mode_ceiling,
+                attempts + 1,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -868,6 +927,7 @@ fn queued_message(prompt: String) -> Message {
     Message {
         prompt,
         behavior: Some(FollowUpBehavior::Queue),
+        auto_wake: true,
         ..Default::default()
     }
 }
@@ -935,15 +995,10 @@ fn wake_depth(active: &HashMap<Uuid, ActiveRun>, id: Uuid) -> u8 {
     active.get(&id).map_or(0, |run| run.wake_depth)
 }
 
-/// Worker reports wake the coordinator at depth zero, so routine result delivery does not
-/// consume the finite depth budget. Other mentions, including coordinator retries, still
-/// increase depth and remain bounded to stop ping-pong.
-fn next_wake_depth(depth: u8, target: &SwarmMember, worker_report: bool) -> u8 {
-    if target.role == "coordinator" && worker_report {
-        0
-    } else {
-        depth.saturating_add(1)
-    }
+/// Every automated handoff carries depth forward. Independent workers assigned in one
+/// coordinator run share that run's depth; exchanges with one worker ratchet and terminate.
+fn next_wake_depth(depth: u8) -> u8 {
+    depth.saturating_add(1)
 }
 
 fn live_worker_count(board: &SwarmBoardSnapshot) -> usize {
@@ -1233,13 +1288,24 @@ mod tests {
     }
 
     #[test]
-    fn worker_reports_reset_coordinator_wake_depth_but_agent_pings_increment_it() {
-        let coordinator = member("coordinator", "coordinator", "working");
-        let worker = member("coder", "worker", "working");
+    fn automated_wakes_increment_depth() {
+        assert_eq!(next_wake_depth(7), 8);
+    }
 
-        assert_eq!(next_wake_depth(7, &coordinator, true), 0);
-        assert_eq!(next_wake_depth(7, &coordinator, false), 8);
-        assert_eq!(next_wake_depth(7, &worker, true), 8);
+    #[test]
+    fn coordinator_worker_ping_pong_reaches_the_wake_depth_limit() {
+        let mut depth = 0;
+        for _ in 0..MAX_WAKE_DEPTH {
+            depth = next_wake_depth(depth);
+        }
+        assert_eq!(depth, MAX_WAKE_DEPTH);
+        assert!(depth >= MAX_WAKE_DEPTH);
+    }
+
+    #[test]
+    fn independent_worker_reports_share_their_coordinator_turn_depth() {
+        let reports = (0..12).map(|_| next_wake_depth(1)).collect::<Vec<_>>();
+        assert_eq!(reports, vec![2; 12]);
     }
 
     #[test]

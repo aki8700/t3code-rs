@@ -2038,6 +2038,12 @@ async fn swarm_mcp_status_and_reader_return_compact_truncated_messages() {
 #[tokio::test]
 async fn swarm_status_counts_killed_members_and_lists_only_live_members() {
     let tmp = TempDir::new();
+    git(&tmp.0, &["init", "-q", "--initial-branch=main"]);
+    git(&tmp.0, &["config", "user.name", "T3 Test"]);
+    git(&tmp.0, &["config", "user.email", "t3@example.test"]);
+    std::fs::write(tmp.0.join("base.txt"), "initial\n").unwrap();
+    git(&tmp.0, &["add", "."]);
+    git(&tmp.0, &["commit", "-qm", "initial"]);
     let app = router(tmp.state(AuthConfig::LocalOnly));
     let id = create_parent(&app, &tmp.0).await;
     json_req(
@@ -2053,7 +2059,7 @@ async fn swarm_status_counts_killed_members_and_lists_only_live_members() {
         mcp_tool(
             &app,
             "swarm_add_worker",
-            json!({"thread_id":id,"name":name,"brief":"check","provider":"mock","model":"mock"}),
+            json!({"thread_id":id,"name":name,"brief":"check","provider":"mock","model":"mock","isolation":"worktree"}),
         )
         .await;
     }
@@ -2073,6 +2079,15 @@ async fn swarm_status_counts_killed_members_and_lists_only_live_members() {
     assert!(members.iter().any(|member| member["name"] == "coordinator"));
     assert!(members.iter().any(|member| member["name"] == "live"));
     assert!(!members.iter().any(|member| member["state"] == "killed"));
+    assert!(
+        status["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(
+                |worktree| worktree["worker"] != "killed-one" && worktree["worker"] != "killed-two"
+            )
+    );
 }
 
 #[tokio::test]
@@ -2518,7 +2533,7 @@ case "$prompt" in
     n=$(cat wake_calls 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > wake_calls
     if [ "$n" -eq 1 ]; then
       touch first-wake-started
-      sleep 2
+      while [ ! -f release-first-wake ]; do sleep 0.01; done
       echo "boom" >&2
       exit 1
     fi ;;
@@ -2561,12 +2576,13 @@ printf '{"type":"result","subtype":"success","result":"noted"}\n'
     .expect("first wake did not start");
     post("@coordinator second").await;
     let third = post("@coordinator third").await;
+    std::fs::write(tmp.0.join("release-first-wake"), "ready").unwrap();
 
     let detail = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
             let runs = detail["runs"].as_array().unwrap();
-            if runs.len() >= 5
+            if runs.len() >= 3
                 && runs
                     .iter()
                     .all(|run| !matches!(run["status"].as_str(), Some("running" | "queued")))
@@ -2662,7 +2678,7 @@ async fn posts_arriving_during_a_running_wake_share_one_queued_wake() {
         &tmp,
         r#"#!/bin/sh
 IFS= read -r prompt
-case "$prompt" in *"first"*) touch first-wake-started; sleep 1 ;; esac
+case "$prompt" in *"first"*) touch first-wake-started; while [ ! -f release-first-wake ]; do sleep 0.01; done ;; esac
 printf '{"type":"result","subtype":"success","result":"noted"}\n'
 "#,
     )
@@ -2696,6 +2712,7 @@ printf '{"type":"result","subtype":"success","result":"noted"}\n'
         post(text).await;
     }
     let last = post("@coordinator fourth").await;
+    std::fs::write(tmp.0.join("release-first-wake"), "ready").unwrap();
     let detail = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
@@ -2739,6 +2756,124 @@ printf '{"type":"result","subtype":"success","result":"noted"}\n'
     );
     let board = json_req(&app, Method::GET, &format!("/api/threads/{id}/swarm"), None).await;
     assert_eq!(board["members"][0]["last_read_seq"], last["seq"]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn coalescing_a_queued_wake_keeps_its_position_before_a_user_followup() {
+    let tmp = TempDir::new();
+    let (app, id) = swarm_fixture(
+        &tmp,
+        r#"#!/bin/sh
+IFS= read -r prompt
+case "$prompt" in
+  *"/swarm"*) touch coordinator-started; while [ ! -f release-coordinator ]; do sleep 0.01; done ;;
+esac
+printf '{"type":"result","subtype":"success","result":"noted"}\n'
+"#,
+    )
+    .await;
+    start_swarm(&app, id).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !tmp.0.join("coordinator-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("coordinator did not start");
+    let worker = mcp_tool(
+        &app,
+        "swarm_add_worker",
+        json!({"thread_id":id,"name":"w1","brief":"check","provider":"mock","model":"mock"}),
+    )
+    .await;
+    let worker_id = worker["thread_id"].clone();
+    mcp_tool(
+        &app,
+        "swarm_post_message",
+        json!({"thread_id":worker_id,"text":"@coordinator report one"}),
+    )
+    .await;
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({"prompt":"user follow-up","behavior":"queue"})),
+    )
+    .await;
+    mcp_tool(
+        &app,
+        "swarm_post_message",
+        json!({"thread_id":worker["thread_id"],"text":"@coordinator report two"}),
+    )
+    .await;
+    std::fs::write(tmp.0.join("release-coordinator"), "ready").unwrap();
+    let detail = wait_for_runs(&app, id, 3).await;
+    let runs = detail["runs"].as_array().unwrap();
+    let queued_wake = runs
+        .iter()
+        .find(|run| {
+            run["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("Unread swarm board posts")
+        })
+        .unwrap();
+    let user = runs
+        .iter()
+        .find(|run| run["prompt"] == "user follow-up")
+        .unwrap();
+    assert!(
+        queued_wake["ordinal"].as_u64() < user["ordinal"].as_u64(),
+        "{runs:?}"
+    );
+    let prompt = queued_wake["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains("report one") && prompt.contains("report two"),
+        "{prompt}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn repeated_failed_first_batch_does_not_redeliver_more_than_once() {
+    let tmp = TempDir::new();
+    let (app, id) = swarm_fixture(
+        &tmp,
+        r#"#!/bin/sh
+IFS= read -r prompt
+case "$prompt" in
+  *"Unread swarm board posts"*)
+    echo x >> wake_calls
+    echo boom >&2; exit 1 ;;
+esac
+printf '{"type":"result","subtype":"success","result":"noted"}\n'
+"#,
+    )
+    .await;
+    start_swarm(&app, id).await;
+    wait_for_runs(&app, id, 1).await;
+    let worker = mcp_tool(
+        &app,
+        "swarm_add_worker",
+        json!({"thread_id":id,"name":"w1","brief":"check","provider":"mock","model":"mock"}),
+    )
+    .await;
+    for index in 0..20 {
+        mcp_tool(
+            &app,
+            "swarm_post_message",
+            json!({"thread_id":worker["thread_id"],"text":format!("@coordinator post-{index}")}),
+        )
+        .await;
+    }
+    let calls = settled_calls(&tmp).await;
+    assert!(
+        calls <= 4,
+        "failed multi-batch wakes caused {calls} provider calls"
+    );
+    let wake_calls = std::fs::read_to_string(tmp.0.join("wake_calls")).unwrap();
+    assert!(wake_calls.lines().count() <= 6, "{wake_calls}");
 }
 
 #[tokio::test]
