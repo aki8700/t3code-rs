@@ -489,6 +489,11 @@ impl RunCoordinator {
                         .update_queued_run(target.id, run.id, prompt.clone(), run.input.clone())
                         .await?
                     {
+                        // The queued prompt changed in place with no run-status change, so
+                        // open clients would otherwise keep showing the stale prompt.
+                        self.emit(WsServerMessage::Resync {
+                            thread_id: Some(target.id),
+                        });
                         self.record_delivery(
                             target.id,
                             WakeDelivery {

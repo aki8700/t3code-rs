@@ -4951,7 +4951,7 @@ function handleWs(m) {
       break;
     case 'resync':
       loadThreadsSoon();
-      if (S.threadId) { loadDetailSoon(); loadSwarm(S.threadId); }
+      if (S.threadId && (!m.thread_id || m.thread_id === S.threadId)) { loadDetailSoon(); loadSwarm(S.threadId); }
       break;
     case 'error':
       toast(`サーバーエラー: ${m.message}`, 'err', 6000);
