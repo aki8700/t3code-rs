@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use t3_core::*;
 use uuid::Uuid;
 
@@ -651,9 +652,9 @@ fn empty_object() -> Value {
 
 fn validate_argument_keys(name: &str, args: &Value) -> CoreResult<()> {
     let Some(schema) = tools()
-        .into_iter()
+        .iter()
         .find(|tool| tool["name"] == name)
-        .map(|tool| tool["inputSchema"].clone())
+        .map(|tool| &tool["inputSchema"])
     else {
         return Ok(());
     };
@@ -661,7 +662,7 @@ fn validate_argument_keys(name: &str, args: &Value) -> CoreResult<()> {
         "task_diff" | "task_merge" => &["task_id"],
         _ => &[],
     };
-    validate_schema_argument_keys(&schema, args, name, aliases)
+    validate_schema_argument_keys(schema, args, name, aliases)
 }
 
 fn validate_schema_argument_keys(
@@ -842,7 +843,12 @@ fn parse_provider<E: serde::de::Error>(id: &str) -> Result<ProviderId, E> {
     }
 }
 
-fn tools() -> Vec<Value> {
+fn tools() -> &'static [Value] {
+    static TOOLS: OnceLock<Vec<Value>> = OnceLock::new();
+    TOOLS.get_or_init(build_tools).as_slice()
+}
+
+fn build_tools() -> Vec<Value> {
     let string = json!({"type": "string"});
     let uuid = json!({"type": "string", "format": "uuid"});
     let limit = json!({"type": "integer", "minimum": 0});
@@ -1412,10 +1418,10 @@ pub(crate) mod tests {
         let listed = tools();
         assert_eq!(listed.len(), expected.len());
         for (name, fields) in expected {
-            assert_schema_keys(listed_schema(&listed, name), fields, name);
+            assert_schema_keys(listed_schema(listed, name), fields, name);
         }
         assert_schema_keys(
-            &listed_schema(&listed, "thread_fork")["properties"]["target_model"],
+            &listed_schema(listed, "thread_fork")["properties"]["target_model"],
             fields!(ModelSelection {
                 provider,
                 model,
@@ -1425,7 +1431,7 @@ pub(crate) mod tests {
             "thread_fork.target_model",
         );
         assert_schema_keys(
-            &listed_schema(&listed, "compaction_econ")["properties"]["prices"],
+            &listed_schema(listed, "compaction_econ")["properties"]["prices"],
             fields!(Prices {
                 input,
                 output,
