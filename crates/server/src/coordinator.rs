@@ -1402,6 +1402,12 @@ impl RunCoordinator {
             }
         };
         drop(mcp_token);
+        // The provider worker has returned, so its attempt groups have gone through the
+        // driver's process cleanup. Rows from retries and terminal failures are no longer
+        // restart cleanup targets either.
+        if let Err(error) = self.0.store.clear_run_orphan_processes(run_id).await {
+            tracing::warn!(%error, %run_id, "Could not clear finished provider process tracking");
+        }
 
         struct VerifyFailure {
             command: String,

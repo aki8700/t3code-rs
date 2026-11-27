@@ -1,11 +1,13 @@
 //! Resuming provider sessions: the pre-resume session check and the restart recovery of runs
 //! that a stopped server left in flight.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use t3_core::ProviderId;
 use t3_store::OrphanProcess;
-use uuid::Uuid;
 
 /// Sent in place of the original prompt when a run resumes after a server restart. The session
 /// already holds the original request, so resending it would repeat the work.
@@ -30,10 +32,14 @@ pub(crate) async fn session_resumable(
 
 /// Stops recorded provider process groups and returns runs confirmed stopped.
 #[cfg(unix)]
-pub(crate) async fn stop_orphaned_processes(orphan_processes: Vec<OrphanProcess>) -> Vec<Uuid> {
+pub(crate) async fn stop_orphaned_processes(
+    orphan_processes: Vec<OrphanProcess>,
+) -> Vec<OrphanProcess> {
     let ps = tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new("ps")
+        let output = Command::new("ps")
             .args(["-A", "-ww", "-o", "pid=,pgid=,uid=,lstart="])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
             .output()?;
         if !output.status.success() {
             return Err(std::io::Error::other("ps returned a failure status"));
@@ -49,32 +55,57 @@ pub(crate) async fn stop_orphaned_processes(orphan_processes: Vec<OrphanProcess>
             return Vec::new();
         }
     };
-    stop_orphaned_processes_from_snapshot(orphan_processes, &ps).await
+    stop_orphaned_processes_from_snapshot_with_probe(orphan_processes, &ps, process_identity_alive)
+        .await
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(crate) async fn stop_orphaned_processes_from_snapshot(
     orphan_processes: Vec<OrphanProcess>,
     ps: &str,
-) -> Vec<Uuid> {
+) -> Vec<OrphanProcess> {
+    stop_orphaned_processes_from_snapshot_with_probe(orphan_processes, ps, |target| {
+        group_alive(target.process_group_id)
+            && matching_groups(
+                ps,
+                std::slice::from_ref(target),
+                unsafe { libc::getuid() },
+                unsafe { libc::getpgrp() },
+            )
+            .iter()
+            .any(|found| found == target)
+    })
+    .await
+}
+
+#[cfg(unix)]
+async fn stop_orphaned_processes_from_snapshot_with_probe<F>(
+    orphan_processes: Vec<OrphanProcess>,
+    ps: &str,
+    identity_alive: F,
+) -> Vec<OrphanProcess>
+where
+    F: Fn(&OrphanProcess) -> bool,
+{
     let groups = {
         // SAFETY: getuid and getpgrp have no preconditions.
         let (uid, own_group) = unsafe { (libc::getuid(), libc::getpgrp()) };
         matching_groups(ps, &orphan_processes, uid, own_group)
     };
-    stop_verified_groups(&orphan_processes, &groups).await
+    stop_verified_groups(&orphan_processes, &groups, identity_alive).await
 }
 
 #[cfg(unix)]
 async fn stop_verified_groups(
     targets: &[OrphanProcess],
-    groups: &[(Uuid, libc::pid_t)],
-) -> Vec<Uuid> {
-    for (run_id, group) in groups {
-        tracing::warn!(%run_id, pgid = group, "Stopping a provider process left by the previous server");
+    groups: &[OrphanProcess],
+    identity_alive: impl Fn(&OrphanProcess) -> bool,
+) -> Vec<OrphanProcess> {
+    for target in groups {
+        tracing::warn!(%target.run_id, pgid = target.process_group_id, "Stopping a provider process left by the previous server");
         // SAFETY: group IDs were matched to the persisted provider leader identity above.
         unsafe {
-            libc::killpg(*group, libc::SIGTERM);
+            libc::killpg(target.process_group_id, libc::SIGTERM);
         }
     }
     if !groups.is_empty() {
@@ -82,13 +113,13 @@ async fn stop_verified_groups(
     }
     let survivors: Vec<_> = groups
         .iter()
-        .filter(|(_, group)| group_alive(*group))
-        .copied()
+        .filter(|target| group_alive(target.process_group_id) && identity_alive(target))
+        .cloned()
         .collect();
-    for (_, group) in &survivors {
-        // SAFETY: group IDs were verified against the recorded process identity.
+    for target in &survivors {
+        // SAFETY: the process table still contains the exact recorded leader identity.
         unsafe {
-            libc::killpg(*group, libc::SIGKILL);
+            libc::killpg(target.process_group_id, libc::SIGKILL);
         }
     }
     if !survivors.is_empty() {
@@ -96,14 +127,14 @@ async fn stop_verified_groups(
     }
     let stopped: Vec<_> = targets
         .iter()
-        .filter(|target| !group_alive(target.process_group_id))
-        .map(|target| target.run_id)
+        .filter(|target| !identity_alive(target))
+        .cloned()
         .collect();
     stopped
 }
 
 #[cfg(not(unix))]
-pub(crate) async fn stop_orphaned_processes(_targets: Vec<OrphanProcess>) -> Vec<Uuid> {
+pub(crate) async fn stop_orphaned_processes(_targets: Vec<OrphanProcess>) -> Vec<OrphanProcess> {
     Vec::new()
 }
 
@@ -114,7 +145,7 @@ fn matching_groups(
     targets: &[OrphanProcess],
     uid: libc::uid_t,
     own_group: libc::pid_t,
-) -> Vec<(Uuid, libc::pid_t)> {
+) -> Vec<OrphanProcess> {
     let mut groups = Vec::new();
     for line in ps.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
@@ -135,12 +166,36 @@ fn matching_groups(
         if let Some(target) = targets
             .iter()
             .find(|target| target.process_group_id == group && target.start_time == start_time)
-            && !groups.iter().any(|(_, existing)| *existing == group)
+            && !groups
+                .iter()
+                .any(|existing: &OrphanProcess| existing.process_group_id == group)
         {
-            groups.push((target.run_id, group));
+            groups.push(target.clone());
         }
     }
     groups
+}
+
+#[cfg(unix)]
+fn process_identity_alive(target: &OrphanProcess) -> bool {
+    let Ok(output) = Command::new("ps")
+        .args(["-A", "-ww", "-o", "pid=,pgid=,uid=,lstart="])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+    else {
+        // Failure to inspect the process table must never authorize SIGKILL or row deletion.
+        return true;
+    };
+    output.status.success()
+        && matching_groups(
+            &String::from_utf8_lossy(&output.stdout),
+            std::slice::from_ref(target),
+            unsafe { libc::getuid() },
+            unsafe { libc::getpgrp() },
+        )
+        .iter()
+        .any(|found| found == target)
 }
 
 #[cfg(unix)]
@@ -153,6 +208,7 @@ fn group_alive(group: libc::pid_t) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+    use uuid::Uuid;
 
     #[test]
     fn recorded_group_identity_matches_only_the_same_leader_and_start_time() {
@@ -171,10 +227,9 @@ garbage line
             process_group_id: 101,
             start_time: "Fri Nov 27 13:34:00 2026".into(),
         };
-        assert_eq!(
-            matching_groups(&ps, std::slice::from_ref(&target), 501, 77),
-            vec![(target.run_id, 101)]
-        );
+        let groups = matching_groups(&ps, std::slice::from_ref(&target), 501, 77);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0], target);
         let changed_start = OrphanProcess {
             start_time: "Fri Nov 27 13:35:00 2026".into(),
             ..target
@@ -182,14 +237,31 @@ garbage line
         assert!(matching_groups(&ps, &[changed_start], 501, 77).is_empty());
     }
 
+    #[test]
+    fn single_digit_day_lstart_spacing_matches_saved_normalized_time() {
+        let target = OrphanProcess {
+            run_id: Uuid::new_v4(),
+            process_group_id: 101,
+            start_time: "Sat Nov 7 09:05:01 2026".into(),
+        };
+        let ps = "101 101 501 Sat Nov  7 09:05:01 2026 provider\n";
+        let groups = matching_groups(ps, std::slice::from_ref(&target), 501, 77);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0], target);
+    }
+
     #[tokio::test]
     async fn stops_mcp_disabled_provider_process_by_recorded_identity() {
-        let mut child = std::process::Command::new("/bin/sh")
+        let child = std::process::Command::new("/bin/sh")
             .args(["-c", "sleep 30; :"])
             .process_group(0)
             .spawn()
             .unwrap();
         let pid = child.id();
+        let waiter = std::thread::spawn(move || {
+            let mut child = child;
+            child.wait().unwrap()
+        });
         let target = OrphanProcess {
             run_id: Uuid::new_v4(),
             process_group_id: pid as i32,
@@ -203,7 +275,7 @@ garbage line
             target.start_time
         );
         let stopped = stop_orphaned_processes_from_snapshot(vec![target], &snapshot).await;
-        let status = child.wait().unwrap();
+        let status = waiter.join().unwrap();
         assert_eq!(stopped.len(), 1);
         assert!(!status.success());
     }

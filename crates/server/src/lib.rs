@@ -145,8 +145,8 @@ pub async fn serve(config: ServerConfig) -> CoreResult<()> {
     let (state, recovered) = ServerState::recover(config, format!("http://{mcp_address}"))?;
     // Keep cleanup targets persisted until process-group termination is confirmed.
     let stopped = resume::stop_orphaned_processes(recovered.orphan_processes).await;
-    for run_id in stopped {
-        state.store.clear_orphan_cleanup(run_id).await?;
+    for process in stopped {
+        state.store.clear_orphan_cleanup(process).await?;
     }
     prune_known_project_snapshots(&state.store).await;
     let coordinator = state.coordinator.clone();
@@ -345,13 +345,18 @@ mod startup_tests {
             .update_thread_session_id(thread.id, "session-1".into())
             .await
             .unwrap();
-        let mut child = std::process::Command::new("/bin/sh")
+        let child = std::process::Command::new("/bin/sh")
             .args(["-c", "sleep 30; :"])
             .process_group(0)
             .spawn()
             .unwrap();
+        let child_pid = child.id();
+        let waiter = std::thread::spawn(move || {
+            let mut child = child;
+            child.wait().unwrap()
+        });
         store
-            .record_orphan_process(run_id, child.id() as i32, "Fri Nov 27 13:34:00 2026".into())
+            .record_orphan_process(run_id, child_pid as i32, "Fri Nov 27 13:34:00 2026".into())
             .await
             .unwrap();
         let first_startup = store.recover_interrupted_runs().unwrap();
@@ -368,8 +373,8 @@ mod startup_tests {
         let target = &next_startup.orphan_processes[0];
         let snapshot = format!(
             "{} {} {} {}",
-            child.id(),
-            child.id(),
+            child_pid,
+            child_pid,
             unsafe { libc::getuid() },
             target.start_time
         );
@@ -378,8 +383,11 @@ mod startup_tests {
             &snapshot,
         )
         .await;
-        assert_eq!(stopped, vec![run_id]);
-        store.clear_orphan_cleanup(run_id).await.unwrap();
+        assert_eq!(stopped, next_startup.orphan_processes);
+        store
+            .clear_orphan_cleanup(stopped[0].clone())
+            .await
+            .unwrap();
         assert!(
             store
                 .recover_interrupted_runs()
@@ -387,6 +395,6 @@ mod startup_tests {
                 .orphan_processes
                 .is_empty()
         );
-        assert!(!child.wait().unwrap().success());
+        assert!(!waiter.join().unwrap().success());
     }
 }

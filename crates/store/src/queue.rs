@@ -554,7 +554,64 @@ mod tests {
 
         let second = store.recover_interrupted_runs().unwrap();
         assert_eq!(second.orphan_processes, first.orphan_processes);
-        store.clear_orphan_cleanup(run_id).await.unwrap();
+        store
+            .clear_orphan_cleanup(first.orphan_processes[0].clone())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .recover_interrupted_runs()
+                .unwrap()
+                .orphan_processes
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_one_orphan_group_preserves_another_group_for_the_same_run() {
+        let (store, thread_id) = fixture().await;
+        let run_id = running_run(&store, thread_id, None).await;
+        let first = OrphanProcess {
+            run_id,
+            process_group_id: 4242,
+            start_time: "Sat Nov 7 09:05:01 2026".into(),
+        };
+        let second = OrphanProcess {
+            run_id,
+            process_group_id: 4343,
+            start_time: "Sat Nov 7 09:06:01 2026".into(),
+        };
+        for process in [&first, &second] {
+            store
+                .record_orphan_process(
+                    process.run_id,
+                    process.process_group_id,
+                    process.start_time.clone(),
+                )
+                .await
+                .unwrap();
+        }
+        store.recover_interrupted_runs().unwrap();
+
+        store.clear_orphan_cleanup(first).await.unwrap();
+
+        assert_eq!(
+            store.recover_interrupted_runs().unwrap().orphan_processes,
+            vec![second]
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_completion_clears_run_process_tracking() {
+        let (store, thread_id) = fixture().await;
+        let run_id = running_run(&store, thread_id, None).await;
+        store
+            .record_orphan_process(run_id, 4242, "Sat Nov 7 09:05:01 2026".into())
+            .await
+            .unwrap();
+
+        store.clear_run_orphan_processes(run_id).await.unwrap();
+
         assert!(
             store
                 .recover_interrupted_runs()

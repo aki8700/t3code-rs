@@ -633,13 +633,19 @@ async fn run_turn_with_idle_timeout(
 fn process_start_time(pid: u32) -> Option<String> {
     let output = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
         .output()
         .ok()?;
     output
         .status
         .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .then(|| normalize_process_start_time(&String::from_utf8_lossy(&output.stdout)))
         .filter(|start| !start.is_empty())
+}
+
+fn normalize_process_start_time(start: &str) -> String {
+    start.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn exit_message(status: std::process::ExitStatus, stderr: &str, detail: Option<&str>) -> String {
@@ -959,6 +965,14 @@ pub(crate) fn command(bin: &Path) -> Command {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_single_digit_day_lstart_spacing() {
+        assert_eq!(
+            normalize_process_start_time("Sat Nov  7 09:05:01 2026\n"),
+            "Sat Nov 7 09:05:01 2026"
+        );
+    }
     use crate::{AntigravityDriver, ClaudeDriver, CodexDriver, OpenCodeDriver, test_request};
     use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
     use t3_core::{

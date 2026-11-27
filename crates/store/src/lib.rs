@@ -254,11 +254,31 @@ impl SqliteStore {
     }
 
     /// Clears a cleanup request only after the recorded process group is confirmed gone.
-    pub async fn clear_orphan_cleanup(&self, run_id: Uuid) -> CoreResult<()> {
+    pub async fn clear_orphan_cleanup(&self, process: OrphanProcess) -> CoreResult<()> {
         self.with_writer(move |connection| {
             connection
                 .execute(
-                    "DELETE FROM run_orphan_processes WHERE run_id = ?1 AND cleanup_pending = 1",
+                    "DELETE FROM run_orphan_processes
+                     WHERE run_id = ?1 AND process_group_id = ?2 AND start_time = ?3
+                        AND cleanup_pending = 1",
+                    params![
+                        process.run_id.to_string(),
+                        process.process_group_id,
+                        process.start_time
+                    ],
+                )
+                .map_err(storage_error)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Removes process identities after a provider run has completed and cleaned up its groups.
+    pub async fn clear_run_orphan_processes(&self, run_id: Uuid) -> CoreResult<()> {
+        self.with_writer(move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM run_orphan_processes WHERE run_id = ?1",
                     [run_id.to_string()],
                 )
                 .map_err(storage_error)?;
