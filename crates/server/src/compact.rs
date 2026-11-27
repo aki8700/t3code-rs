@@ -8,12 +8,46 @@ use std::{path::Path, time::Duration};
 
 use serde_json::{Value, json};
 use t3_core::{CoreError, CoreResult};
+use t3_maki::{CompactionEconInput, Prices, compaction_econ};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     process::ChildStdin,
 };
 
 use crate::limits::{MAX_LINE_BYTES, prepare_probe_cmd, read_capped_line};
+
+pub(crate) const AUTO_COMPACT_RATIO: f64 = 0.75;
+
+#[allow(dead_code)]
+pub(crate) fn should_auto_compact(
+    context_tokens: u64,
+    context_window: u64,
+    remaining_turns_est: f64,
+) -> bool {
+    if context_window == 0 {
+        return false;
+    }
+    if (context_tokens as f64) / (context_window as f64) < AUTO_COMPACT_RATIO {
+        return false;
+    }
+    compaction_econ(CompactionEconInput {
+        prefix: context_tokens / 10,
+        replaced: (context_tokens * 7) / 10,
+        summary: (context_tokens / 20).clamp(1_500, 4_000),
+        tail: context_tokens / 5,
+        instruction: 1_500,
+        summarizer_reuses_prefix: true,
+        prices: Prices {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+        },
+        remaining_turns: Some(remaining_turns_est),
+    })
+    .worth_compacting
+        == Some(true)
+}
 
 const COMPACT_TIMEOUT: Duration = Duration::from_secs(180);
 const EXIT_GRACE: Duration = Duration::from_secs(5);
@@ -327,5 +361,13 @@ echo '{"method":"turn/completed","params":{"threadId":"other","turn":{"status":"
         .await
         .unwrap_err();
         assert!(error.to_string().contains("見つかりません"), "{error}");
+    }
+
+    #[test]
+    fn auto_compact_requires_high_ratio_and_positive_economics() {
+        assert!(!should_auto_compact(100_000, 200_000, 12.0));
+        assert!(!should_auto_compact(100_000, 0, 12.0));
+        assert!(should_auto_compact(160_000, 200_000, 12.0));
+        assert!(!should_auto_compact(160_000, 200_000, 1.0));
     }
 }
