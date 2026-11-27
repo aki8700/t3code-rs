@@ -2592,3 +2592,31 @@ pub(crate) fn text_value(value: &Value) -> Option<&str> {
             .find_map(|key| value[*key].as_str())
     })
 }
+
+#[cfg(test)]
+mod output_tail_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verify_feedback_uses_the_kept_shell_output_tail() {
+        let (_cancel_tx, cancellation) = tokio::sync::watch::channel(false);
+        let out = crate::shell::run_shell_cancellable(
+            &std::env::temp_dir(),
+            crate::shell::ShellExecRequest {
+                command: "head -c 300000 /dev/zero | tr '\\000' 'x'; printf '\\nVERIFY_FINAL_LINE_MARKER\\n'".into(),
+                timeout_secs: Some(5),
+            },
+            cancellation,
+        )
+        .await
+        .expect("verify shell should run");
+        let tail = redact_and_tail(&out.stdout, 4_000);
+        let summary = crate::verify::summarize_failure("verify", Some(1), false, &tail);
+        let prompt =
+            crate::verify::build_fix_prompt("verify", Some(1), false, &summary, &tail, 1, 3, &[]);
+
+        assert!(prompt.contains("VERIFY_FINAL_LINE_MARKER"));
+        assert!(summary.contains("VERIFY_FINAL_LINE_MARKER"));
+    }
+}
