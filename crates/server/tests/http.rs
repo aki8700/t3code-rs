@@ -4024,7 +4024,7 @@ esac
     assert_eq!(fb_runs[0]["status"], "rate-limited");
     assert_eq!(
         fb_runs[0]["error_message"],
-        "usage_limit: You have hit your weekly usage limit (reset_at: 2026-11-27T03:00:00Z)"
+        "usage_limit: You have hit your weekly usage limit (reset_at: 2030-01-01T00:00:00Z)"
     );
     assert_eq!(fb_runs[1]["provider"], "mock");
     assert_eq!(fb_runs[1]["status"], "completed");
