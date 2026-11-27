@@ -62,6 +62,8 @@ const MIGRATIONS: &[&str] = &[
         cleanup_pending INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (run_id, process_group_id, start_time)
     )",
+    "INSERT OR IGNORE INTO fts_item_rows (item_id, thread_id, fts_rowid)
+        SELECT item_id, thread_id, rowid FROM fts_entries WHERE item_id IS NOT NULL",
 ];
 
 const PREVIEW_BYTES: usize = 64 * 1024;
@@ -1550,6 +1552,16 @@ fn insert_item(
             )
             .map_err(storage_error)?
             .execute(params![thread_key, id.to_string(), body])
+            .map_err(storage_error)?;
+        let fts_rowid: i64 = connection
+            .query_row("SELECT last_insert_rowid()", [], |row| row.get(0))
+            .map_err(storage_error)?;
+        connection
+            .prepare_cached(
+                "INSERT INTO fts_item_rows (item_id, thread_id, fts_rowid) VALUES (?1, ?2, ?3)",
+            )
+            .map_err(storage_error)?
+            .execute(params![id.to_string(), thread_key, fts_rowid])
             .map_err(storage_error)?;
     }
     Ok(TurnItem {
