@@ -362,6 +362,12 @@ impl RunCoordinator {
         self.emit_board(&board);
         let mut woken = Vec::new();
         let targets = mentioned_members(&board, &sender, &post.mentions);
+        let worker_report = caller.as_ref().is_some_and(|caller| {
+            board
+                .members
+                .iter()
+                .any(|member| member.thread_id == caller.id && member.role == "worker")
+        });
         if depth >= MAX_WAKE_DEPTH {
             if !targets.is_empty() {
                 // No mention in the notice: it must not wake anyone itself.
@@ -378,7 +384,12 @@ impl RunCoordinator {
         } else {
             for member in targets {
                 match self
-                    .wake_member(active, member, caller.as_ref(), depth + 1)
+                    .wake_member(
+                        active,
+                        member,
+                        caller.as_ref(),
+                        next_wake_depth(depth, member, worker_report),
+                    )
                     .await
                 {
                     Ok(true) => woken.push(member.name.clone()),
@@ -413,10 +424,11 @@ impl RunCoordinator {
         if target.archived || caller.is_some_and(|caller| !can_dispatch(caller, &target)) {
             return Ok(false);
         }
-        let mut cursor = self
-            .in_flight_seq(active, target.id)
-            .await?
-            .max(member.last_read_seq);
+        // At most one queued wake per member: a wake still waiting in the queue is replaced
+        // by one that carries every unread post, so posts arriving while the member is busy
+        // cost one turn instead of one turn each. Only the running run's posts are skipped.
+        let running_to = self.supersede_queued_wakes(active, target.id).await?;
+        let mut cursor = member.last_read_seq.max(running_to);
         let mut woken = false;
         loop {
             let messages = store
@@ -471,35 +483,57 @@ impl RunCoordinator {
             .push(WakeDelivery { run_id, from, to });
     }
 
-    /// Highest post seq already handed to a queued or running run of the thread. Deliveries
-    /// whose run was dropped from the queue without running are forgotten here.
-    async fn in_flight_seq(
+    /// Cancels the member's queued wake runs and forgets their deliveries, which a new wake
+    /// takes over. Returns the highest post seq handed to the member's running run. Records
+    /// of runs that left the queue without running are dropped too.
+    async fn supersede_queued_wakes(
         &self,
         active: &HashMap<Uuid, ActiveRun>,
         thread_id: Uuid,
     ) -> CoreResult<i64> {
-        let queued = self.0.store.list_queued_runs(thread_id).await?;
         let running = active.get(&thread_id).map(|run| run.id);
-        let mut deliveries = self.deliveries();
-        let Some(list) = deliveries.get_mut(&thread_id) else {
-            return Ok(0);
+        let (running_to, superseded) = {
+            let mut deliveries = self.deliveries();
+            let Some(list) = deliveries.get_mut(&thread_id) else {
+                return Ok(0);
+            };
+            let (current, superseded): (Vec<_>, Vec<_>) = std::mem::take(list)
+                .into_iter()
+                .partition(|delivery| Some(delivery.run_id) == running);
+            let running_to = current
+                .iter()
+                .map(|delivery| delivery.to)
+                .max()
+                .unwrap_or(0);
+            if current.is_empty() {
+                deliveries.remove(&thread_id);
+            } else {
+                *list = current;
+            }
+            let mut superseded = superseded
+                .into_iter()
+                .map(|delivery| delivery.run_id)
+                .collect::<Vec<_>>();
+            superseded.dedup();
+            (running_to, superseded)
         };
-        list.retain(|delivery| {
-            Some(delivery.run_id) == running || queued.iter().any(|run| run.id == delivery.run_id)
-        });
-        Ok(list.iter().map(|delivery| delivery.to).max().unwrap_or(0))
+        for run_id in superseded {
+            self.cancel_queued_locked(thread_id, run_id).await?;
+        }
+        Ok(running_to)
     }
 
-    /// Called when a run ends. A completed run acknowledges the posts it delivered. Any
-    /// other outcome drops every pending delivery of the thread, so the next wake starts
-    /// again from the acknowledged cursor and includes the posts this run never finished.
+    /// Called when a run ends. A completed run acknowledges the posts it delivered. When the
+    /// run did not complete, a wake queued behind it lacks the posts this run never finished,
+    /// so that wake is rebuilt from the acknowledged cursor.
     pub(crate) async fn settle_wake(
         &self,
+        active: &mut HashMap<Uuid, ActiveRun>,
         thread_id: Uuid,
         run_id: Uuid,
         status: RunStatus,
     ) -> CoreResult<()> {
-        let delivered = {
+        let (delivered, queued_wake) = {
             let mut deliveries = self.deliveries();
             let Some(list) = deliveries.get_mut(&thread_id) else {
                 return Ok(());
@@ -507,12 +541,13 @@ impl RunCoordinator {
             let (delivered, rest) = std::mem::take(list)
                 .into_iter()
                 .partition::<Vec<_>, _>(|delivery| delivery.run_id == run_id);
-            if status == RunStatus::Completed && !rest.is_empty() {
-                *list = rest;
-            } else {
+            let queued_wake = rest.first().map(|delivery| delivery.run_id);
+            if rest.is_empty() {
                 deliveries.remove(&thread_id);
+            } else {
+                *list = rest;
             }
-            delivered
+            (delivered, queued_wake)
         };
         if status == RunStatus::Completed {
             for delivery in delivered {
@@ -521,6 +556,29 @@ impl RunCoordinator {
                     .ack_swarm_member_read_seq(thread_id, delivery.from, delivery.to)
                     .await?;
             }
+            return Ok(());
+        }
+        let Some(queued_wake) = queued_wake.filter(|_| !delivered.is_empty()) else {
+            return Ok(());
+        };
+        let Some(depth) = self
+            .0
+            .store
+            .queued_run(thread_id, queued_wake)
+            .await?
+            .map(|run| run.input.wake_depth)
+        else {
+            return Ok(());
+        };
+        let Some(board) = self.get_board(thread_id).await? else {
+            return Ok(());
+        };
+        if let Some(member) = board
+            .members
+            .iter()
+            .find(|member| member.thread_id == thread_id && member.state != "killed")
+        {
+            self.wake_member(active, member, None, depth).await?;
         }
         Ok(())
     }
@@ -877,6 +935,17 @@ fn wake_depth(active: &HashMap<Uuid, ActiveRun>, id: Uuid) -> u8 {
     active.get(&id).map_or(0, |run| run.wake_depth)
 }
 
+/// Worker reports wake the coordinator at depth zero, so routine result delivery does not
+/// consume the finite depth budget. Other mentions, including coordinator retries, still
+/// increase depth and remain bounded to stop ping-pong.
+fn next_wake_depth(depth: u8, target: &SwarmMember, worker_report: bool) -> u8 {
+    if target.role == "coordinator" && worker_report {
+        0
+    } else {
+        depth.saturating_add(1)
+    }
+}
+
 fn live_worker_count(board: &SwarmBoardSnapshot) -> usize {
     board
         .members
@@ -1161,6 +1230,16 @@ mod tests {
             head_seq: 0,
         };
         assert_eq!(live_worker_count(&board), MAX_ACTIVE_WORKERS);
+    }
+
+    #[test]
+    fn worker_reports_reset_coordinator_wake_depth_but_agent_pings_increment_it() {
+        let coordinator = member("coordinator", "coordinator", "working");
+        let worker = member("coder", "worker", "working");
+
+        assert_eq!(next_wake_depth(7, &coordinator, true), 0);
+        assert_eq!(next_wake_depth(7, &coordinator, false), 8);
+        assert_eq!(next_wake_depth(7, &worker, true), 8);
     }
 
     #[test]

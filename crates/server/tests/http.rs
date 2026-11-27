@@ -2036,6 +2036,46 @@ async fn swarm_mcp_status_and_reader_return_compact_truncated_messages() {
 }
 
 #[tokio::test]
+async fn swarm_status_counts_killed_members_and_lists_only_live_members() {
+    let tmp = TempDir::new();
+    let app = router(tmp.state(AuthConfig::LocalOnly));
+    let id = create_parent(&app, &tmp.0).await;
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{id}/messages"),
+        Some(json!({"prompt":"/swarm inspect members"})),
+    )
+    .await;
+    wait_for_runs(&app, id, 1).await;
+
+    for name in ["live", "killed-one", "killed-two"] {
+        mcp_tool(
+            &app,
+            "swarm_add_worker",
+            json!({"thread_id":id,"name":name,"brief":"check","provider":"mock","model":"mock"}),
+        )
+        .await;
+    }
+    for name in ["killed-one", "killed-two"] {
+        mcp_tool(
+            &app,
+            "swarm_kill_worker",
+            json!({"thread_id":id,"name":name}),
+        )
+        .await;
+    }
+
+    let status = mcp_tool(&app, "swarm_status", json!({"thread_id":id})).await;
+    assert_eq!(status["killed_count"], 2);
+    let members = status["members"].as_array().unwrap();
+    assert_eq!(members.len(), 2, "{members:?}");
+    assert!(members.iter().any(|member| member["name"] == "coordinator"));
+    assert!(members.iter().any(|member| member["name"] == "live"));
+    assert!(!members.iter().any(|member| member["state"] == "killed"));
+}
+
+#[tokio::test]
 async fn task_and_swarm_status_report_worktree_clashes_and_behind_counts() {
     let tmp = TempDir::new();
     let workspace = tmp.0.join("repo");
@@ -2145,8 +2185,7 @@ async fn task_and_swarm_status_report_worktree_clashes_and_behind_counts() {
         .find(|overlap| overlap["file"] == "shared-swarm.txt")
         .unwrap();
     assert_eq!(clash["workers"], json!(["swarm-a", "swarm-b"]));
-    let from_worker =
-        mcp_tool(&app, "swarm_status", json!({"thread_id":swarm_ids[0]})).await;
+    let from_worker = mcp_tool(&app, "swarm_status", json!({"thread_id":swarm_ids[0]})).await;
     assert_eq!(from_worker["board_id"], swarm["board_id"]);
     assert_eq!(from_worker["overlaps"], swarm["overlaps"]);
 
@@ -2466,6 +2505,102 @@ printf '{"type":"result","subtype":"success","result":"noted"}\n'
     assert_eq!(board["members"][0]["last_read_seq"], third["seq"]);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn queued_wake_after_failure_replays_and_acks_all_unread_posts() {
+    let tmp = TempDir::new();
+    let (app, id) = swarm_fixture(
+        &tmp,
+        r#"#!/bin/sh
+IFS= read -r prompt
+case "$prompt" in
+  *"Unread swarm board posts"*)
+    n=$(cat wake_calls 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > wake_calls
+    if [ "$n" -eq 1 ]; then
+      touch first-wake-started
+      sleep 2
+      echo "boom" >&2
+      exit 1
+    fi ;;
+esac
+printf '{"type":"result","subtype":"success","result":"noted"}\n'
+"#,
+    )
+    .await;
+    start_swarm(&app, id).await;
+    wait_for_runs(&app, id, 1).await;
+    let worker = mcp_tool(
+        &app,
+        "swarm_add_worker",
+        json!({
+            "thread_id":id,"name":"w1","brief":"check","provider":"mock","model":"mock",
+        }),
+    )
+    .await;
+    let worker_id = worker["thread_id"].clone();
+    let post = |text: &'static str| {
+        let app = app.clone();
+        let worker_id = worker_id.clone();
+        async move {
+            mcp_tool(
+                &app,
+                "swarm_post_message",
+                json!({"thread_id":worker_id,"text":text}),
+            )
+            .await
+        }
+    };
+
+    post("@coordinator first").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !tmp.0.join("first-wake-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first wake did not start");
+    post("@coordinator second").await;
+    let third = post("@coordinator third").await;
+
+    let detail = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
+            let runs = detail["runs"].as_array().unwrap();
+            if runs.len() >= 5
+                && runs
+                    .iter()
+                    .all(|run| !matches!(run["status"].as_str(), Some("running" | "queued")))
+            {
+                break detail;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("queued wakes did not finish");
+    let runs = detail["runs"].as_array().unwrap();
+    let wakes = runs
+        .iter()
+        .filter(|run| run["status"] != "cancelled")
+        .filter(|run| {
+            run["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("Unread swarm board posts")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(wakes.len(), 2, "{runs:?}");
+    assert_eq!(wakes[0]["status"], "failed");
+    assert_eq!(wakes[1]["status"], "completed");
+    let prompt = wakes[1]["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains("first") && prompt.contains("second") && prompt.contains("third"),
+        "{prompt}"
+    );
+    let board = json_req(&app, Method::GET, &format!("/api/threads/{id}/swarm"), None).await;
+    assert_eq!(board["members"][0]["last_read_seq"], third["seq"]);
+}
+
 // A wake queued behind a running wake gets only the posts the running one lacks.
 #[cfg(unix)]
 #[tokio::test]
@@ -2515,6 +2650,95 @@ printf '{"type":"result","subtype":"success","result":"noted"}\n'
         prompt.contains("second") && !prompt.contains("first"),
         "{prompt}"
     );
+}
+
+// Posts that arrive while the member is busy share one queued wake, and its completion
+// acknowledges all of them.
+#[cfg(unix)]
+#[tokio::test]
+async fn posts_arriving_during_a_running_wake_share_one_queued_wake() {
+    let tmp = TempDir::new();
+    let (app, id) = swarm_fixture(
+        &tmp,
+        r#"#!/bin/sh
+IFS= read -r prompt
+case "$prompt" in *"first"*) touch first-wake-started; sleep 1 ;; esac
+printf '{"type":"result","subtype":"success","result":"noted"}\n'
+"#,
+    )
+    .await;
+    start_swarm(&app, id).await;
+    wait_for_runs(&app, id, 1).await;
+    let worker = mcp_tool(
+        &app,
+        "swarm_add_worker",
+        json!({
+            "thread_id":id,"name":"w1","brief":"check","provider":"mock","model":"mock",
+        }),
+    )
+    .await;
+    let post = |text: &str| {
+        mcp_tool(
+            &app,
+            "swarm_post_message",
+            json!({"thread_id":worker["thread_id"],"text":text}),
+        )
+    };
+    post("@coordinator first").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !tmp.0.join("first-wake-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first wake did not start");
+    for text in ["@coordinator second", "@coordinator third"] {
+        post(text).await;
+    }
+    let last = post("@coordinator fourth").await;
+    let detail = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
+            let runs = detail["runs"].as_array().unwrap();
+            if runs
+                .iter()
+                .all(|run| !matches!(run["status"].as_str(), Some("running" | "queued")))
+                && runs
+                    .iter()
+                    .filter(|run| run["status"] == "completed")
+                    .count()
+                    >= 3
+            {
+                break detail;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("wakes did not finish");
+    let wakes = detail["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|run| run["status"] == "completed")
+        .filter(|run| {
+            run["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("Unread swarm board posts")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(wakes.len(), 2, "{detail}");
+    let prompt = wakes[1]["prompt"].as_str().unwrap();
+    assert!(
+        !prompt.contains("first")
+            && prompt.contains("second")
+            && prompt.contains("third")
+            && prompt.contains("fourth"),
+        "{prompt}"
+    );
+    let board = json_req(&app, Method::GET, &format!("/api/threads/{id}/swarm"), None).await;
+    assert_eq!(board["members"][0]["last_read_seq"], last["seq"]);
 }
 
 #[tokio::test]

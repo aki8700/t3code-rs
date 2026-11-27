@@ -137,7 +137,9 @@ impl From<SwarmMember> for SwarmMemberSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct SwarmStatusResult {
     pub board_id: Uuid,
+    /// Members that are not killed. Killed members appear only in `killed_count`.
     pub members: Vec<SwarmMemberSummary>,
+    pub killed_count: usize,
     pub head_seq: i64,
     pub message_count: usize,
     pub worktrees: Vec<WorktreeChange>,
@@ -809,7 +811,7 @@ fn tools() -> Vec<Value> {
         ),
         make(
             "swarm_status",
-            "Get compact swarm status with member records, worktree changed files, commits behind each base branch, and files shared by multiple workers.",
+            "Get compact swarm status with live member records (killed members only as killed_count), worktree changed files, commits behind each base branch, and files shared by multiple workers.",
             json!({"thread_id": uuid}),
             &[],
         ),
