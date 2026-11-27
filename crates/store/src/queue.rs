@@ -187,6 +187,13 @@ impl SqliteStore {
                     .optional()
                     .map_err(storage_error)?;
                 if let Some(item_id) = item_id {
+                    let old_blob_hash: Option<String> = tx
+                        .query_row(
+                            "SELECT blob_hash FROM turn_items WHERE id = ?1",
+                            [&item_id],
+                            |row| row.get(0),
+                        )
+                        .map_err(storage_error)?;
                     tx.execute(
                         "UPDATE turn_items SET payload_text = ?2, blob_hash = ?3, raw_bytes = ?4,
                          compressed_bytes = ?5 WHERE id = ?1",
@@ -200,10 +207,19 @@ impl SqliteStore {
                     )
                     .map_err(storage_error)?;
                     tx.execute(
-                        "UPDATE fts_entries SET body = ?3 WHERE thread_id = ?1 AND item_id = ?2",
-                        params![thread_id.to_string(), item_id, prompt],
+                        "UPDATE fts_entries SET body = ?2
+                         WHERE rowid = (SELECT fts_rowid FROM fts_item_rows WHERE item_id = ?1)",
+                        params![item_id, prompt],
                     )
                     .map_err(storage_error)?;
+                    if let Some(old_blob_hash) = old_blob_hash {
+                        tx.execute(
+                            "DELETE FROM blob_store WHERE hash = ?1
+                             AND NOT EXISTS (SELECT 1 FROM turn_items WHERE blob_hash = ?1)",
+                            [&old_blob_hash],
+                        )
+                        .map_err(storage_error)?;
+                    }
                 }
             }
             tx.commit().map_err(storage_error)?;
@@ -486,6 +502,85 @@ mod tests {
         let hits = store.search_fts("needle", 10).await.unwrap();
         assert!(hits.iter().any(|hit| hit.item_id == Some(item.id)));
         assert!(store.search_fts("stale", 10).await.unwrap().is_empty());
+        store
+            .with_reader(move |connection| {
+                let plan: Vec<String> = connection
+                    .prepare(
+                        "EXPLAIN QUERY PLAN SELECT fts_rowid FROM fts_item_rows WHERE item_id = ?1",
+                    )
+                    .map_err(storage_error)?
+                    .query_map([item.id.to_string()], |row| row.get(3))
+                    .map_err(storage_error)?
+                    .collect::<Result<_, _>>()
+                    .map_err(storage_error)?;
+                assert!(
+                    plan.iter().any(|detail| {
+                        detail.contains("fts_item_rows") && detail.contains("item_id")
+                    }),
+                    "unexpected mapping query plan: {plan:?}"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn updating_queued_run_deletes_unreferenced_old_payload_blob() {
+        let (store, thread_id) = fixture().await;
+        let run = queued_run(thread_id);
+        let old_text = "large queued prompt payload ".repeat(5_000);
+        let item = NewTurnItem {
+            thread_id,
+            run_id: run.id,
+            kind: t3_core::TurnItemKind::UserMessage,
+            summary: None,
+            payload: serde_json::json!({"text": old_text}),
+            searchable_text: None,
+        };
+        let input = QueuedRunInput {
+            model_selection: mock_selection(),
+            attachment_ids: Vec::new(),
+            notify_parent: true,
+            wake_depth: 0,
+            mode_ceiling: None,
+            verify_fix_depth: 0,
+            last_verify_signature: None,
+            verify_dead_ends: Vec::new(),
+            fallback_attempts: 0,
+        };
+        let (run, item) = store.enqueue_run(run, item, input.clone()).await.unwrap();
+        let old_hash: String = store
+            .with_reader(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT blob_hash FROM turn_items WHERE id = ?1",
+                        [item.id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(storage_error)
+            })
+            .await
+            .unwrap();
+
+        store
+            .update_queued_run(thread_id, run.id, "replacement".into(), input)
+            .await
+            .unwrap();
+
+        let remains: bool = store
+            .with_reader(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM blob_store WHERE hash = ?1)",
+                        [&old_hash],
+                        |row| row.get(0),
+                    )
+                    .map_err(storage_error)
+            })
+            .await
+            .unwrap();
+        assert!(!remains);
     }
 
     fn queued_run(thread_id: Uuid) -> Run {

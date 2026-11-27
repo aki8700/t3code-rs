@@ -117,8 +117,17 @@ CREATE INDEX IF NOT EXISTS attachments_thread ON attachments(thread_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_entries USING fts5(
     thread_id UNINDEXED, item_id UNINDEXED, title, body, tokenize='trigram'
 );
+CREATE TABLE IF NOT EXISTS fts_item_rows (
+    item_id TEXT PRIMARY KEY NOT NULL,
+    thread_id TEXT NOT NULL,
+    fts_rowid INTEGER NOT NULL UNIQUE
+);
 CREATE TRIGGER IF NOT EXISTS threads_delete_fts AFTER DELETE ON threads BEGIN
     DELETE FROM fts_entries WHERE thread_id = old.id;
+END;
+CREATE INDEX IF NOT EXISTS fts_item_rows_thread ON fts_item_rows(thread_id);
+CREATE TRIGGER IF NOT EXISTS threads_delete_fts_item_rows AFTER DELETE ON threads BEGIN
+    DELETE FROM fts_item_rows WHERE thread_id = old.id;
 END;
 
 CREATE TABLE IF NOT EXISTS queued_run_inputs (
