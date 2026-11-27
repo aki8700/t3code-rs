@@ -464,6 +464,15 @@ async fn run_turn_with_idle_timeout(
                 provider.display_name()
             ))
         })?;
+        #[cfg(unix)]
+        if let Some(pid) = child.id()
+            && let Some(start_time) = process_start_time(pid)
+        {
+            let _ = tx.send(StreamEvent::ProcessStarted {
+                process_group_id: pid as i32,
+                start_time,
+            });
+        }
         runs.insert(
             run_id,
             ActiveProcess {
@@ -618,6 +627,19 @@ async fn run_turn_with_idle_timeout(
     };
     let _ = tx.send(event);
     Ok(())
+}
+
+#[cfg(unix)]
+fn process_start_time(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|start| !start.is_empty())
 }
 
 fn exit_message(status: std::process::ExitStatus, stderr: &str, detail: Option<&str>) -> String {
@@ -987,9 +1009,15 @@ mod tests {
     }
 
     async fn receive(rx: &mut mpsc::UnboundedReceiver<StreamEvent>) -> Option<StreamEvent> {
-        tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap()
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap();
+            if matches!(event, Some(StreamEvent::ProcessStarted { .. })) {
+                continue;
+            }
+            return event;
+        }
     }
 
     #[tokio::test]

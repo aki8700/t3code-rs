@@ -55,6 +55,14 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS runs_thread_ordinal ON runs(thread_id, ordinal);
 
+CREATE TABLE IF NOT EXISTS run_orphan_processes (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    process_group_id INTEGER NOT NULL,
+    start_time TEXT NOT NULL,
+    cleanup_pending INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, process_group_id, start_time)
+);
+
 CREATE TABLE IF NOT EXISTS blob_store (
     hash TEXT PRIMARY KEY NOT NULL,
     raw_bytes INTEGER NOT NULL,

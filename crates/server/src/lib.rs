@@ -143,9 +143,10 @@ pub async fn serve(config: ServerConfig) -> CoreResult<()> {
         .map_err(internal_io)?
         .unwrap_or(public_address);
     let (state, recovered) = ServerState::recover(config, format!("http://{mcp_address}"))?;
-    // Cancelled runs never start again, so their processes are only stopped here.
-    for thread_id in recovered.thread_ids {
-        resume::stop_orphaned_processes(thread_id).await;
+    // Keep cleanup targets persisted until process-group termination is confirmed.
+    let stopped = resume::stop_orphaned_processes(recovered.orphan_processes).await;
+    for run_id in stopped {
+        state.store.clear_orphan_cleanup(run_id).await?;
     }
     prune_known_project_snapshots(&state.store).await;
     let coordinator = state.coordinator.clone();
@@ -249,7 +250,7 @@ mod startup_tests {
     }
 
     #[tokio::test]
-    async fn second_restart_at_resume_limit_stops_leftover_provider_process() {
+    async fn restart_retries_pending_cleanup_after_crash_before_process_stop() {
         let dir = TempDir::new();
         let config = ServerConfig {
             data_dir: dir.0.join("server"),
@@ -344,46 +345,48 @@ mod startup_tests {
             .update_thread_session_id(thread.id, "session-1".into())
             .await
             .unwrap();
-        assert_eq!(
-            store.recover_interrupted_runs().unwrap().resumed,
-            vec![run_id]
-        );
-        store
-            .start_queued_run(run_id, selection, Some("session-1".into()))
-            .await
-            .unwrap();
-        drop(store);
-
-        let thread_id = thread.id.to_string();
         let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 30; :", "sh", "--thread-id", thread_id.as_str()])
+            .args(["-c", "sleep 30; :"])
             .process_group(0)
             .spawn()
             .unwrap();
-        let server = tokio::spawn(serve(config.clone()));
-        let mut status = None;
-        for _ in 0..100 {
-            status = child.try_wait().unwrap();
-            if status.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        server.abort();
-        let _ = server.await;
-        if status.is_none() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        assert!(
-            status.is_some(),
-            "leftover provider process was not stopped"
-        );
-        assert!(!status.unwrap().success());
+        store
+            .record_orphan_process(run_id, child.id() as i32, "Fri Nov 27 13:34:00 2026".into())
+            .await
+            .unwrap();
+        let first_startup = store.recover_interrupted_runs().unwrap();
+        assert_eq!(first_startup.resumed, vec![run_id]);
+        assert_eq!(first_startup.orphan_processes.len(), 1);
+        drop(store); // Simulate a crash after DB recovery but before process cleanup.
+
         let store = SqliteStore::open(config.db_path(), config.storage).unwrap();
+        let next_startup = store.recover_interrupted_runs().unwrap();
         assert_eq!(
-            store.list_runs(thread.id).await.unwrap()[0].status,
-            RunStatus::Cancelled
+            next_startup.orphan_processes,
+            first_startup.orphan_processes
         );
+        let target = &next_startup.orphan_processes[0];
+        let snapshot = format!(
+            "{} {} {} {}",
+            child.id(),
+            child.id(),
+            unsafe { libc::getuid() },
+            target.start_time
+        );
+        let stopped = resume::stop_orphaned_processes_from_snapshot(
+            next_startup.orphan_processes.clone(),
+            &snapshot,
+        )
+        .await;
+        assert_eq!(stopped, vec![run_id]);
+        store.clear_orphan_cleanup(run_id).await.unwrap();
+        assert!(
+            store
+                .recover_interrupted_runs()
+                .unwrap()
+                .orphan_processes
+                .is_empty()
+        );
+        assert!(!child.wait().unwrap().success());
     }
 }

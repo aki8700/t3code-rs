@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use t3_core::ProviderId;
+use t3_store::OrphanProcess;
 use uuid::Uuid;
 
 /// Sent in place of the original prompt when a run resumes after a server restart. The session
@@ -27,107 +28,125 @@ pub(crate) async fn session_resumable(
     .unwrap_or(false)
 }
 
-/// Stops provider processes that a previous server left running for `thread_id`.
-///
-/// Runs do not record their pid, but every provider process with the t3 MCP server carries
-/// `--thread-id <thread>` in its own or its MCP child's command line. The thread id is a random
-/// UUID, so a match cannot be a recycled pid. The process group is signalled, as at spawn
-/// each provider becomes the leader of its own group.
+/// Stops recorded provider process groups and returns runs confirmed stopped.
 #[cfg(unix)]
-pub(crate) async fn stop_orphaned_processes(thread_id: Uuid) {
-    let groups = tokio::task::spawn_blocking(move || {
+pub(crate) async fn stop_orphaned_processes(orphan_processes: Vec<OrphanProcess>) -> Vec<Uuid> {
+    let ps = tokio::task::spawn_blocking(move || {
         let output = std::process::Command::new("ps")
-            .args(["-A", "-ww", "-o", "pid=,pgid=,uid=,command="])
+            .args(["-A", "-ww", "-o", "pid=,pgid=,uid=,lstart="])
             .output()?;
-        // SAFETY: getuid and getpgrp have no preconditions.
-        let (uid, own_group) = unsafe { (libc::getuid(), libc::getpgrp()) };
-        Ok::<_, std::io::Error>(orphan_groups(
-            &String::from_utf8_lossy(&output.stdout),
-            thread_id,
-            uid,
-            own_group,
-        ))
+        if !output.status.success() {
+            return Err(std::io::Error::other("ps returned a failure status"));
+        }
+        Ok::<_, std::io::Error>(String::from_utf8_lossy(&output.stdout).into_owned())
     })
     .await
     .unwrap_or_else(|error| Err(std::io::Error::other(error)));
-    let groups = match groups {
-        Ok(groups) => groups,
+    let ps = match ps {
+        Ok(ps) => ps,
         Err(error) => {
-            tracing::warn!(%error, %thread_id, "Could not list processes to find orphaned runs");
-            return;
+            tracing::warn!(%error, "Could not list processes to find orphaned runs");
+            return Vec::new();
         }
     };
-    for group in groups {
-        tracing::warn!(%thread_id, pgid = group, "Stopping a provider process left by the previous server");
-        stop_group(group).await;
+    stop_orphaned_processes_from_snapshot(orphan_processes, &ps).await
+}
+
+#[cfg(unix)]
+pub(crate) async fn stop_orphaned_processes_from_snapshot(
+    orphan_processes: Vec<OrphanProcess>,
+    ps: &str,
+) -> Vec<Uuid> {
+    let groups = {
+        // SAFETY: getuid and getpgrp have no preconditions.
+        let (uid, own_group) = unsafe { (libc::getuid(), libc::getpgrp()) };
+        matching_groups(ps, &orphan_processes, uid, own_group)
+    };
+    stop_verified_groups(&orphan_processes, &groups).await
+}
+
+#[cfg(unix)]
+async fn stop_verified_groups(
+    targets: &[OrphanProcess],
+    groups: &[(Uuid, libc::pid_t)],
+) -> Vec<Uuid> {
+    for (run_id, group) in groups {
+        tracing::warn!(%run_id, pgid = group, "Stopping a provider process left by the previous server");
+        // SAFETY: group IDs were matched to the persisted provider leader identity above.
+        unsafe {
+            libc::killpg(*group, libc::SIGTERM);
+        }
     }
+    if !groups.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    }
+    let survivors: Vec<_> = groups
+        .iter()
+        .filter(|(_, group)| group_alive(*group))
+        .copied()
+        .collect();
+    for (_, group) in &survivors {
+        // SAFETY: group IDs were verified against the recorded process identity.
+        unsafe {
+            libc::killpg(*group, libc::SIGKILL);
+        }
+    }
+    if !survivors.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    }
+    let stopped: Vec<_> = targets
+        .iter()
+        .filter(|target| !group_alive(target.process_group_id))
+        .map(|target| target.run_id)
+        .collect();
+    stopped
 }
 
 #[cfg(not(unix))]
-pub(crate) async fn stop_orphaned_processes(_thread_id: Uuid) {}
+pub(crate) async fn stop_orphaned_processes(_targets: Vec<OrphanProcess>) -> Vec<Uuid> {
+    Vec::new()
+}
 
-/// Process groups in `ps -o pid=,pgid=,uid=,command=` output that belong to `thread_id`.
+/// Recorded process group leaders in `ps -o pid=,pgid=,uid=,lstart=` output.
 #[cfg(unix)]
-fn orphan_groups(
+fn matching_groups(
     ps: &str,
-    thread_id: Uuid,
+    targets: &[OrphanProcess],
     uid: libc::uid_t,
     own_group: libc::pid_t,
-) -> Vec<libc::pid_t> {
-    let spaced = format!("--thread-id {thread_id}");
-    let quoted = format!("\"--thread-id\",\"{thread_id}\"");
+) -> Vec<(Uuid, libc::pid_t)> {
     let mut groups = Vec::new();
     for line in ps.lines() {
-        let mut rest = line.trim_start();
-        let mut field = || {
-            let (value, tail) = rest.split_once(char::is_whitespace)?;
-            rest = tail.trim_start();
-            Some(value)
-        };
-        let (Some(_pid), Some(group), Some(owner)) = (field(), field(), field()) else {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        let (Ok(pid), Ok(group), Ok(owner)) = (
+            fields[0].parse::<libc::pid_t>(),
+            fields[1].parse::<libc::pid_t>(),
+            fields[2].parse::<libc::uid_t>(),
+        ) else {
             continue;
         };
-        let (Ok(group), Ok(owner)) = (group.parse::<libc::pid_t>(), owner.parse::<libc::uid_t>())
-        else {
+        let start_time = fields[3..8].join(" ");
+        if pid != group || owner != uid || group <= 1 || group == own_group {
             continue;
-        };
-        if owner == uid
-            && group > 1
-            && group != own_group
-            && (rest.contains(&spaced) || rest.contains(&quoted))
-            && !groups.contains(&group)
+        }
+        if let Some(target) = targets
+            .iter()
+            .find(|target| target.process_group_id == group && target.start_time == start_time)
+            && !groups.iter().any(|(_, existing)| *existing == group)
         {
-            groups.push(group);
+            groups.push((target.run_id, group));
         }
     }
     groups
 }
 
-/// SIGTERM, then SIGKILL when the group outlives the grace period, as `process::interrupt` does.
 #[cfg(unix)]
-async fn stop_group(group: libc::pid_t) {
-    use std::time::Duration;
-
-    let alive = || {
-        // SAFETY: signal 0 only checks that the group exists.
-        unsafe { libc::killpg(group, 0) == 0 }
-    };
-    for signal in [libc::SIGTERM, libc::SIGKILL] {
-        // SAFETY: killpg has no memory preconditions; group > 1 excludes init and broadcast.
-        if unsafe { libc::killpg(group, signal) } != 0 {
-            return;
-        }
-        for _ in 0..30 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if !alive() {
-                return;
-            }
-        }
-    }
-    tracing::warn!(
-        pgid = group,
-        "A provider process left by the previous server is still alive"
-    );
+fn group_alive(group: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks that the group exists.
+    unsafe { libc::killpg(group, 0) == 0 }
 }
 
 #[cfg(all(test, unix))]
@@ -136,38 +155,56 @@ mod tests {
     use std::os::unix::process::CommandExt;
 
     #[test]
-    fn orphan_groups_match_the_thread_and_skip_others() {
+    fn recorded_group_identity_matches_only_the_same_leader_and_start_time() {
         let thread = Uuid::new_v4();
-        let other = Uuid::new_v4();
         let ps = format!(
-            "  101   101   501 claude -p --mcp-config {{\"mcpServers\":{{\"t3rs\":{{\"args\":[\"mcp\",\"--url\",\"http://x\",\"--thread-id\",\"{thread}\"]}}}}}}
-  102   101   501 /bin/t3d mcp --url http://x --thread-id {thread}
-  103   103   501 /bin/t3d mcp --url http://x --thread-id {other}
-  104   104     0 /bin/t3d mcp --url http://x --thread-id {thread}
-  105    77   501 /bin/t3d mcp --url http://x --thread-id {thread}
-  106   106   501 codex exec -c mcp_servers.t3rs.args=[\"mcp\",\"--thread-id\",\"{thread}\"] -
+            "  101   101   501 Fri Nov 27 13:34:00 2026 prompt-{thread}
+  102   101   501 Fri Nov 27 13:34:01 2026 provider child
+  103   103   501 Fri Nov 27 13:34:00 2026 different process
+  104   104     0 Fri Nov 27 13:34:00 2026 other user
+  105    77   501 Fri Nov 27 13:34:00 2026 current server
 garbage line
 "
         );
-        assert_eq!(orphan_groups(&ps, thread, 501, 77), vec![101, 106]);
+        let target = OrphanProcess {
+            run_id: Uuid::new_v4(),
+            process_group_id: 101,
+            start_time: "Fri Nov 27 13:34:00 2026".into(),
+        };
+        assert_eq!(
+            matching_groups(&ps, std::slice::from_ref(&target), 501, 77),
+            vec![(target.run_id, 101)]
+        );
+        let changed_start = OrphanProcess {
+            start_time: "Fri Nov 27 13:35:00 2026".into(),
+            ..target
+        };
+        assert!(matching_groups(&ps, &[changed_start], 501, 77).is_empty());
     }
 
     #[tokio::test]
-    async fn stops_a_live_process_group() {
-        let thread = Uuid::new_v4();
+    async fn stops_mcp_disabled_provider_process_by_recorded_identity() {
         let mut child = std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                "sleep 30; :",
-                "sh",
-                "--thread-id",
-                &thread.to_string(),
-            ])
+            .args(["-c", "sleep 30; :"])
             .process_group(0)
             .spawn()
             .unwrap();
-        stop_orphaned_processes(thread).await;
+        let pid = child.id();
+        let target = OrphanProcess {
+            run_id: Uuid::new_v4(),
+            process_group_id: pid as i32,
+            start_time: "Fri Nov 27 13:34:00 2026".into(),
+        };
+        // This provider command intentionally has no MCP/thread-id arguments. The process table
+        // snapshot proves the persisted PGID and leader start time are sufficient to select it.
+        let snapshot = format!(
+            "{pid} {pid} {} {}",
+            unsafe { libc::getuid() },
+            target.start_time
+        );
+        let stopped = stop_orphaned_processes_from_snapshot(vec![target], &snapshot).await;
         let status = child.wait().unwrap();
+        assert_eq!(stopped.len(), 1);
         assert!(!status.success());
     }
 }

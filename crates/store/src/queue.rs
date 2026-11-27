@@ -520,13 +520,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_restart_at_limit_returns_thread_id_for_orphan_cleanup() {
+    async fn second_restart_at_limit_only_returns_recorded_orphan_processes() {
         let (store, thread_id) = fixture().await;
         let run_id = running_run(&store, thread_id, Some("session-1")).await;
 
         assert_eq!(
-            store.recover_interrupted_runs().unwrap().thread_ids,
-            vec![thread_id]
+            store.recover_interrupted_runs().unwrap().orphan_processes,
+            Vec::new()
         );
         store
             .start_queued_run(run_id, mock_selection(), Some("session-1".into()))
@@ -535,7 +535,33 @@ mod tests {
         let recovered = store.recover_interrupted_runs().unwrap();
 
         assert_eq!(recovered.cancelled, vec![run_id]);
-        assert_eq!(recovered.thread_ids, vec![thread_id]);
+        assert!(recovered.orphan_processes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_orphan_cleanup_survives_an_additional_restart() {
+        let (store, thread_id) = fixture().await;
+        let run_id = running_run(&store, thread_id, None).await;
+        store
+            .record_orphan_process(run_id, 4242, "Fri Nov 27 13:34:00 2026".into())
+            .await
+            .unwrap();
+
+        let first = store.recover_interrupted_runs().unwrap();
+        assert_eq!(first.cancelled, vec![run_id]);
+        assert_eq!(first.orphan_processes.len(), 1);
+        assert_eq!(first.orphan_processes[0].process_group_id, 4242);
+
+        let second = store.recover_interrupted_runs().unwrap();
+        assert_eq!(second.orphan_processes, first.orphan_processes);
+        store.clear_orphan_cleanup(run_id).await.unwrap();
+        assert!(
+            store
+                .recover_interrupted_runs()
+                .unwrap()
+                .orphan_processes
+                .is_empty()
+        );
     }
 
     #[tokio::test]
