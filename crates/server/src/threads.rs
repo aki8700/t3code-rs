@@ -1188,8 +1188,13 @@ impl OrchestratorBackend for RunCoordinator {
             .list_runs(thread.id)
             .await?
             .into_iter()
+            .rev()
             .find(|run| run.ordinal > 0)
             .ok_or_else(|| CoreError::NotFound("delegated run".into()))?;
+        let status = match run.status {
+            RunStatus::Queued | RunStatus::Running => ThreadStatus::Running,
+            _ => thread.status,
+        };
         let summary = match run.status {
             RunStatus::Failed | RunStatus::RateLimited => run
                 .error_message
@@ -1223,7 +1228,7 @@ impl OrchestratorBackend for RunCoordinator {
             task_id,
             child_thread_id: thread.id,
             run_id: run.id,
-            status: thread.status,
+            status,
             worktree_path: thread.worktree_path,
             summary,
             worktree,

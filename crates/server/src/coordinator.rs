@@ -286,6 +286,7 @@ impl RunCoordinator {
                 thread_id,
                 run_id,
                 status: RunStatus::Cancelled,
+                followup: false,
                 error: Some("Cancelled".into()),
             });
         }
@@ -668,6 +669,7 @@ impl RunCoordinator {
                 thread_id: thread.id,
                 run_id: run.id,
                 status: RunStatus::Queued,
+                followup: false,
                 error: None,
             });
         }
@@ -738,6 +740,7 @@ impl RunCoordinator {
                         thread_id: thread.id,
                         run_id,
                         status: RunStatus::Failed,
+                        followup: false,
                         error: Some(message),
                     });
                     if submitted_id == Some(run_id) {
@@ -1021,6 +1024,7 @@ impl RunCoordinator {
             thread_id,
             run_id,
             status: RunStatus::Cancelled,
+            followup: false,
             error: Some(error),
         });
         Ok(())
@@ -1062,6 +1066,7 @@ impl RunCoordinator {
                 thread_id: id,
                 run_id,
                 status: RunStatus::Cancelled,
+                followup: false,
                 error: Some("Interrupted".into()),
             });
         }
@@ -1728,6 +1733,13 @@ impl RunCoordinator {
             }
         }
         let defer_completion = enqueued_followup && !self.0.shutting_down.load(Ordering::Relaxed);
+        let followup = match store.list_queued_runs(thread_id).await {
+            Ok(queued) => defer_completion || !queued.is_empty(),
+            Err(error) => {
+                tracing::warn!(%error, %thread_id, "Could not check for queued follow-up runs");
+                defer_completion
+            }
+        };
         if notify_parent && !defer_completion {
             let child_error = error
                 .as_deref()
@@ -1771,6 +1783,7 @@ impl RunCoordinator {
             thread_id,
             run_id,
             status,
+            followup,
             error,
         });
         self.emit(WsServerMessage::ThreadStatusChanged {
@@ -2031,6 +2044,7 @@ impl RunCoordinator {
                     thread_id,
                     run_id,
                     status: RunStatus::RateLimited,
+                    followup: false,
                     error: Some(message.clone()),
                 });
                 out.terminal = Some((RunStatus::RateLimited, Some(message)));

@@ -1340,6 +1340,141 @@ fn resumed_run_verifies_and_rolls_back_edits_made_before_the_restart() {
 }
 
 #[tokio::test]
+async fn task_status_reports_the_latest_follow_up_run() {
+    let tmp = TempDir::new();
+    let workspace = tmp.0.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    git(&workspace, &["init", "-q"]);
+    std::fs::write(workspace.join("tracked.txt"), "before\n").unwrap();
+    git(&workspace, &["add", "tracked.txt"]);
+    git(
+        &workspace,
+        &[
+            "-c",
+            "user.name=T3 Test",
+            "-c",
+            "user.email=t3@example.test",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    let state = tmp.state(AuthConfig::LocalOnly);
+    let mut events = state.coordinator.subscribe();
+    let app = router(state);
+    let parent_id = create_parent(&app, &workspace).await;
+    let parent = json_req(
+        &app,
+        Method::GET,
+        &format!("/api/threads/{parent_id}"),
+        None,
+    )
+    .await;
+    let project_id = parent["thread"]["project_id"].as_str().unwrap();
+    json_req(
+        &app,
+        Method::PATCH,
+        &format!("/api/projects/{project_id}"),
+        Some(json!({
+            "verify_command": "test -e task-status-verify-marker || (touch task-status-verify-marker && false)"
+        })),
+    )
+    .await;
+    json_req(
+        &app,
+        Method::PATCH,
+        "/api/settings",
+        Some(json!({"verify_max_auto_fixes": 0})),
+    )
+    .await;
+
+    let started = mcp_tool(
+        &app,
+        "delegate_task",
+        json!({
+            "parent_thread_id":parent_id,"title":"Retry task","task":"[slow] first attempt",
+            "provider":"mock","model":"mock"
+        }),
+    )
+    .await;
+    let task_id: Uuid = serde_json::from_value(started["task_id"].clone()).unwrap();
+    let child_id: Uuid = serde_json::from_value(started["child_thread_id"].clone()).unwrap();
+    let first_run_id: Uuid = serde_json::from_value(started["run_id"].clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), WsServerMessage::Delta { thread_id, .. } if thread_id == child_id) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::write(workspace.join("tracked.txt"), "trigger verify\n").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let WsServerMessage::RunStatusChanged {
+                thread_id,
+                run_id,
+                status: RunStatus::Failed,
+                ..
+            } = events.recv().await.unwrap()
+                && thread_id == child_id
+                && run_id == first_run_id
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let failed = mcp_tool(&app, "task_status", json!({"task_id":task_id})).await;
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["run_id"], first_run_id.to_string());
+
+    let sent = mcp_tool(
+        &app,
+        "thread_send",
+        json!({"thread_id":child_id,"prompt":"[slow] second attempt succeeded"}),
+    )
+    .await;
+    let second_run_id = sent["run_id"].clone();
+    assert_ne!(first_run_id.to_string(), second_run_id.as_str().unwrap());
+
+    let in_progress = mcp_tool(&app, "task_status", json!({"task_id":task_id})).await;
+    assert_eq!(in_progress["status"], "running");
+    assert_eq!(in_progress["run_id"], second_run_id);
+
+    let second_run_id: Uuid = serde_json::from_value(second_run_id.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let WsServerMessage::RunStatusChanged {
+                thread_id,
+                run_id,
+                status: RunStatus::Completed,
+                ..
+            } = events.recv().await.unwrap()
+                && thread_id == child_id
+                && run_id == second_run_id
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    let completed = mcp_tool(&app, "task_status", json!({"task_id":task_id})).await;
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["run_id"], second_run_id.to_string());
+    assert!(
+        completed["summary"]
+            .as_str()
+            .unwrap()
+            .contains("second attempt succeeded")
+    );
+}
+
+#[tokio::test]
 async fn queue_and_delegated_cancellation() {
     let tmp = TempDir::new();
     let state = tmp.state(AuthConfig::LocalOnly);
@@ -1369,6 +1504,26 @@ async fn queue_and_delegated_cancellation() {
             item["run_id"] == queued["run_id"] && item["payload"]["text"] == "queued"
         })
     );
+    let first_run_id: Uuid = serde_json::from_value(first["run_id"].clone()).unwrap();
+    let followed_up = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let WsServerMessage::RunStatusChanged {
+                thread_id,
+                run_id,
+                status: RunStatus::Completed,
+                followup,
+                ..
+            } = events.recv().await.unwrap()
+                && thread_id == id
+                && run_id == first_run_id
+            {
+                break followup;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(followed_up);
     wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
     wait_for_thread(&mut events, id, ThreadStatus::Completed).await;
     let detail = json_req(&app, Method::GET, &path, None).await;
