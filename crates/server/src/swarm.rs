@@ -280,6 +280,15 @@ impl RunCoordinator {
             ));
         }
         let model_selection = worker_model(&parent.model_selection, &spec);
+        if let Some((hold, _)) = self.0.holds.blocking(&model_selection, None) {
+            return Err(CoreError::Provider(t3_providers::format_worker_error(
+                t3_providers::FailureClass::UsageLimit,
+                hold.provider,
+                hold.model.as_deref().unwrap_or(&model_selection.model),
+                Some(&hold.until.to_rfc3339()),
+                &hold.reason,
+            )));
+        }
         let worker = self
             .new_thread(
                 CreateThread {

@@ -1246,6 +1246,68 @@ fn write_private_file_with(
     result
 }
 
+#[allow(dead_code)]
+fn write_config_safely(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to write config through symlink: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            if !meta.file_type().is_file() {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("config path is not a regular file: {}", path.display()),
+                ));
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(parent)?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{}.{seq}", std::process::id()));
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = opts.open(&tmp_path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if write_res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2118,6 +2180,36 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&out_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_config_safely_creates_overwrites_and_rejects_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "t3-cli-cfg-safe-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+
+        write_config_safely(&cfg, b"model = \"gpt-6-luna\"\n").unwrap();
+        assert_eq!(fs::read(&cfg).unwrap(), b"model = \"gpt-6-luna\"\n");
+        write_config_safely(&cfg, b"model = \"claude-haiku-5-5\"\n").unwrap();
+        assert_eq!(fs::read(&cfg).unwrap(), b"model = \"claude-haiku-5-5\"\n");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let victim = dir.join("victim.txt");
+            let link = dir.join("linked.toml");
+            fs::write(&victim, b"keep-me").unwrap();
+            symlink(&victim, &link).unwrap();
+            let err = write_config_safely(&link, b"overwrite").unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+            assert_eq!(fs::read(&victim).unwrap(), b"keep-me");
         }
 
         let _ = fs::remove_dir_all(&dir);

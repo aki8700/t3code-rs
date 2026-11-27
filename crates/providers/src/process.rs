@@ -552,7 +552,10 @@ async fn run_turn_inner(
     let (close_tx, close_rx) = oneshot::channel();
     let (reader_stop_tx, reader_stop_rx) = oneshot::channel();
     let collect = async {
+        let stderr_limit = Arc::new(Mutex::new(None::<String>));
+        let stderr_stop = Arc::new(tokio::sync::Notify::new());
         let wait = async {
+            let wait_notify = Arc::clone(&stderr_stop);
             #[cfg(not(unix))]
             let status = tokio::select! {
                 status = child.wait() => status,
@@ -564,6 +567,10 @@ async fn run_turn_inner(
                     child.start_kill()?;
                     child.wait().await
                 }
+                _ = wait_notify.notified() => {
+                    child.start_kill()?;
+                    child.wait().await
+                }
             }?;
             #[cfg(unix)]
             {
@@ -571,6 +578,10 @@ async fn run_turn_inner(
                 let result = tokio::select! {
                     result = wait_for_exit(pid) => result,
                     Ok(()) = reader_stop_rx => {
+                        GroupCleanup(Some(pid)).kill();
+                        wait_for_exit(pid).await
+                    }
+                    _ = wait_notify.notified() => {
                         GroupCleanup(Some(pid)).kill();
                         wait_for_exit(pid).await
                     }
@@ -604,14 +615,37 @@ async fn run_turn_inner(
                 idle_timeout,
                 tool_profile,
             ),
-            read_tail(stderr),
+            read_tail_watching_limit(
+                stderr,
+                provider,
+                Arc::clone(&stderr_limit),
+                Arc::clone(&stderr_stop)
+            ),
             write_input(stdin, input, steer_rx, close_rx),
         )
+        .map(|(status, terminal, stderr, ())| {
+            (
+                status,
+                terminal,
+                stderr,
+                stderr_limit.lock().unwrap().clone(),
+            )
+        })
     };
-    let (status, terminal, stderr, ()) = tokio::select! {
+    let (status, terminal, stderr, fatal_stderr_limit) = tokio::select! {
         _ = tx.closed() => return Ok(()),
         result = collect => result.map_err(process_error)?,
     };
+
+    if let Some(limit_msg) = fatal_stderr_limit {
+        let _ = tx.send(StreamEvent::RateLimited {
+            retry_after_secs: 0,
+            message: limit_msg,
+            reset_at: None,
+            error_code: Some("usage_limit".into()),
+        });
+        return Ok(());
+    }
 
     let terminal = match terminal {
         ReadOutcome::Terminal(terminal) => terminal,
@@ -1000,6 +1034,69 @@ async fn read_tail(mut input: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
         let excess = (tail.len() + size).saturating_sub(STDERR_LIMIT);
         tail.drain(..excess);
         tail.extend_from_slice(&buf[..size]);
+    }
+}
+
+pub(crate) fn detect_fatal_stderr_limit(provider: ProviderId, line: &str) -> Option<&'static str> {
+    if provider == ProviderId::OpenCode
+        && line
+            .to_ascii_lowercase()
+            .contains("free usage limit reached")
+    {
+        Some("Free usage limit reached")
+    } else {
+        None
+    }
+}
+
+async fn read_tail_watching_limit(
+    mut input: impl AsyncRead + Unpin,
+    provider: ProviderId,
+    fatal_limit: Arc<Mutex<Option<String>>>,
+    stop_notify: Arc<tokio::sync::Notify>,
+) -> io::Result<Vec<u8>> {
+    let mut tail = Vec::new();
+    let mut line_buf = Vec::new();
+    let mut buf = [0; 4096];
+    loop {
+        let size = input.read(&mut buf).await?;
+        if size == 0 {
+            if !line_buf.is_empty() {
+                check_stderr_limit_line(&line_buf, provider, &fatal_limit, &stop_notify);
+            }
+            return Ok(tail);
+        }
+        let chunk = &buf[..size];
+        let excess = (tail.len() + size).saturating_sub(STDERR_LIMIT);
+        tail.drain(..excess);
+        tail.extend_from_slice(chunk);
+
+        for &byte in chunk {
+            if byte == b'\n' {
+                check_stderr_limit_line(&line_buf, provider, &fatal_limit, &stop_notify);
+                line_buf.clear();
+            } else if line_buf.len() < 4096 {
+                line_buf.push(byte);
+            }
+        }
+    }
+}
+
+fn check_stderr_limit_line(
+    raw: &[u8],
+    provider: ProviderId,
+    fatal_limit: &Mutex<Option<String>>,
+    stop_notify: &tokio::sync::Notify,
+) {
+    let line = String::from_utf8_lossy(raw);
+    if let Some(reason) = detect_fatal_stderr_limit(provider, &line) {
+        let mut guard = fatal_limit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_none() {
+            *guard = Some(format!("{reason}: {}", line.trim()));
+        }
+        stop_notify.notify_waiters();
     }
 }
 
@@ -2247,6 +2344,58 @@ printf '%s\n' '{"type":"control_cancel_request","request_id":"cli-req-1"}'
             payload: json!({}),
         };
         assert!(!send_control_response(&active, Uuid::new_v4(), &resp));
+    }
+
+    #[test]
+    fn detect_fatal_stderr_limit_matches_opencode_case_insensitively() {
+        assert_eq!(
+            detect_fatal_stderr_limit(
+                ProviderId::OpenCode,
+                "ERROR 2026-11-27T14:00:00Z Free Usage Limit Reached for model"
+            ),
+            Some("Free usage limit reached")
+        );
+        assert_eq!(
+            detect_fatal_stderr_limit(ProviderId::OpenCode, "WARN normal diagnostic line"),
+            None
+        );
+        assert_eq!(
+            detect_fatal_stderr_limit(ProviderId::Codex, "Free usage limit reached"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_stderr_free_usage_limit_triggers_immediate_stop() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut stderr_writer, stderr_reader) = tokio::io::duplex(1024);
+        let fatal_limit = Arc::new(Mutex::new(None));
+        let stop_notify = Arc::new(tokio::sync::Notify::new());
+
+        let tail_limit = Arc::clone(&fatal_limit);
+        let tail_notify = Arc::clone(&stop_notify);
+        let tail_task = tokio::spawn(async move {
+            read_tail_watching_limit(stderr_reader, ProviderId::OpenCode, tail_limit, tail_notify)
+                .await
+        });
+
+        let notified = stop_notify.notified();
+        stderr_writer
+            .write_all(b"INFO starting opencode\nERROR: Free usage limit reached\n")
+            .await
+            .unwrap();
+        stderr_writer.flush().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("stop_notify must fire immediately on OpenCode free usage limit");
+
+        drop(stderr_writer);
+        let tail = String::from_utf8_lossy(&tail_task.await.unwrap().unwrap()).into_owned();
+        assert!(tail.contains("Free usage limit reached"));
+        let recorded = fatal_limit.lock().unwrap().clone().unwrap();
+        assert!(recorded.contains("Free usage limit reached"));
     }
 }
 

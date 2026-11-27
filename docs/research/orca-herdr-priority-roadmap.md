@@ -111,7 +111,14 @@
   - **R2-2**: ワーカー初回規約に `code_index` / `code_slice` / `code_grep` 優先を明記。
   - **R2-3**: `handoff_summary` へセクション別（2.5KB）・全体（8KB）UTF-8 キャップ（`[truncated]`）を適用。
   - **R2-4**: `Cancelled` / `RateLimited` / `Failed` 終了時に直近の部分進捗（400 文字・`@` 無害化・4096B 上限）を `@coordinator` へサルベージ通知。
-- **保留／進行中**:
-  - **Muse Wave 2**（`2026-11-27-t3code-ui-wave2`：クライアント側 `seq` 欠番検知＋`web/js/thread-helpers.js` 分割）は `~/muse-handoff/tasks/` に公開済みで Muse 処理待ち。
-  - **DeepSeek**（`opencode/deepseek-v4.1-flash-free`）は上流 API が無応答タイムアウト（15 秒）だったため、該当実装は Gemini Mac アプリへフォールバック済み。
+- **Muse Wave 2 反映済み（`955bd9d`）**:
+  - `web/js/ui-guards.js` に `createSeqTracker` を追加し、`web/app.js` へ `events_lost` / `seq` 欠番検知と自動再同期を配線。
+  - `web/app.js` から純粋関数 19 件を `web/js/thread-helpers.js` へ分割し、`web/js/thread-helpers.test.mjs` を追加（`node --test` 計 71 件パス）。
+- **第 3 弾ハーネス改善反映済み（Gemini Mac アプリ）**:
+  - **R2-5**: `opencode_args` に `--print-logs --log-level ERROR` を付与し、`process.rs` の `read_tail_watching_limit` が `Free usage limit reached` を stderr から 1 秒未満で検知・即 `RateLimited` 終了するよう改善（60 秒無反応待ちを解消）。
+  - **R2-6**: `SwarmService::add_worker_locked` に `ProviderHolds` 事前ゲートを追加し、hold 中モデルでの空スレッド／ワークツリー作成を防止。
+  - **P1-3**: `Coordinator` に `ThreadStatusDeduper` を組み込み、同一 `ThreadStatusChanged` の連続 WS 送出を抑制。
+  - **P2-3**: `crates/cli/src/main.rs` に symlink 拒否＋`0o600` 原子的設定書き込み `write_config_safely` と単体テストを追加。
+- **保留／未着手**:
+  - **DeepSeek**（`opencode/deepseek-v4.1-flash-free`）は OpenCode 無料枠上限（`AI_APICallError: Free usage limit reached`）のため、該当実装はすべて Gemini Mac アプリへフォールバック済み。
   - **未着手（大改修枠）**: **G-1**（`coordinator.rs` `active` ロック縮小）、**P2-1**（Unix `pre_exec` `await_gate` パイプ）、**G-9**（巨大ファイル分割）。

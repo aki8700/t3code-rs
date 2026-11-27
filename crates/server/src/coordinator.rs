@@ -42,11 +42,31 @@ pub(crate) struct Coordinator {
     injection: McpInjectionSpec,
     tokens: McpTokens,
     limits: Arc<crate::limits::UsageLimitsCache>,
-    holds: ProviderHolds,
+    pub(crate) holds: ProviderHolds,
     user_runs: StdMutex<HashSet<Uuid>>,
     queued_tickets: StdMutex<HashMap<Uuid, watch::Sender<bool>>>,
     queued_chained_dones: StdMutex<HashMap<Uuid, Vec<watch::Sender<bool>>>>,
     pub(crate) wake_deliveries: crate::swarm::WakeDeliveries,
+    thread_status_deduper: ThreadStatusDeduper,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ThreadStatusDeduper {
+    last: StdMutex<HashMap<Uuid, ThreadStatus>>,
+}
+
+impl ThreadStatusDeduper {
+    pub(crate) fn should_emit(&self, thread_id: Uuid, status: ThreadStatus) -> bool {
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.get(&thread_id) == Some(&status) {
+            return false;
+        }
+        last.insert(thread_id, status);
+        true
+    }
 }
 
 const MAX_LIVE_CONTEXT_ENTRIES: usize = 256;
@@ -198,6 +218,7 @@ impl RunCoordinator {
             queued_tickets: StdMutex::default(),
             queued_chained_dones: StdMutex::default(),
             wake_deliveries: Default::default(),
+            thread_status_deduper: ThreadStatusDeduper::default(),
             events,
             active: Mutex::new(HashMap::new()),
             latest_context: Mutex::new(HashMap::new()),
@@ -484,6 +505,14 @@ impl RunCoordinator {
     }
 
     pub(crate) fn emit(&self, event: WsServerMessage) {
+        if let WsServerMessage::ThreadStatusChanged { thread_id, status } = &event
+            && !self
+                .0
+                .thread_status_deduper
+                .should_emit(*thread_id, *status)
+        {
+            return;
+        }
         let _ = self.0.events.send(event);
     }
 
@@ -2732,5 +2761,23 @@ mod output_tail_tests {
 
         assert!(prompt.contains("VERIFY_FINAL_LINE_MARKER"));
         assert!(summary.contains("VERIFY_FINAL_LINE_MARKER"));
+    }
+
+    #[test]
+    fn thread_status_deduper_suppresses_consecutive_identical_statuses() {
+        let deduper = ThreadStatusDeduper::default();
+        let t1 = Uuid::new_v4();
+        let t2 = Uuid::new_v4();
+
+        assert!(deduper.should_emit(t1, ThreadStatus::Running));
+        assert!(!deduper.should_emit(t1, ThreadStatus::Running));
+        assert!(!deduper.should_emit(t1, ThreadStatus::Running));
+
+        assert!(deduper.should_emit(t2, ThreadStatus::Running));
+        assert!(!deduper.should_emit(t2, ThreadStatus::Running));
+
+        assert!(deduper.should_emit(t1, ThreadStatus::Idle));
+        assert!(!deduper.should_emit(t1, ThreadStatus::Idle));
+        assert!(deduper.should_emit(t1, ThreadStatus::Running));
     }
 }
