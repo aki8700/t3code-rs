@@ -10,8 +10,10 @@ const LINE_REPEATS: usize = 8;
 const MAX_PERIOD: usize = 512;
 const BLOCK_REPEATS: usize = 6;
 const TOOL_LOOP_REPEATS: usize = 8;
-const FAILED_TOOL_WARN_REPEATS: usize = 2;
-const FAILED_TOOL_STOP_REPEATS: usize = 3;
+// OpenHands' StuckDetector stops after four identical action/observation pairs; agents often
+// retry a failing build a few times while fixing it, so warn on the third and stop on the fifth.
+const FAILED_TOOL_WARN_REPEATS: usize = 3;
+const FAILED_TOOL_STOP_REPEATS: usize = 5;
 
 /// Tool steps a provider has started but not yet finished.
 ///
@@ -486,42 +488,57 @@ mod tests {
         })
     }
 
+    fn expected(attempt: usize) -> ToolFailureAction {
+        if attempt >= FAILED_TOOL_STOP_REPEATS {
+            ToolFailureAction::Stop
+        } else if attempt == FAILED_TOOL_WARN_REPEATS {
+            ToolFailureAction::Warn
+        } else {
+            ToolFailureAction::None
+        }
+    }
+
+    fn fail_bash(watchdog: &mut ToolFailureWatchdog, id: &str, output: &str) -> ToolFailureAction {
+        let input = serde_json::json!({"command": "make build"});
+        assert_eq!(
+            watchdog.push(
+                TurnItemKind::ToolCall,
+                Some("Bash"),
+                &tool_call(id, "Bash", input)
+            ),
+            ToolFailureAction::None
+        );
+        watchdog.push(
+            TurnItemKind::ToolResult,
+            None,
+            &tool_result(id, true, output),
+        )
+    }
+
     #[test]
     fn repeated_failure_signature_warns_then_stops_across_read_only_results() {
         let mut watchdog = ToolFailureWatchdog::default();
-        let input = serde_json::json!({"command": "make build"});
-        for (id, elapsed) in [("b1", "10ms"), ("b2", "30ms"), ("b3", "50ms")] {
-            assert_eq!(
-                watchdog.push(
-                    TurnItemKind::ToolCall,
-                    Some("Bash"),
-                    &tool_call(id, "Bash", input.clone())
+        for attempt in 1..=FAILED_TOOL_STOP_REPEATS {
+            // A failing read in between is neutral.
+            watchdog.push(
+                TurnItemKind::ToolCall,
+                Some("Read"),
+                &tool_call(
+                    &format!("r{attempt}"),
+                    "Read",
+                    serde_json::json!({"file_path": "x"}),
                 ),
-                ToolFailureAction::None
             );
-            if id == "b2" {
-                watchdog.push(
-                    TurnItemKind::ToolCall,
-                    Some("Read"),
-                    &tool_call("r1", "Read", serde_json::json!({"file_path": "x"})),
-                );
-                watchdog.push(
-                    TurnItemKind::ToolResult,
-                    None,
-                    &tool_result("r1", true, "missing file"),
-                );
-            }
-            let result = tool_result(id, true, &format!("failed in {elapsed}"));
-            let action = watchdog.push(TurnItemKind::ToolResult, None, &result);
+            watchdog.push(
+                TurnItemKind::ToolResult,
+                None,
+                &tool_result(&format!("r{attempt}"), true, "missing file"),
+            );
+            // Elapsed times differ but normalize to the same signature.
+            let output = format!("failed in {}ms", attempt * 20);
             assert_eq!(
-                action,
-                if id == "b2" {
-                    ToolFailureAction::Warn
-                } else if id == "b3" {
-                    ToolFailureAction::Stop
-                } else {
-                    ToolFailureAction::None
-                }
+                fail_bash(&mut watchdog, &format!("b{attempt}"), &output),
+                expected(attempt)
             );
         }
     }
@@ -529,32 +546,16 @@ mod tests {
     #[test]
     fn success_of_a_tool_clears_its_failure_count_and_read_failures_are_neutral() {
         let mut watchdog = ToolFailureWatchdog::default();
-        let input = serde_json::json!({"command": "make build"});
-        for id in ["b1", "b2"] {
-            watchdog.push(
-                TurnItemKind::ToolCall,
-                Some("Bash"),
-                &tool_call(id, "Bash", input.clone()),
-            );
-            let action = watchdog.push(
-                TurnItemKind::ToolResult,
-                None,
-                &tool_result(id, true, "failed"),
-            );
+        for attempt in 1..FAILED_TOOL_STOP_REPEATS {
             assert_eq!(
-                action,
-                if id == "b2" {
-                    ToolFailureAction::Warn
-                } else {
-                    ToolFailureAction::None
-                }
+                fail_bash(&mut watchdog, &format!("a{attempt}"), "failed"),
+                expected(attempt)
             );
         }
-
         watchdog.push(
             TurnItemKind::ToolCall,
             Some("Bash"),
-            &tool_call("ok", "Bash", input.clone()),
+            &tool_call("ok", "Bash", serde_json::json!({"command": "make build"})),
         );
         assert_eq!(
             watchdog.push(
@@ -564,28 +565,14 @@ mod tests {
             ),
             ToolFailureAction::None
         );
-        for id in ["b3", "b4"] {
-            watchdog.push(
-                TurnItemKind::ToolCall,
-                Some("Bash"),
-                &tool_call(id, "Bash", input.clone()),
-            );
-            let action = watchdog.push(
-                TurnItemKind::ToolResult,
-                None,
-                &tool_result(id, true, "failed"),
-            );
+        // The count starts over after the success.
+        for attempt in 1..FAILED_TOOL_STOP_REPEATS {
             assert_eq!(
-                action,
-                if id == "b4" {
-                    ToolFailureAction::Warn
-                } else {
-                    ToolFailureAction::None
-                }
+                fail_bash(&mut watchdog, &format!("c{attempt}"), "failed"),
+                expected(attempt)
             );
         }
-
-        for id in ["r2", "r3", "r4"] {
+        for id in ["r2", "r3", "r4", "r5", "r6"] {
             watchdog.push(
                 TurnItemKind::ToolCall,
                 Some("Read"),

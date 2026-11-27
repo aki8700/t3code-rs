@@ -1363,6 +1363,10 @@ printf '%s\n' \
   '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b2","is_error":true,"content":"failed in 30ms"}]}}' \
   '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b3","name":"Bash","input":{"command":"make build"}}]}}' \
   '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b3","is_error":true,"content":"failed in 50ms"}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b4","name":"Bash","input":{"command":"make build"}}]}}' \
+  '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b4","is_error":true,"content":"failed in 80ms"}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b5","name":"Bash","input":{"command":"make build"}}]}}' \
+  '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b5","is_error":true,"content":"failed in 100ms"}]}}' \
   '{"type":"result","subtype":"success","result":"unexpected completion"}'
 "#,
         );
