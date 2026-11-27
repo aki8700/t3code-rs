@@ -32,7 +32,7 @@ use std::{
 use t3_core::{CoreError, CoreResult, McpInjectionSpec, ServerConfig, Store, create_private_dir};
 use t3_git::GitManager;
 use t3_mcp::McpServer;
-use t3_store::{DaemonLock, SqliteStore, acquire_daemon_lock};
+use t3_store::{DaemonLock, RecoveredRuns, SqliteStore, acquire_daemon_lock};
 use tokio::{net::TcpListener, sync::watch};
 use uuid::Uuid;
 
@@ -57,11 +57,15 @@ pub struct ServerState {
     shells: shell::ActiveShells,
     mcp: Arc<McpServer<RunCoordinator>>,
     daemon_lock: Arc<DaemonLock>,
-    startup_orphaned_threads: Vec<Uuid>,
 }
 
 impl ServerState {
     pub fn new(config: ServerConfig, server_url: String) -> CoreResult<Self> {
+        Self::recover(config, server_url).map(|(state, _)| state)
+    }
+
+    /// Like `new`, also returning the runs the previous server left in flight.
+    fn recover(config: ServerConfig, server_url: String) -> CoreResult<(Self, RecoveredRuns)> {
         let tokens = auth::McpTokens::default();
         let auth = AuthLayer::new(&config, tokens.clone())?;
         create_private_dir(&config.data_dir).map_err(storage_io)?;
@@ -84,7 +88,7 @@ impl ServerState {
             limits_cache.clone(),
             settings.clone(),
         );
-        Ok(Self {
+        let state = Self {
             mcp: Arc::new(McpServer::new(coordinator.clone())),
             coordinator,
             daemon_lock,
@@ -96,14 +100,8 @@ impl ServerState {
             usage_cache: Arc::new(Mutex::new(usage::UsageScanCache::default())),
             limits_cache,
             shells: shell::ActiveShells::default(),
-            startup_orphaned_threads: recovered.thread_ids,
-        })
-    }
-
-    async fn stop_startup_orphaned_processes(&mut self) {
-        for thread_id in self.startup_orphaned_threads.drain(..) {
-            resume::stop_orphaned_processes(thread_id).await;
-        }
+        };
+        Ok((state, recovered))
     }
 }
 
@@ -144,8 +142,11 @@ pub async fn serve(config: ServerConfig) -> CoreResult<()> {
         .transpose()
         .map_err(internal_io)?
         .unwrap_or(public_address);
-    let mut state = ServerState::new(config, format!("http://{mcp_address}"))?;
-    state.stop_startup_orphaned_processes().await;
+    let (state, recovered) = ServerState::recover(config, format!("http://{mcp_address}"))?;
+    // Cancelled runs never start again, so their processes are only stopped here.
+    for thread_id in recovered.thread_ids {
+        resume::stop_orphaned_processes(thread_id).await;
+    }
     prune_known_project_snapshots(&state.store).await;
     let coordinator = state.coordinator.clone();
     let _daemon_lock = state.daemon_lock.clone();
@@ -252,6 +253,7 @@ mod startup_tests {
         let dir = TempDir::new();
         let config = ServerConfig {
             data_dir: dir.0.join("server"),
+            port: 0,
             enabled_providers: vec![ProviderId::Mock],
             ..ServerConfig::default()
         };
@@ -358,10 +360,17 @@ mod startup_tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        let mut state = ServerState::new(config, "http://127.0.0.1:3774".into()).unwrap();
-        state.stop_startup_orphaned_processes().await;
-
-        let status = child.try_wait().unwrap();
+        let server = tokio::spawn(serve(config.clone()));
+        let mut status = None;
+        for _ in 0..100 {
+            status = child.try_wait().unwrap();
+            if status.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        server.abort();
+        let _ = server.await;
         if status.is_none() {
             let _ = child.kill();
             let _ = child.wait();
@@ -371,8 +380,9 @@ mod startup_tests {
             "leftover provider process was not stopped"
         );
         assert!(!status.unwrap().success());
+        let store = SqliteStore::open(config.db_path(), config.storage).unwrap();
         assert_eq!(
-            state.store.list_runs(thread.id).await.unwrap()[0].status,
+            store.list_runs(thread.id).await.unwrap()[0].status,
             RunStatus::Cancelled
         );
     }
