@@ -59,21 +59,31 @@ pub(crate) async fn stop_orphaned_processes(
         .await
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityProbe {
+    /// Recorded leader (pid == pgid, uid, start_time) is still present.
+    LeaderMatch,
+    /// Process group has no leader matching the recorded start_time, and no new leader recycled the pgid.
+    LeaderGone,
+    /// A different leader now owns this pgid (PGID recycled); never signal it.
+    Recycled,
+    /// Could not inspect the process table; never signal or clear pending rows.
+    Failed,
+}
+
 #[cfg(all(unix, test))]
 pub(crate) async fn stop_orphaned_processes_from_snapshot(
     orphan_processes: Vec<OrphanProcess>,
     ps: &str,
 ) -> Vec<OrphanProcess> {
     stop_orphaned_processes_from_snapshot_with_probe(orphan_processes, ps, |target| {
-        group_alive(target.process_group_id)
-            && matching_groups(
-                ps,
-                std::slice::from_ref(target),
-                unsafe { libc::getuid() },
-                unsafe { libc::getpgrp() },
-            )
-            .iter()
-            .any(|found| found == target)
+        if !group_alive(target.process_group_id) {
+            return IdentityProbe::LeaderGone;
+        }
+        probe_target_in_ps(ps, target, unsafe { libc::getuid() }, unsafe {
+            libc::getpgrp()
+        })
     })
     .await
 }
@@ -82,24 +92,24 @@ pub(crate) async fn stop_orphaned_processes_from_snapshot(
 async fn stop_orphaned_processes_from_snapshot_with_probe<F>(
     orphan_processes: Vec<OrphanProcess>,
     ps: &str,
-    identity_alive: F,
+    probe: F,
 ) -> Vec<OrphanProcess>
 where
-    F: Fn(&OrphanProcess) -> bool,
+    F: Fn(&OrphanProcess) -> IdentityProbe,
 {
     let groups = {
         // SAFETY: getuid and getpgrp have no preconditions.
         let (uid, own_group) = unsafe { (libc::getuid(), libc::getpgrp()) };
         matching_groups(ps, &orphan_processes, uid, own_group)
     };
-    stop_verified_groups(&orphan_processes, &groups, identity_alive).await
+    stop_verified_groups(&orphan_processes, &groups, probe).await
 }
 
 #[cfg(unix)]
 async fn stop_verified_groups(
     targets: &[OrphanProcess],
     groups: &[OrphanProcess],
-    identity_alive: impl Fn(&OrphanProcess) -> bool,
+    probe: impl Fn(&OrphanProcess) -> IdentityProbe,
 ) -> Vec<OrphanProcess> {
     for target in groups {
         tracing::warn!(%target.run_id, pgid = target.process_group_id, "Stopping a provider process left by the previous server");
@@ -113,11 +123,22 @@ async fn stop_verified_groups(
     }
     let survivors: Vec<_> = groups
         .iter()
-        .filter(|target| group_alive(target.process_group_id) && identity_alive(target))
+        .filter(|target| {
+            if !group_alive(target.process_group_id) {
+                return false;
+            }
+            // Send SIGKILL if either the original leader is still alive OR the leader
+            // exited on SIGTERM while un-recycled child processes remain in the group.
+            // Never SIGKILL on PGID recycle or ps probe failure.
+            matches!(
+                probe(target),
+                IdentityProbe::LeaderMatch | IdentityProbe::LeaderGone
+            )
+        })
         .cloned()
         .collect();
     for target in &survivors {
-        // SAFETY: the process table still contains the exact recorded leader identity.
+        // SAFETY: the group is verified not recycled and probe succeeded above.
         unsafe {
             libc::killpg(target.process_group_id, libc::SIGKILL);
         }
@@ -125,12 +146,15 @@ async fn stop_verified_groups(
     if !survivors.is_empty() {
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     }
-    let stopped: Vec<_> = targets
+    targets
         .iter()
-        .filter(|target| !identity_alive(target))
+        .filter(|target| match probe(target) {
+            IdentityProbe::Recycled => true,
+            IdentityProbe::LeaderGone => !group_alive(target.process_group_id),
+            IdentityProbe::LeaderMatch | IdentityProbe::Failed => false,
+        })
         .cloned()
-        .collect();
-    stopped
+        .collect()
 }
 
 #[cfg(not(unix))]
@@ -177,25 +201,58 @@ fn matching_groups(
 }
 
 #[cfg(unix)]
-fn process_identity_alive(target: &OrphanProcess) -> bool {
+fn probe_target_in_ps(
+    ps: &str,
+    target: &OrphanProcess,
+    uid: libc::uid_t,
+    own_group: libc::pid_t,
+) -> IdentityProbe {
+    if target.process_group_id <= 1 || target.process_group_id == own_group {
+        return IdentityProbe::Recycled;
+    }
+    for line in ps.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        let (Ok(pid), Ok(group), Ok(owner)) = (
+            fields[0].parse::<libc::pid_t>(),
+            fields[1].parse::<libc::pid_t>(),
+            fields[2].parse::<libc::uid_t>(),
+        ) else {
+            continue;
+        };
+        if pid == target.process_group_id && group == target.process_group_id {
+            let start_time = fields[3..8].join(" ");
+            return if owner == uid && start_time == target.start_time {
+                IdentityProbe::LeaderMatch
+            } else {
+                IdentityProbe::Recycled
+            };
+        }
+    }
+    IdentityProbe::LeaderGone
+}
+
+#[cfg(unix)]
+fn process_identity_alive(target: &OrphanProcess) -> IdentityProbe {
     let Ok(output) = Command::new("ps")
         .args(["-A", "-ww", "-o", "pid=,pgid=,uid=,lstart="])
         .env("LC_ALL", "C")
         .env("TZ", "UTC")
         .output()
     else {
-        // Failure to inspect the process table must never authorize SIGKILL or row deletion.
-        return true;
+        return IdentityProbe::Failed;
     };
-    output.status.success()
-        && matching_groups(
-            &String::from_utf8_lossy(&output.stdout),
-            std::slice::from_ref(target),
-            unsafe { libc::getuid() },
-            unsafe { libc::getpgrp() },
-        )
-        .iter()
-        .any(|found| found == target)
+    if !output.status.success() {
+        return IdentityProbe::Failed;
+    }
+    probe_target_in_ps(
+        &String::from_utf8_lossy(&output.stdout),
+        target,
+        unsafe { libc::getuid() },
+        unsafe { libc::getpgrp() },
+    )
 }
 
 #[cfg(unix)]

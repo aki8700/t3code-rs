@@ -278,7 +278,7 @@ impl SqliteStore {
         self.with_writer(move |connection| {
             connection
                 .execute(
-                    "DELETE FROM run_orphan_processes WHERE run_id = ?1",
+                    "DELETE FROM run_orphan_processes WHERE run_id = ?1 AND cleanup_pending = 0",
                     [run_id.to_string()],
                 )
                 .map_err(storage_error)?;
