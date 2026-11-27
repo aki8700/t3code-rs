@@ -1,9 +1,13 @@
+pub mod coalesce;
+pub use coalesce::RepoCoalescer;
+
 use std::{
     collections::HashMap,
     ffi::OsStr,
     io::ErrorKind,
     path::{Path, PathBuf},
     process::{Output, Stdio},
+    sync::OnceLock,
 };
 
 use ignore::{
@@ -440,7 +444,17 @@ impl GitManager {
     }
 
     pub async fn diff_summary(dir: &Path, ignore_whitespace: bool) -> CoreResult<DiffSummary> {
-        Self::diff_summary_with_budget(dir, ignore_whitespace, MAX_TOTAL_PATCH_BYTES).await
+        static COALESCER: OnceLock<RepoCoalescer<DiffSummary>> = OnceLock::new();
+        let mut key = dir.to_path_buf();
+        if ignore_whitespace {
+            key.push("\0ignore-whitespace");
+        }
+        COALESCER
+            .get_or_init(RepoCoalescer::new)
+            .run(&key, || {
+                Self::diff_summary_with_budget(dir, ignore_whitespace, MAX_TOTAL_PATCH_BYTES)
+            })
+            .await
     }
 
     async fn diff_summary_with_budget(
