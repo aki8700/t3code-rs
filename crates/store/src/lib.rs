@@ -37,6 +37,8 @@ pub struct RecoveredRuns {
     /// Runs put back in the queue to resume their provider session.
     pub resumed: Vec<Uuid>,
     pub cancelled: Vec<Uuid>,
+    /// Threads whose provider processes may still be running from the previous server.
+    pub thread_ids: Vec<Uuid>,
 }
 
 const MIGRATIONS: &[&str] = &[
@@ -394,6 +396,7 @@ impl SqliteStore {
         )?;
         let mut recovered = RecoveredRuns::default();
         for (run_id, thread_id, session) in in_flight {
+            recovered.thread_ids.push(thread_id);
             if let Some(session) = session {
                 transaction
                     .execute(

@@ -492,6 +492,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn second_restart_at_limit_returns_thread_id_for_orphan_cleanup() {
+        let (store, thread_id) = fixture().await;
+        let run_id = running_run(&store, thread_id, Some("session-1")).await;
+
+        assert_eq!(
+            store.recover_interrupted_runs().unwrap().thread_ids,
+            vec![thread_id]
+        );
+        store
+            .start_queued_run(run_id, mock_selection(), Some("session-1".into()))
+            .await
+            .unwrap();
+        let recovered = store.recover_interrupted_runs().unwrap();
+
+        assert_eq!(recovered.cancelled, vec![run_id]);
+        assert_eq!(recovered.thread_ids, vec![thread_id]);
+    }
+
+    #[tokio::test]
     async fn restart_cancels_runs_without_a_session_or_inputs() {
         let (store, thread_id) = fixture().await;
         let run_id = running_run(&store, thread_id, None).await;

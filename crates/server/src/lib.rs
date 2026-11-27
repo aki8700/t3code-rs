@@ -57,6 +57,7 @@ pub struct ServerState {
     shells: shell::ActiveShells,
     mcp: Arc<McpServer<RunCoordinator>>,
     daemon_lock: Arc<DaemonLock>,
+    startup_orphaned_threads: Vec<Uuid>,
 }
 
 impl ServerState {
@@ -66,7 +67,7 @@ impl ServerState {
         create_private_dir(&config.data_dir).map_err(storage_io)?;
         let daemon_lock = Arc::new(acquire_daemon_lock(&config.data_dir)?);
         let store = SqliteStore::open(config.db_path(), config.storage.clone())?;
-        store.recover_interrupted_runs()?;
+        let recovered = store.recover_interrupted_runs()?;
         let settings = settings::SettingsStore::load_or_init(&config);
         let injection = McpInjectionSpec {
             binary_path: std::env::current_exe().map_err(internal_io)?,
@@ -95,7 +96,14 @@ impl ServerState {
             usage_cache: Arc::new(Mutex::new(usage::UsageScanCache::default())),
             limits_cache,
             shells: shell::ActiveShells::default(),
+            startup_orphaned_threads: recovered.thread_ids,
         })
+    }
+
+    async fn stop_startup_orphaned_processes(&mut self) {
+        for thread_id in self.startup_orphaned_threads.drain(..) {
+            resume::stop_orphaned_processes(thread_id).await;
+        }
     }
 }
 
@@ -136,7 +144,8 @@ pub async fn serve(config: ServerConfig) -> CoreResult<()> {
         .transpose()
         .map_err(internal_io)?
         .unwrap_or(public_address);
-    let state = ServerState::new(config, format!("http://{mcp_address}"))?;
+    let mut state = ServerState::new(config, format!("http://{mcp_address}"))?;
+    state.stop_startup_orphaned_processes().await;
     prune_known_project_snapshots(&state.store).await;
     let coordinator = state.coordinator.clone();
     let _daemon_lock = state.daemon_lock.clone();
@@ -209,4 +218,162 @@ fn storage_io(error: io::Error) -> CoreError {
 
 fn internal_io(error: io::Error) -> CoreError {
     CoreError::Internal(error.to_string())
+}
+
+#[cfg(all(test, unix))]
+mod startup_tests {
+    use super::*;
+    use chrono::Utc;
+    use std::{os::unix::process::CommandExt, path::PathBuf};
+    use t3_core::{
+        InteractionMode, ModelSelection, NewTurnItem, ProviderId, Run, RunStatus, RuntimeMode,
+        Store, Thread, ThreadStatus, TurnItemKind,
+    };
+    use t3_store::QueuedRunInput;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("t3-startup-test-{}", Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn second_restart_at_resume_limit_stops_leftover_provider_process() {
+        let dir = TempDir::new();
+        let config = ServerConfig {
+            data_dir: dir.0.join("server"),
+            enabled_providers: vec![ProviderId::Mock],
+            ..ServerConfig::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let store = SqliteStore::open(config.db_path(), config.storage.clone()).unwrap();
+        let project = store
+            .create_project("Restart test".into(), dir.0.clone())
+            .await
+            .unwrap();
+        let selection = ModelSelection {
+            provider: ProviderId::Mock,
+            model: "mock".into(),
+            ..ModelSelection::default()
+        };
+        let now = Utc::now();
+        let thread = store
+            .create_thread(Thread {
+                id: Uuid::new_v4(),
+                project_id: project.id,
+                parent_thread_id: None,
+                relationship: None,
+                title: "Restart test".into(),
+                model_selection: selection.clone(),
+                runtime_mode: RuntimeMode::AutoAcceptEdits,
+                interaction_mode: InteractionMode::Plan,
+                status: ThreadStatus::Idle,
+                worktree_path: None,
+                branch: None,
+                provider_session_id: None,
+                archived: false,
+                pinned: false,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+        let run = Run {
+            id: Uuid::new_v4(),
+            thread_id: thread.id,
+            ordinal: 1,
+            provider: ProviderId::Mock,
+            model: "mock".into(),
+            effort: None,
+            status: RunStatus::Queued,
+            prompt: "queued".into(),
+            provider_session_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
+            duration_ms: None,
+            error_message: None,
+            started_at: now,
+            completed_at: None,
+        };
+        let run_id = run.id;
+        let _ = store
+            .enqueue_run(
+                run,
+                NewTurnItem {
+                    thread_id: thread.id,
+                    run_id,
+                    kind: TurnItemKind::UserMessage,
+                    summary: None,
+                    payload: serde_json::json!({"text": "queued"}),
+                    searchable_text: None,
+                },
+                QueuedRunInput {
+                    model_selection: selection.clone(),
+                    attachment_ids: Vec::new(),
+                    notify_parent: false,
+                    wake_depth: 0,
+                    mode_ceiling: None,
+                    verify_fix_depth: 0,
+                    last_verify_signature: None,
+                    verify_dead_ends: Vec::new(),
+                    fallback_attempts: 0,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .start_queued_run(run_id, selection.clone(), None)
+            .await
+            .unwrap();
+        store
+            .update_thread_session_id(thread.id, "session-1".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.recover_interrupted_runs().unwrap().resumed,
+            vec![run_id]
+        );
+        store
+            .start_queued_run(run_id, selection, Some("session-1".into()))
+            .await
+            .unwrap();
+        drop(store);
+
+        let thread_id = thread.id.to_string();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30; :", "sh", "--thread-id", thread_id.as_str()])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut state = ServerState::new(config, "http://127.0.0.1:3774".into()).unwrap();
+        state.stop_startup_orphaned_processes().await;
+
+        let status = child.try_wait().unwrap();
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            status.is_some(),
+            "leftover provider process was not stopped"
+        );
+        assert!(!status.unwrap().success());
+        assert_eq!(
+            state.store.list_runs(thread.id).await.unwrap()[0].status,
+            RunStatus::Cancelled
+        );
+    }
 }
