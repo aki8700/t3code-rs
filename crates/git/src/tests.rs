@@ -510,6 +510,45 @@ async fn remove_worktree_pins_uncommitted_work_under_snapshot_ref() {
 }
 
 #[tokio::test]
+async fn new_snapshot_prunes_expired_refs_and_keeps_younger_ones() {
+    let fixture = TempRepo::new().await;
+    fixture.write("tracked.txt", "base\n");
+    fixture.commit().await;
+    let now = chrono::Utc::now();
+    let expired = format!(
+        "refs/t3/snapshots/expired-{}",
+        (now - chrono::Duration::days(15)).format("%Y%m%dT%H%M%S%3fZ")
+    );
+    let recent = format!(
+        "refs/t3/snapshots/recent-{}",
+        (now - chrono::Duration::days(13)).format("%Y%m%dT%H%M%S%3fZ")
+    );
+    for reference in [&expired, &recent] {
+        git_output(&fixture.repo, &["update-ref", reference, "HEAD"])
+            .await
+            .unwrap();
+    }
+
+    let manager = GitManager::new(fixture.root.join("worktrees"));
+    let (worktree, _) = manager
+        .create_worktree(&fixture.repo, "retention", None)
+        .await
+        .unwrap();
+    fs::write(worktree.join("tracked.txt"), "edited\n").unwrap();
+    let snapshot = manager
+        .remove_worktree(&fixture.repo, &worktree)
+        .await
+        .unwrap()
+        .expect("dirty worktree is snapshotted");
+
+    let refs = snapshot_refs(&fixture.repo).await;
+    assert!(!refs.contains(&expired));
+    assert!(refs.contains(&recent));
+    assert!(refs.contains(&snapshot));
+    assert_eq!(refs.len(), 2);
+}
+
+#[tokio::test]
 async fn remove_worktree_skips_snapshot_for_clean_worktree() {
     let fixture = TempRepo::new().await;
     fixture.write(".gitignore", "ignored.log\n");

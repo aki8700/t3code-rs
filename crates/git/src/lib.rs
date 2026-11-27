@@ -18,6 +18,7 @@ const PATCH_LIMIT: usize = 200 * 1024;
 const MAX_TOTAL_PATCH_BYTES: usize = 2 * 1024 * 1024;
 const PATCH_TRUNCATED_MARKER: &str = "\n... [truncated]";
 const BUDGET_TRUNCATED_MARKER: &str = "[truncated: total diff patch budget exceeded]";
+const SNAPSHOT_RETENTION_DAYS: i64 = 14;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -323,6 +324,40 @@ impl GitManager {
         command.args(["worktree", "prune"]);
         checked_output(command, false).await?;
         Ok(())
+    }
+
+    /// Remove worktree snapshot refs whose timestamp in the ref name is over 14 days old.
+    /// Refs without the timestamp format used by `snapshot_worktree` are left untouched.
+    pub async fn prune_snapshots(repo_root: &Path) -> CoreResult<usize> {
+        let output = git_output(
+            repo_root,
+            &["for-each-ref", "--format=%(refname)", "refs/t3/snapshots/"],
+        )
+        .await?;
+        // The ref name stores milliseconds, so leave one millisecond of slack to avoid
+        // expiring a snapshot just before its full retention interval has elapsed.
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::days(SNAPSHOT_RETENTION_DAYS)
+            - chrono::Duration::milliseconds(1);
+        let mut pruned = 0;
+        for reference in String::from_utf8_lossy(&output).lines() {
+            let Some(timestamp) = reference
+                .rsplit_once('-')
+                .and_then(|(_, timestamp)| timestamp.strip_suffix('Z'))
+            else {
+                continue;
+            };
+            let Ok(created_at) =
+                chrono::NaiveDateTime::parse_from_str(timestamp, "%Y%m%dT%H%M%S%3f")
+            else {
+                continue;
+            };
+            if created_at.and_utc() < cutoff {
+                git_output(repo_root, &["update-ref", "-d", reference]).await?;
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
     }
 
     pub async fn create_worktree(
@@ -953,6 +988,9 @@ async fn snapshot_worktree(repo_root: &Path, worktree: &Path) -> CoreResult<Opti
     let sha = String::from_utf8_lossy(&sha).trim().to_owned();
     // The empty old value makes update-ref refuse to overwrite an existing snapshot.
     git_output(repo_root, &["update-ref", &refname, &sha, ""]).await?;
+    if let Err(error) = GitManager::prune_snapshots(repo_root).await {
+        tracing::warn!(%error, "Failed to prune expired worktree snapshots");
+    }
     Ok(Some(refname))
 }
 

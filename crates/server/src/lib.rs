@@ -29,7 +29,8 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use t3_core::{CoreError, CoreResult, McpInjectionSpec, ServerConfig, create_private_dir};
+use t3_core::{CoreError, CoreResult, McpInjectionSpec, ServerConfig, Store, create_private_dir};
+use t3_git::GitManager;
 use t3_mcp::McpServer;
 use t3_store::{DaemonLock, SqliteStore, acquire_daemon_lock};
 use tokio::{net::TcpListener, sync::watch};
@@ -136,6 +137,7 @@ pub async fn serve(config: ServerConfig) -> CoreResult<()> {
         .map_err(internal_io)?
         .unwrap_or(public_address);
     let state = ServerState::new(config, format!("http://{mcp_address}"))?;
+    prune_known_project_snapshots(&state.store).await;
     let coordinator = state.coordinator.clone();
     let _daemon_lock = state.daemon_lock.clone();
     coordinator.resume_queued_runs().await?;
@@ -178,6 +180,23 @@ pub async fn serve(config: ServerConfig) -> CoreResult<()> {
         }
     }
     .map_err(internal_io)
+}
+
+async fn prune_known_project_snapshots(store: &SqliteStore) {
+    let projects = match store.list_projects().await {
+        Ok(projects) => projects,
+        Err(error) => {
+            tracing::warn!(%error, "Failed to load projects for snapshot retention");
+            return;
+        }
+    };
+    for project in projects {
+        if GitManager::is_git_repo(&project.workspace_root).await
+            && let Err(error) = GitManager::prune_snapshots(&project.workspace_root).await
+        {
+            tracing::warn!(project = %project.id, path = %project.workspace_root.display(), %error, "Failed to prune expired worktree snapshots");
+        }
+    }
 }
 
 async fn wait_for_shutdown(mut stop: watch::Receiver<bool>) {
