@@ -398,7 +398,10 @@ fn answer(nodes: &[&Value], prompt: &str) -> Option<String> {
                 matches!(
                     node["role"].as_str(),
                     Some("AXTextArea" | "AXStaticText" | "AXHeading" | "AXLink")
-                )
+                ) || (node["role"].as_str() == Some("AXButton")
+                    && node["identifier"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("code-widget-")))
             })
             .filter_map(|node| {
                 node["value"]
@@ -652,4 +655,76 @@ async fn wait_for_answer(
     Err(failure(
         "送信後に回答を取得できませんでした。再送前に Gemini のチャットを確認してください",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn options_parse_accepts_valid_flags_and_double_dash() {
+        let opts = Options::parse("--model hydrogen --effort high hello world").unwrap();
+        assert_eq!(opts.model, Some("hydrogen"));
+        assert_eq!(opts.effort, Some("high"));
+        assert!(!opts.new);
+        assert_eq!(opts.prompt, "hello world");
+
+        let opts_new = Options::parse("--new --model auto hi").unwrap();
+        assert!(opts_new.new);
+        assert_eq!(opts_new.model, Some("auto"));
+        assert_eq!(opts_new.prompt, "hi");
+
+        let opts_dash = Options::parse("-- --flag-like prompt").unwrap();
+        assert_eq!(opts_dash.prompt, "--flag-like prompt");
+    }
+
+    #[test]
+    fn options_parse_rejects_invalid_inputs() {
+        assert!(Options::parse("--model unknown hello").is_err());
+        assert!(Options::parse("--effort ultra hello").is_err());
+        assert!(Options::parse("   \n\t  ").is_err());
+        assert!(Options::parse("--model hydrogen").is_err());
+        assert!(Options::parse(&"a".repeat(16 * 1024)).is_ok());
+        assert!(Options::parse(&"a".repeat(16 * 1024 + 1)).is_err());
+        assert!(Options::parse("hello\0world").is_err());
+    }
+
+    #[test]
+    fn model_label_and_effort_option_match_japanese_and_english() {
+        let auto_ja = json!({"description": "自動"});
+        let auto_en = json!({"description": "Auto"});
+        assert!(model_label(&auto_ja, "auto"));
+        assert!(model_label(&auto_en, "auto"));
+
+        let controls = [
+            json!({"role": "AXButton", "description": "低、高速", "states": ["enabled"]}),
+            json!({"role": "AXButton", "description": "標準", "states": ["enabled"]}),
+            json!({"role": "AXButton", "description": "高、深い推論", "states": ["enabled"]}),
+        ];
+        let refs: Vec<&Value> = controls.iter().collect();
+        assert!(effort_option(&refs, "low").is_some());
+        assert!(effort_option(&refs, "standard").is_some());
+        assert!(effort_option(&refs, "high").is_some());
+    }
+
+    #[test]
+    fn answer_extracts_static_text_textarea_and_code_widget() {
+        let prompt = "Write Rust add";
+        let tree = json!([
+            {"role": "AXHeading", "description": prompt},
+            {
+                "role": "AXRow",
+                "children": [
+                    {"role": "AXButton", "identifier": "code-widget-copy-1", "description": "pub fn add(a: i32, b: i32) -> i32 { a + b }"},
+                    {"role": "AXTextArea", "value": "Explanation here"},
+                    {"role": "AXButton", "identifier": "copy-button", "states": ["enabled"]}
+                ]
+            }
+        ]);
+        let mut flat = Vec::new();
+        walk(tree.as_array().unwrap(), &mut flat);
+        let extracted = answer(&flat, prompt).expect("answer should be extracted");
+        assert!(extracted.contains("pub fn add(a: i32, b: i32)"));
+        assert!(extracted.contains("Explanation here"));
+    }
 }

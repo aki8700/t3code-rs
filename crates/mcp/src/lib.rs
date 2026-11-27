@@ -10,10 +10,49 @@ use std::sync::OnceLock;
 use t3_core::*;
 use uuid::Uuid;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingHint {
+    pub task_type: String,
+    pub recommended_provider: String,
+    pub recommended_model: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Capabilities {
     pub providers: Vec<ProviderHealth>,
     pub model_tiers: Vec<ModelSpec>,
+    #[serde(default)]
+    pub routing_hints: Vec<RoutingHint>,
+}
+
+pub fn default_routing_hints() -> Vec<RoutingHint> {
+    vec![
+        RoutingHint {
+            task_type: "explore/read".to_owned(),
+            recommended_provider: "Tier1Fast".to_owned(),
+            recommended_model: "Tier1Fast".to_owned(),
+            notes: "Fast codebase exploration, file reads, and targeted search".to_owned(),
+        },
+        RoutingHint {
+            task_type: "design/review".to_owned(),
+            recommended_provider: "/gemini".to_owned(),
+            recommended_model: "Gemini macOS app (0 API tokens)".to_owned(),
+            notes: "Design, review, and standalone code generation via Gemini Mac app".to_owned(),
+        },
+        RoutingHint {
+            task_type: "impl".to_owned(),
+            recommended_provider: "codex/haiku".to_owned(),
+            recommended_model: "gpt-6-luna / claude-haiku-5-5".to_owned(),
+            notes: "Scoped implementation and unit-tested edits".to_owned(),
+        },
+        RoutingHint {
+            task_type: "ui".to_owned(),
+            recommended_provider: "muse-handoff".to_owned(),
+            recommended_model: "Muse app".to_owned(),
+            notes: "Web UI layout, modularization, and node --test suites".to_owned(),
+        },
+    ]
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -1129,6 +1168,7 @@ pub(crate) mod tests {
             Ok(Capabilities {
                 providers: vec![],
                 model_tiers: vec![],
+                routing_hints: default_routing_hints(),
             })
         }
 
@@ -1247,6 +1287,7 @@ pub(crate) mod tests {
             Ok(Capabilities {
                 providers: vec![],
                 model_tiers: vec![],
+                routing_hints: default_routing_hints(),
             })
         }
         async fn delegate(
@@ -1800,6 +1841,7 @@ pub(crate) mod tests {
             Ok(Capabilities {
                 providers: Vec::new(),
                 model_tiers: Vec::new(),
+                routing_hints: default_routing_hints(),
             })
         }
         async fn delegate(
@@ -1880,5 +1922,24 @@ pub(crate) mod tests {
                     .contains("not available in worker profile")
             );
         }
+    }
+
+    #[test]
+    fn default_routing_hints_cover_all_core_roles_and_roundtrip() {
+        let hints = default_routing_hints();
+        assert_eq!(hints.len(), 4);
+        assert_eq!(hints[0].task_type, "explore/read");
+        assert_eq!(hints[1].recommended_provider, "/gemini");
+        assert_eq!(hints[3].recommended_provider, "muse-handoff");
+
+        let caps = Capabilities {
+            providers: vec![],
+            model_tiers: vec![],
+            routing_hints: hints.clone(),
+        };
+        let mut val = serde_json::to_value(&caps).unwrap();
+        val.as_object_mut().unwrap().remove("routing_hints");
+        let decoded: Capabilities = serde_json::from_value(val).unwrap();
+        assert!(decoded.routing_hints.is_empty());
     }
 }

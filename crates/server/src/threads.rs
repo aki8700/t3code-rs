@@ -1217,6 +1217,7 @@ impl OrchestratorBackend for RunCoordinator {
         Ok(Capabilities {
             providers,
             model_tiers,
+            routing_hints: t3_mcp::default_routing_hints(),
         })
     }
 

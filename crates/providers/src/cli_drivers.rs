@@ -1214,4 +1214,21 @@ mod tests {
         assert_eq!(worker_tools.len(), WORKER_PREAPPROVED_TOOLS.len());
         assert!(worker_tools.iter().all(|t| !t.contains("swarm_add_worker")));
     }
+
+    #[test]
+    fn codex_and_claude_resume_args_are_deterministic_for_prompt_cache() {
+        let codex_req = request(ProviderId::Codex);
+        let mut c1 = Command::new("codex");
+        codex_args(&mut c1, &codex_req);
+        let mut c2 = Command::new("codex");
+        codex_args(&mut c2, &codex_req);
+        assert_eq!(args(&c1), args(&c2));
+
+        let claude_req = request(ProviderId::Claude);
+        let mut k1 = Command::new("claude");
+        claude_args(&mut k1, &claude_req);
+        let mut k2 = Command::new("claude");
+        claude_args(&mut k2, &claude_req);
+        assert_eq!(args(&k1), args(&k2));
+    }
 }

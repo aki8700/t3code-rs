@@ -45,6 +45,7 @@ impl OrchestratorBackend for Backend {
         Ok(Capabilities {
             providers: vec![],
             model_tiers: vec![],
+            routing_hints: t3_mcp::default_routing_hints(),
         })
     }
 

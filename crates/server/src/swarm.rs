@@ -1585,4 +1585,53 @@ mod tests {
             .is_ok()
         );
     }
+
+    #[test]
+    fn prompt_prefix_remains_byte_identical_when_members_change() {
+        let board_id = Uuid::new_v4();
+        let coord = member("coordinator", "coordinator", "working");
+        let worker_a = member("worker-a", "worker", "waiting");
+        let worker_b = member("worker-b", "worker", "working");
+        let board_v1 = SwarmBoardSnapshot {
+            board_id,
+            coordinator_thread_id: coord.thread_id,
+            title: "cache".into(),
+            members: vec![coord.clone(), worker_a.clone()],
+            messages: Vec::new(),
+            head_seq: 0,
+        };
+        let board_v2 = SwarmBoardSnapshot {
+            board_id,
+            coordinator_thread_id: coord.thread_id,
+            title: "cache".into(),
+            members: vec![coord.clone(), worker_a, worker_b],
+            messages: Vec::new(),
+            head_seq: 0,
+        };
+        let base_prompt = "PROJECT RULES: Keep diffs minimal.\n\nImplement feature X.";
+        for resumed in [false, true] {
+            let mut p1 = base_prompt.to_owned();
+            SwarmTurn::prepare(
+                &board_v1,
+                coord.thread_id,
+                ProviderId::Codex,
+                resumed,
+                &mut p1,
+            )
+            .unwrap();
+            let mut p2 = base_prompt.to_owned();
+            SwarmTurn::prepare(
+                &board_v2,
+                coord.thread_id,
+                ProviderId::Codex,
+                resumed,
+                &mut p2,
+            )
+            .unwrap();
+            let (prefix1, tail1) = p1.split_once("Members: ").expect("Members tail");
+            let (prefix2, tail2) = p2.split_once("Members: ").expect("Members tail");
+            assert_eq!(prefix1.as_bytes(), prefix2.as_bytes());
+            assert_ne!(tail1, tail2);
+        }
+    }
 }
