@@ -3,7 +3,13 @@
 //! A restart forgets every hold; the first run after it rediscovers the limit.
 
 use chrono::{DateTime, Duration, Utc};
-use std::{collections::HashSet, sync::Mutex};
+use std::{
+    collections::HashSet,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use t3_core::{ModelSelection, ProviderId};
 use uuid::Uuid;
 
@@ -22,9 +28,29 @@ struct Entry {
 }
 
 #[derive(Default)]
-pub(crate) struct ProviderHolds(Mutex<Vec<Entry>>);
+pub(crate) struct ProviderHolds(Mutex<Vec<Entry>>, AtomicBool, Mutex<HashSet<Uuid>>);
 
 impl ProviderHolds {
+    pub(crate) fn set_paused(&self, paused: bool) {
+        self.1.store(paused, Ordering::Release);
+        if !paused {
+            self.2.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.1.load(Ordering::Acquire)
+    }
+
+    /// Returns true after the run has already received the pause reason.
+    pub(crate) fn pause_blocking(&self, run_id: Uuid) -> Option<bool> {
+        if !self.is_paused() {
+            return None;
+        }
+        let mut announced = self.2.lock().unwrap_or_else(|e| e.into_inner());
+        self.is_paused().then(|| !announced.insert(run_id))
+    }
+
     /// Records a limit and returns true when it extends the hold, so the caller schedules a wake.
     pub(crate) fn record(&self, hold: ProviderHold) -> bool {
         let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -218,5 +244,19 @@ mod tests {
                 .blocking(&selection(ProviderId::Claude, "claude-sonnet-5-5"), None)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pause_all_blocks_unattended_runs_and_announces_each_once() {
+        let holds = ProviderHolds::default();
+        let run = Uuid::new_v4();
+        assert!(!holds.is_paused());
+        holds.set_paused(true);
+        assert!(holds.is_paused());
+        assert_eq!(holds.pause_blocking(run), Some(false));
+        assert_eq!(holds.pause_blocking(run), Some(true));
+        holds.set_paused(false);
+        assert!(!holds.is_paused());
+        assert_eq!(holds.pause_blocking(run), None);
     }
 }

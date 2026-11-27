@@ -116,6 +116,34 @@ impl SqliteStore {
         .await
     }
 
+    pub async fn queued_run(&self, thread_id: Uuid, run_id: Uuid) -> CoreResult<Option<QueuedRun>> {
+        self.with_reader(move |connection| {
+            connection
+                .query_row(
+                    "SELECT runs.id, runs.prompt, inputs.input_json,
+                CASE WHEN runs.restart_resumes > 0 THEN runs.provider_session_id END
+             FROM runs JOIN queued_run_inputs AS inputs ON inputs.run_id = runs.id
+             WHERE runs.thread_id = ?1 AND runs.id = ?2 AND runs.status = ?3",
+                    params![
+                        thread_id.to_string(),
+                        run_id.to_string(),
+                        encode(&RunStatus::Queued)?
+                    ],
+                    |row| {
+                        Ok(QueuedRun {
+                            id: parse(row, 0)?,
+                            prompt: row.get(1)?,
+                            input: decode(row, 2)?,
+                            restart_session: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(storage_error)
+        })
+        .await
+    }
+
     pub async fn list_queued_runs(&self, thread_id: Uuid) -> CoreResult<Vec<Run>> {
         self.with_reader(move |connection| {
             query_all(

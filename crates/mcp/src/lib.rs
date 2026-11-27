@@ -162,6 +162,11 @@ pub struct SwarmReadMessage {
     pub truncated: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct PauseAllInput {
+    paused: bool,
+}
+
 #[async_trait]
 pub trait OrchestratorBackend: Send + Sync {
     async fn get_thread(&self, id: Uuid) -> CoreResult<Thread>;
@@ -209,6 +214,11 @@ pub trait OrchestratorBackend: Send + Sync {
     ) -> CoreResult<Uuid>;
     async fn thread_fork(&self, thread_id: Uuid, options: ForkOptions) -> CoreResult<Thread>;
     async fn orch_stats(&self) -> CoreResult<Vec<OrchModelStat>>;
+    async fn pause_all(&self, _paused: bool) -> CoreResult<bool> {
+        Err(CoreError::InvalidArgument(
+            "pause-all is unsupported by this backend".into(),
+        ))
+    }
     async fn swarm_status(&self, _thread_id: Uuid) -> CoreResult<Option<SwarmStatusResult>> {
         swarm_unsupported()
     }
@@ -359,6 +369,10 @@ impl<B: OrchestratorBackend> McpServer<B> {
         let CallContext { thread_id, caller } = context;
         match name {
             "orchestrator_capabilities" => encode(backend.capabilities().await?),
+            "pause_all" => {
+                let args: PauseAllInput = decode(args)?;
+                encode(backend.pause_all(args.paused).await?)
+            }
             "swarm_status" => {
                 let args: SwarmStatus = decode(args)?;
                 encode(
@@ -786,6 +800,12 @@ fn tools() -> Vec<Value> {
             "List provider health and curated models by tier.",
             json!({}),
             &[],
+        ),
+        make(
+            "pause_all",
+            "Pause or resume unattended run dispatch for this server. Running turns finish and direct user messages can still start.",
+            json!({"paused": {"type": "boolean"}}),
+            &["paused"],
         ),
         make(
             "swarm_status",
