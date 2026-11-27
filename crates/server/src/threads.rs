@@ -1042,7 +1042,9 @@ impl RunCoordinator {
                 continue;
             }
             let status = match base_ref.as_deref() {
-                Some(base_ref) => GitManager::worktree_branch_status(path, base_ref).await.ok(),
+                Some(base_ref) => GitManager::worktree_branch_status(path, base_ref)
+                    .await
+                    .ok(),
                 None => None,
             };
             let mut report = WorktreeChange {
