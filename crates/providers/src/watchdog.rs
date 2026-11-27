@@ -10,10 +10,10 @@ const LINE_REPEATS: usize = 8;
 const MAX_PERIOD: usize = 512;
 const BLOCK_REPEATS: usize = 6;
 const TOOL_LOOP_REPEATS: usize = 8;
-// OpenHands' StuckDetector stops after four identical action/observation pairs; agents often
-// retry a failing build a few times while fixing it, so warn on the third and stop on the fifth.
-const FAILED_TOOL_WARN_REPEATS: usize = 3;
-const FAILED_TOOL_STOP_REPEATS: usize = 5;
+// Allow one identical retry for recovery, then warn and stop before repeated failures
+// consume several minutes. The full call and normalized error must still match.
+const FAILED_TOOL_WARN_REPEATS: usize = 2;
+const FAILED_TOOL_STOP_REPEATS: usize = 4;
 
 /// Tool steps a provider has started but not yet finished.
 ///
@@ -541,6 +541,29 @@ mod tests {
                 expected(attempt)
             );
         }
+    }
+
+    #[test]
+    fn warns_on_second_identical_failure_and_stops_on_fourth() {
+        assert_eq!(FAILED_TOOL_WARN_REPEATS, 2);
+        assert_eq!(FAILED_TOOL_STOP_REPEATS, 4);
+        let mut watchdog = ToolFailureWatchdog::default();
+        assert_eq!(
+            fail_bash(&mut watchdog, "first", "failed"),
+            ToolFailureAction::None
+        );
+        assert_eq!(
+            fail_bash(&mut watchdog, "second", "failed"),
+            ToolFailureAction::Warn
+        );
+        assert_eq!(
+            fail_bash(&mut watchdog, "third", "failed"),
+            ToolFailureAction::None
+        );
+        assert_eq!(
+            fail_bash(&mut watchdog, "fourth", "failed"),
+            ToolFailureAction::Stop
+        );
     }
 
     #[test]
