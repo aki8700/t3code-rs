@@ -14,6 +14,132 @@ const TOOL_LOOP_REPEATS: usize = 8;
 // consume several minutes. The full call and normalized error must still match.
 const FAILED_TOOL_WARN_REPEATS: usize = 2;
 const FAILED_TOOL_STOP_REPEATS: usize = 4;
+const DEFAULT_SOFT_TOOL_BUDGET: usize = 40;
+const DEFAULT_HARD_TOOL_BUDGET: usize = 80;
+const DEFAULT_SOFT_TOKEN_BUDGET: u64 = 4_000_000;
+const DEFAULT_HARD_TOKEN_BUDGET: u64 = 8_000_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BudgetAction {
+    None,
+    Warn(String),
+    Stop(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TurnBudgetWatchdog {
+    tool_calls: usize,
+    total_tokens: u64,
+    warned: bool,
+    soft_tool_calls: usize,
+    hard_tool_calls: usize,
+    soft_tokens: u64,
+    hard_tokens: u64,
+}
+
+impl Default for TurnBudgetWatchdog {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl TurnBudgetWatchdog {
+    pub(crate) fn from_env() -> Self {
+        let soft_tool_calls = env_usize("T3_SOFT_TOOL_BUDGET", DEFAULT_SOFT_TOOL_BUDGET);
+        let hard_tool_calls =
+            env_usize("T3_HARD_TOOL_BUDGET", DEFAULT_HARD_TOOL_BUDGET).max(soft_tool_calls);
+        let soft_tokens = env_u64("T3_SOFT_TOKEN_BUDGET", DEFAULT_SOFT_TOKEN_BUDGET);
+        let hard_tokens =
+            env_u64("T3_HARD_TOKEN_BUDGET", DEFAULT_HARD_TOKEN_BUDGET).max(soft_tokens);
+        Self {
+            tool_calls: 0,
+            total_tokens: 0,
+            warned: false,
+            soft_tool_calls,
+            hard_tool_calls,
+            soft_tokens,
+            hard_tokens,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits(
+        soft_tool_calls: usize,
+        hard_tool_calls: usize,
+        soft_tokens: u64,
+        hard_tokens: u64,
+    ) -> Self {
+        Self {
+            tool_calls: 0,
+            total_tokens: 0,
+            warned: false,
+            soft_tool_calls,
+            hard_tool_calls,
+            soft_tokens,
+            hard_tokens,
+        }
+    }
+
+    pub(crate) fn on_tool_call(&mut self) -> BudgetAction {
+        self.tool_calls = self.tool_calls.saturating_add(1);
+        if self.tool_calls >= self.hard_tool_calls {
+            return BudgetAction::Stop(format!(
+                "turn budget exceeded: {} tool calls reached hard limit of {}",
+                self.tool_calls, self.hard_tool_calls
+            ));
+        }
+        if self.tool_calls >= self.soft_tool_calls && !self.warned {
+            self.warned = true;
+            return BudgetAction::Warn(format!(
+                "[automatic notice] Turn budget warning: {} of {} soft tool calls used (hard stop at {}). Post an intermediate status update, narrow scope, or change strategy instead of repeating tool calls.",
+                self.tool_calls, self.soft_tool_calls, self.hard_tool_calls
+            ));
+        }
+        BudgetAction::None
+    }
+
+    pub(crate) fn on_usage(
+        &mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+    ) -> BudgetAction {
+        let snapshot_total = input_tokens
+            .saturating_add(output_tokens)
+            .saturating_add(cache_read_tokens);
+        self.total_tokens = self.total_tokens.max(snapshot_total);
+        if self.total_tokens >= self.hard_tokens {
+            return BudgetAction::Stop(format!(
+                "turn budget exceeded: {} tokens reached hard limit of {}",
+                self.total_tokens, self.hard_tokens
+            ));
+        }
+        if self.total_tokens >= self.soft_tokens && !self.warned {
+            self.warned = true;
+            return BudgetAction::Warn(format!(
+                "[automatic notice] Turn budget warning: {} of {} soft token budget used (hard stop at {}). Report intermediate progress and wrap up or switch strategy before the hard stop.",
+                self.total_tokens, self.soft_tokens, self.hard_tokens
+            ));
+        }
+        BudgetAction::None
+    }
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(default)
+}
 
 /// Tool steps a provider has started but not yet finished.
 ///
@@ -736,5 +862,43 @@ mod tests {
         for _ in 0..10 {
             assert!(!watchdog.push(TurnItemKind::ToolCall, None, &Value::Null));
         }
+    }
+
+    #[test]
+    fn tool_budget_warns_once_and_stops_at_hard_limit() {
+        let mut watchdog = TurnBudgetWatchdog::with_limits(3, 5, 10_000, 20_000);
+        assert_eq!(watchdog.on_tool_call(), BudgetAction::None);
+        assert_eq!(watchdog.on_tool_call(), BudgetAction::None);
+        assert!(matches!(watchdog.on_tool_call(), BudgetAction::Warn(_)));
+        assert_eq!(watchdog.on_tool_call(), BudgetAction::None);
+        assert!(matches!(watchdog.on_tool_call(), BudgetAction::Stop(_)));
+    }
+
+    #[test]
+    fn token_budget_tracks_max_and_enforces_soft_and_hard_limits() {
+        let mut watchdog = TurnBudgetWatchdog::with_limits(100, 200, 1_000, 2_500);
+        assert_eq!(watchdog.on_usage(500, 200, 100), BudgetAction::None);
+        assert!(matches!(
+            watchdog.on_usage(800, 200, 100),
+            BudgetAction::Warn(_)
+        ));
+        assert_eq!(watchdog.on_usage(400, 100, 50), BudgetAction::None);
+        assert_eq!(watchdog.total_tokens, 1_100);
+        assert!(matches!(
+            watchdog.on_usage(1_500, 500, 600),
+            BudgetAction::Stop(_)
+        ));
+    }
+
+    #[test]
+    fn soft_warning_only_fires_once_across_tools_and_tokens() {
+        let mut watchdog = TurnBudgetWatchdog::with_limits(2, 10, 500, 5_000);
+        assert_eq!(watchdog.on_tool_call(), BudgetAction::None);
+        assert!(matches!(watchdog.on_tool_call(), BudgetAction::Warn(_)));
+        assert_eq!(watchdog.on_usage(400, 200, 0), BudgetAction::None);
+        assert!(matches!(
+            watchdog.on_usage(4_000, 1_000, 0),
+            BudgetAction::Stop(_)
+        ));
     }
 }

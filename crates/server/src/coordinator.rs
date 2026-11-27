@@ -1910,6 +1910,17 @@ impl RunCoordinator {
                 until,
                 reason,
             });
+        } else if status == RunStatus::Completed {
+            self.0.holds.record_success(&thread.model_selection);
+        } else if status == RunStatus::Failed && outcome.provider != ProviderId::Mock {
+            let reason = error.as_deref().unwrap_or("run failed");
+            if let Some(hold) =
+                self.0
+                    .holds
+                    .record_failure(&thread.model_selection, reason, Utc::now())
+            {
+                self.hold_provider(hold);
+            }
         }
         let mut enqueued_followup = false;
         let mut followup_run_id = None;

@@ -2,7 +2,8 @@ use crate::{
     parsers::{Parser, provider_error},
     retry::TOOL_FAILURE_LOOP_ERROR_CODE,
     watchdog::{
-        InFlightTools, RepetitionWatchdog, ToolFailureAction, ToolFailureWatchdog, ToolLoopWatchdog,
+        BudgetAction, InFlightTools, RepetitionWatchdog, ToolFailureAction, ToolFailureWatchdog,
+        ToolLoopWatchdog, TurnBudgetWatchdog,
     },
 };
 use serde_json::{Value, json};
@@ -43,27 +44,43 @@ const MIN_IDLE_TIMEOUT_SECS: u64 = 60;
 const MAX_IDLE_TIMEOUT_SECS: u64 = 3600;
 const IDLE_TIMEOUT_ENV: &str = "T3_IDLE_TIMEOUT_SECS";
 const LEGACY_IDLE_STDOUT_TIMEOUT_ENV: &str = "T3_IDLE_STDOUT_TIMEOUT_SECS";
+const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 60;
+const MIN_STARTUP_TIMEOUT_SECS: u64 = 15;
+const STARTUP_TIMEOUT_ENV: &str = "T3_STARTUP_TIMEOUT_SECS";
 /// While a tool step is running the idle limit is stretched by this factor
 /// (default 900 s -> 1 h), so a hung tool is still stopped eventually.
 const IN_FLIGHT_TOOL_IDLE_FACTOR: u32 = 4;
 const TOOL_FAILURE_LOOP_NOTICE: &str = "[automatic notice] This tool call has failed with the same result twice. Stop retrying it and change the command, inputs, or approach. One more identical failure will stop the run.";
 
+fn startup_timeout(idle_timeout: Duration) -> Duration {
+    let secs = std::env::var(STARTUP_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STARTUP_TIMEOUT_SECS)
+        .max(MIN_STARTUP_TIMEOUT_SECS);
+    Duration::from_secs(secs).min(idle_timeout)
+}
+
+fn warn_agent(
+    steer: Option<&mpsc::UnboundedSender<StdinMsg>>,
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    notice: &str,
+) {
+    let steered = steer.is_some_and(|steer| steer.send(StdinMsg::Steer(notice.to_owned())).is_ok());
+    if !steered {
+        let _ = tx.send(StreamEvent::Item {
+            kind: TurnItemKind::SystemNotice,
+            summary: Some(notice.to_owned()),
+            payload: json!({ "message": notice }),
+        });
+    }
+}
+
 fn warn_agent_of_tool_failure(
     steer: Option<&mpsc::UnboundedSender<StdinMsg>>,
     tx: &mpsc::UnboundedSender<StreamEvent>,
 ) {
-    let steered = steer.is_some_and(|steer| {
-        steer
-            .send(StdinMsg::Steer(TOOL_FAILURE_LOOP_NOTICE.to_owned()))
-            .is_ok()
-    });
-    if !steered {
-        let _ = tx.send(StreamEvent::Item {
-            kind: TurnItemKind::SystemNotice,
-            summary: Some(TOOL_FAILURE_LOOP_NOTICE.to_owned()),
-            payload: json!({ "message": TOOL_FAILURE_LOOP_NOTICE }),
-        });
-    }
+    warn_agent(steer, tx, TOOL_FAILURE_LOOP_NOTICE);
 }
 
 /// Messages written to a streaming provider's stdin while the turn is open.
@@ -727,11 +744,18 @@ async fn read_events(
     let mut reasoning = RepetitionWatchdog::default();
     let mut tool_loop = ToolLoopWatchdog::default();
     let mut failed_tools = ToolFailureWatchdog::default();
+    let mut budget = TurnBudgetWatchdog::from_env();
     let mut in_flight = InFlightTools::default();
+    let startup_limit = startup_timeout(idle_timeout);
+    let mut saw_first_event = false;
     loop {
-        let wait = match in_flight.oldest() {
-            Some(_) => idle_timeout * IN_FLIGHT_TOOL_IDLE_FACTOR,
-            None => idle_timeout,
+        let wait = if !saw_first_event {
+            startup_limit.min(idle_timeout)
+        } else {
+            match in_flight.oldest() {
+                Some(_) => idle_timeout * IN_FLIGHT_TOOL_IDLE_FACTOR,
+                None => idle_timeout,
+            }
         };
         // A CLI waiting for the user's approval is silent by design, so an unanswered
         // request (or one answered during this wait) re-arms the idle limit.
@@ -745,6 +769,15 @@ async fn read_events(
                 let stopped = stop_process.send(()).is_ok();
                 if let Some(event) = terminal {
                     return Ok(after_stop(stopped, event));
+                }
+                if !saw_first_event {
+                    return Ok(ReadOutcome::Stopped(
+                        format!(
+                            "provider produced no startup output within {}s",
+                            wait.as_secs()
+                        )
+                        .into(),
+                    ));
                 }
                 return Ok(ReadOutcome::Stopped(match in_flight.oldest() {
                     Some(tool) => format!(
@@ -776,6 +809,7 @@ async fn read_events(
             }
         }
         if let Ok(mut value) = serde_json::from_slice(&line) {
+            saw_first_event = true;
             if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
                 redact_value(&mut value, secret);
             }
@@ -795,6 +829,7 @@ async fn read_events(
                     });
             }
             for event in parser.parse(&value) {
+                saw_first_event = true;
                 if let StreamEvent::PendingApproval { request } = &event
                     && let Some(provider_request_id) =
                         request.payload["_provider_request_id"].as_str()
@@ -827,6 +862,31 @@ async fn read_events(
                             ));
                         }
                         ToolFailureAction::None => {}
+                    }
+                    let budget_action = match &event {
+                        StreamEvent::Item {
+                            kind: TurnItemKind::ToolCall | TurnItemKind::CommandExecution,
+                            ..
+                        } => budget.on_tool_call(),
+                        StreamEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens,
+                            ..
+                        } => budget.on_usage(
+                            input_tokens.unwrap_or(0),
+                            output_tokens.unwrap_or(0),
+                            cache_read_tokens.unwrap_or(0),
+                        ),
+                        _ => BudgetAction::None,
+                    };
+                    match budget_action {
+                        BudgetAction::None => {}
+                        BudgetAction::Warn(msg) => warn_agent(steer, tx, &msg),
+                        BudgetAction::Stop(msg) => {
+                            let _ = stop_process.send(());
+                            return Ok(ReadOutcome::Stopped(msg.into()));
+                        }
                     }
                     let stop_reason = match &event {
                         StreamEvent::AssistantDelta { text } if assistant.push(text) => Some(
