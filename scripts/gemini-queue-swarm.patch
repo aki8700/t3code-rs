@@ -1,8 +1,28 @@
 --- a/gemini-queue
 +++ b/gemini-queue
-@@ -213,4 +213,21 @@
+@@ -213,4 +213,41 @@
      return text.encode()[:limit].decode("utf-8", "ignore")
 
++def queue_coordinator():
++    if parent := os.environ.get("T3_SWARM_THREAD_ID"):
++        return parent
++    saved = Q / f"swarm-{PROJECT}.thread"
++    if saved.exists():
++        parent = saved.read_text().strip()
++        try:
++            with urllib.request.urlopen(f"{BASE}/api/threads/{parent}?limit=1", timeout=30) as response:
++                if not json.load(response)["thread"]["archived"]:
++                    return parent
++        except urllib.error.HTTPError as error:
++            if error.code != 404:
++                raise
++    parent = post("/api/threads", {"project_id": PROJECT, "title": "Gemini queue"})["id"]
++    # The queue runner holds its process lock across tasks.
++    pending = saved.with_suffix(".tmp")
++    pending.write_text(parent)
++    pending.replace(saved)
++    return parent
++
 +def worker_answer(thread_id, run_id=None):
 +    # A desktop session may spend time waiting behind other workers.
 +    while True:
@@ -22,12 +42,11 @@
 +
  def converse(title, body, blobs, model, effort, part=PART):
      global PART
-@@ -228,10 +245,10 @@
+@@ -228,10 +265,9 @@
      if len(parts) > MAX_PARTS:
          raise RuntimeError(f"{len(parts)} parts > {MAX_PARTS}; split the task")
 -    tid = post("/api/threads", {"project_id": PROJECT, "title": f"gemini-queue {title}"})["id"]
-+    parent = os.environ.get("T3_SWARM_THREAD_ID") or post(
-+        "/api/threads", {"project_id": PROJECT, "title": f"gemini-queue {title}"})["id"]
++    parent = queue_coordinator()
 +    name = "gemini-" + os.urandom(6).hex()
      n, answer = len(parts), ""
      for i, chunk in enumerate(parts, 1):
@@ -37,7 +56,7 @@
 +        text = f"{body}\n\n" if i == 1 else "続き。"
          if n > 1:
              text += f"資料 {i}/{n}:\n```\n{chunk}```\n"
-@@ -242,5 +259,13 @@
+@@ -242,5 +278,13 @@
          if len(text.encode()) > 16384:
              raise RuntimeError(f"message {i} is {len(text.encode())} bytes")
 -        answer = ask(tid, text)
