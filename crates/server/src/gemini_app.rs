@@ -174,6 +174,9 @@ async fn ask_app(
     )
     .await
     .map_err(|_| failure("回答が15分以内に完了しませんでした"))??;
+    // The accessibility text drops long code blocks (a diff came back as its
+    // prose only), so prefer the app's own Markdown copy of the finished reply.
+    let answer = copy_answer(&desktop).await.unwrap_or(answer);
     Ok((
         answer,
         ModelSelection {
@@ -183,6 +186,49 @@ async fn ask_app(
             agent: None,
         },
     ))
+}
+
+/// Presses the newest 回答をコピー button and reads the Markdown from the clipboard,
+/// restoring the user's previous plain-text clipboard afterwards.
+async fn copy_answer(desktop: &Desktop<'_>) -> Option<String> {
+    let snapshot = desktop.snapshot_query(None).await.ok()?;
+    let controls = nodes(&snapshot);
+    let copy = controls
+        .iter()
+        .rev()
+        .copied()
+        .find(|n| n["role"] == "AXButton" && n["identifier"] == "copy-button")?;
+    let saved = clipboard().await;
+    let _ = set_clipboard("").await;
+    desktop.press_node(copy).await.ok()?;
+    let mut copied = None;
+    for _ in 0..10 {
+        sleep(Duration::from_millis(200)).await;
+        if let Some(text) = clipboard().await.filter(|t| !t.trim().is_empty()) {
+            copied = Some(text);
+            break;
+        }
+    }
+    let _ = set_clipboard(saved.as_deref().unwrap_or("")).await;
+    copied
+}
+
+async fn clipboard() -> Option<String> {
+    let out = Command::new("pbpaste").output().await.ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+async fn set_clipboard(text: &str) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes()).await?;
+    }
+    child.wait().await.map(drop)
 }
 
 fn failure(message: &str) -> CoreError {
