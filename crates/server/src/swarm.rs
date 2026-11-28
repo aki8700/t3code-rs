@@ -1,5 +1,5 @@
 use crate::{
-    coordinator::{ActiveRun, Message, RunCoordinator},
+    coordinator::{Message, RunCoordinator, ThreadGuard},
     threads::CreateThread,
 };
 use chrono::{DateTime, Utc};
@@ -95,6 +95,8 @@ pub(crate) enum Action {
 }
 
 pub(crate) struct SwarmTurn {
+    pub(crate) board_id: Uuid,
+    pub(crate) worker_name: Option<String>,
     marker: Option<String>,
 }
 
@@ -109,13 +111,18 @@ impl SwarmTurn {
         let member = live_member(board, thread_id)?;
         let marker =
             (provider != ProviderId::Mock).then(|| format!("T3_SWARM_ACTION {}", board.board_id));
+        let turn = Self {
+            board_id: board.board_id,
+            worker_name: (member.role != "coordinator").then(|| member.name.clone()),
+            marker,
+        };
         if resumed {
             let mut instructions = format!("Swarm board {} ({}).\n", board.board_id, member.name);
-            if marker.is_some() {
+            if turn.marker.is_some() {
                 append_live_members(&mut instructions, board);
             }
             *prompt = format!("{prompt}\n\n{instructions}");
-            return Ok(Self { marker });
+            return Ok(turn);
         }
         let coordinator = member.role == "coordinator";
         let report = format!(
@@ -129,7 +136,7 @@ impl SwarmTurn {
             "Swarm board {}. You are {}.\n{instructions}\n",
             board.board_id, member.name
         );
-        if let Some(marker) = &marker {
+        if let Some(marker) = &turn.marker {
             let examples = if coordinator {
                 r#"{"tool":"swarm_add_worker","name":"reviewer","brief":"Review the changes"}
 {"tool":"swarm_post_message","text":"@reviewer Focus on error handling"}
@@ -144,7 +151,7 @@ impl SwarmTurn {
             append_live_members(&mut instructions, board);
         }
         *prompt = format!("{prompt}\n\n{instructions}");
-        Ok(Self { marker })
+        Ok(turn)
     }
 
     pub(crate) fn actions(&self, output: &str) -> Vec<Action> {
@@ -178,6 +185,23 @@ impl RunCoordinator {
             .ok_or_else(|| CoreError::NotFound("swarm board".into()))
     }
 
+    async fn lock_board(
+        &self,
+        thread_id: Uuid,
+    ) -> CoreResult<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        let board = self.require_board(thread_id).await?;
+        Ok(self.0.board_locks.get(board.board_id).write_owned().await)
+    }
+
+    async fn wake_depth(&self, id: Uuid) -> u8 {
+        self.0
+            .active
+            .lock()
+            .await
+            .get(&id)
+            .map_or(0, |run| run.wake_depth)
+    }
+
     pub(crate) async fn ensure_board(&self, thread: &Thread) -> CoreResult<()> {
         if self.get_board(thread.id).await?.is_none() {
             let board = self.0.store.ensure_swarm_board(thread.clone()).await?;
@@ -205,13 +229,9 @@ impl RunCoordinator {
         Ok(())
     }
 
-    async fn effective_thread(
-        &self,
-        active: &HashMap<Uuid, ActiveRun>,
-        id: Uuid,
-    ) -> CoreResult<Thread> {
+    async fn effective_thread(&self, id: Uuid) -> CoreResult<Thread> {
         let mut thread = self.0.store.get_thread(id).await?;
-        if let Some(run) = active.get(&id) {
+        if let Some(run) = self.0.active.lock().await.get(&id) {
             thread.runtime_mode = thread.runtime_mode.min(run.runtime_mode);
             if run.interaction_mode == InteractionMode::Plan {
                 thread.interaction_mode = InteractionMode::Plan;
@@ -225,16 +245,18 @@ impl RunCoordinator {
         caller: Uuid,
         spec: SwarmWorkerSpec,
     ) -> CoreResult<SwarmMember> {
-        let mut active = self.0.active.lock().await;
-        self.add_worker_locked(&mut active, caller, spec).await
+        let _board = self.lock_board(caller).await?;
+        let guard = self.lock_thread(caller).await;
+        self.add_worker_locked(&guard, caller, spec).await
     }
 
     async fn add_worker_locked(
         &self,
-        active: &mut HashMap<Uuid, ActiveRun>,
+        guard: &ThreadGuard,
         caller_id: Uuid,
         spec: SwarmWorkerSpec,
     ) -> CoreResult<SwarmMember> {
+        debug_assert_eq!(guard.id, caller_id);
         self.ensure_accepting_runs()?;
         if !valid_name(&spec.name) || matches!(spec.name.as_str(), "all" | "coordinator" | "user") {
             return Err(CoreError::InvalidArgument(
@@ -259,13 +281,13 @@ impl RunCoordinator {
                 "swarm allows at most {MAX_ACTIVE_WORKERS} active workers"
             )));
         }
-        let depth = wake_depth(active, caller_id);
+        let depth = self.wake_depth(caller_id).await;
         if depth >= MAX_WAKE_DEPTH {
             return Err(CoreError::InvalidArgument(
                 "maximum swarm wake depth reached".into(),
             ));
         }
-        let caller = self.effective_thread(active, caller_id).await?;
+        let caller = self.effective_thread(caller_id).await?;
         let parent = store.get_thread(board.coordinator_thread_id).await?;
         if !can_dispatch(&caller, &parent) {
             return Err(CoreError::InvalidArgument(
@@ -289,8 +311,10 @@ impl RunCoordinator {
                 &hold.reason,
             )));
         }
+        let worker_guard = self.lock_thread(Uuid::new_v4()).await;
         let worker = self
-            .new_thread(
+            .new_thread_locked(
+                &worker_guard,
                 CreateThread {
                     project_id: parent.project_id,
                     title: spec.name.clone(),
@@ -328,7 +352,7 @@ impl RunCoordinator {
             let prompt = format!("Your swarm brief from {}:\n{}", actor.name, spec.brief);
             let run_id = self
                 .send_locked(
-                    active,
+                    &worker_guard,
                     worker.clone(),
                     queued_message(prompt),
                     depth + 1,
@@ -351,7 +375,7 @@ impl RunCoordinator {
         }
         .await;
         if let Err(error) = result {
-            if !active.contains_key(&worker.id) {
+            if !self.0.active.lock().await.contains_key(&worker.id) {
                 self.discard_thread(&worker).await;
                 if spec.isolation == IsolationMode::Worktree
                     && let Some(path) = &worker.worktree_path
@@ -393,9 +417,10 @@ impl RunCoordinator {
         sender_override: Option<&str>,
         text: String,
     ) -> CoreResult<(SwarmBoardSnapshot, SwarmPostResult)> {
-        let mut active = self.0.active.lock().await;
-        let depth = wake_depth(&active, caller_id);
-        self.post_locked(&mut active, caller_id, sender_override, text, depth)
+        let _board = self.lock_board(caller_id).await?;
+        let guard = self.lock_thread(caller_id).await;
+        let depth = self.wake_depth(caller_id).await;
+        self.post_locked(&guard, caller_id, sender_override, text, depth)
             .await
     }
 
@@ -403,7 +428,7 @@ impl RunCoordinator {
     /// depth of the run they report on, so notices cannot wake members forever.
     async fn post_locked(
         &self,
-        active: &mut HashMap<Uuid, ActiveRun>,
+        guard: &ThreadGuard,
         caller_id: Uuid,
         sender_override: Option<&str>,
         text: String,
@@ -417,12 +442,12 @@ impl RunCoordinator {
             let member = live_member(&board, caller_id)?;
             (
                 member.name.clone(),
-                Some(self.effective_thread(active, caller_id).await?),
+                Some(self.effective_thread(caller_id).await?),
             )
         };
         let mentions = mentions_in(&text);
         let sender_run_id = if sender_override.is_none() {
-            active.get(&caller_id).map(|run| run.id)
+            self.0.active.lock().await.get(&caller_id).map(|run| run.id)
         } else {
             None
         };
@@ -457,7 +482,7 @@ impl RunCoordinator {
         } else {
             for member in targets {
                 match self
-                    .wake_member(active, member, caller.as_ref(), next_wake_depth(depth))
+                    .wake_member(guard, member, caller.as_ref(), next_wake_depth(depth))
                     .await
                 {
                     Ok(true) => woken.push(member.name.clone()),
@@ -482,18 +507,29 @@ impl RunCoordinator {
 
     async fn wake_member(
         &self,
-        active: &mut HashMap<Uuid, ActiveRun>,
+        guard: &ThreadGuard,
         member: &SwarmMember,
         caller: Option<&Thread>,
         depth: u8,
     ) -> CoreResult<bool> {
-        self.wake_member_with_retry(active, member, caller, depth, None, 0)
+        let target;
+        let guard = if guard.id == member.thread_id {
+            guard
+        } else {
+            target = self.lock_thread(member.thread_id).await;
+            &target
+        };
+        // The target can finish a run and advance its read cursor before we
+        // acquire its thread lock. Deliver only the posts still unread now.
+        let board = self.require_board(guard.id).await?;
+        let member = live_member(&board, guard.id)?;
+        self.wake_member_with_retry(guard, member, caller, depth, None, 0)
             .await
     }
 
     async fn wake_member_with_retry(
         &self,
-        active: &mut HashMap<Uuid, ActiveRun>,
+        guard: &ThreadGuard,
         member: &SwarmMember,
         caller: Option<&Thread>,
         depth: u8,
@@ -501,6 +537,7 @@ impl RunCoordinator {
         redeliveries: u8,
     ) -> CoreResult<bool> {
         let store = &self.0.store;
+        debug_assert_eq!(guard.id, member.thread_id);
         let target = store.get_thread(member.thread_id).await?;
         if target.archived || caller.is_some_and(|caller| !can_dispatch(caller, &target)) {
             return Ok(false);
@@ -512,7 +549,7 @@ impl RunCoordinator {
         // At most one queued wake per member: a wake still waiting in the queue is replaced
         // by one that carries every unread post, so posts arriving while the member is busy
         // cost one turn instead of one turn each. Only the running run's posts are skipped.
-        let (running_range, mut preserved) = self.supersede_queued_wakes(active, target.id).await?;
+        let (running_range, mut preserved) = self.supersede_queued_wakes(target.id).await?;
         let mut cursor = skip_contiguous_running_range(member.last_read_seq, running_range);
         let mut woken = false;
         loop {
@@ -520,7 +557,7 @@ impl RunCoordinator {
                 .list_swarm_messages(member.board_id, cursor, WAKE_BATCH)
                 .await?;
             let Some(last) = messages.last() else {
-                self.cancel_trailing_wakes(target.id, preserved).await?;
+                self.cancel_trailing_wakes(guard, preserved).await?;
                 return Ok(woken);
             };
             let unread = messages
@@ -576,7 +613,7 @@ impl RunCoordinator {
                         message.mode_ceiling =
                             stricter_mode_ceiling(delivery.mode_ceiling, effective_ceiling);
                         self.send_locked(
-                            active,
+                            guard,
                             target.clone(),
                             message,
                             coalesced_wake_depth(delivery.wake_depth, depth),
@@ -587,7 +624,7 @@ impl RunCoordinator {
                 } else {
                     let mut message = queued_message(prompt);
                     message.mode_ceiling = effective_ceiling;
-                    self.send_locked(active, target.clone(), message, depth, false)
+                    self.send_locked(guard, target.clone(), message, depth, false)
                         .await?
                 };
                 if queued.is_none() {
@@ -613,7 +650,7 @@ impl RunCoordinator {
             }
             cursor = last.seq;
             if messages.len() < WAKE_BATCH {
-                self.cancel_trailing_wakes(target.id, preserved).await?;
+                self.cancel_trailing_wakes(guard, preserved).await?;
                 return Ok(woken);
             }
         }
@@ -672,11 +709,10 @@ impl RunCoordinator {
     /// and the preserved queued delivery.
     async fn supersede_queued_wakes(
         &self,
-        active: &HashMap<Uuid, ActiveRun>,
         thread_id: Uuid,
     ) -> CoreResult<((i64, i64), Vec<WakeDelivery>)> {
         self.ensure_deliveries_loaded(thread_id).await?;
-        let running = active.get(&thread_id).map(|run| run.id);
+        let running = self.0.active.lock().await.get(&thread_id).map(|run| run.id);
         let (running_range, preserved, remaining_rows) = {
             let mut deliveries = self.deliveries();
             let Some(list) = deliveries.get_mut(&thread_id) else {
@@ -717,7 +753,7 @@ impl RunCoordinator {
 
     async fn cancel_trailing_wakes(
         &self,
-        thread_id: Uuid,
+        guard: &ThreadGuard,
         trailing: Vec<WakeDelivery>,
     ) -> CoreResult<()> {
         let mut ids = trailing
@@ -726,7 +762,7 @@ impl RunCoordinator {
             .collect::<Vec<_>>();
         ids.dedup();
         for id in ids {
-            self.cancel_queued_locked(thread_id, id).await?;
+            self.cancel_queued_locked(guard, id).await?;
         }
         Ok(())
     }
@@ -736,7 +772,7 @@ impl RunCoordinator {
     /// so that wake is rebuilt from the acknowledged cursor.
     pub(crate) async fn settle_wake(
         &self,
-        active: &mut HashMap<Uuid, ActiveRun>,
+        guard: &ThreadGuard,
         thread_id: Uuid,
         run_id: Uuid,
         status: RunStatus,
@@ -825,7 +861,7 @@ impl RunCoordinator {
             .iter()
             .find(|member| member.thread_id == thread_id && member.state != "killed")
         {
-            self.wake_member_with_retry(active, member, None, depth, mode_ceiling, attempts + 1)
+            self.wake_member_with_retry(guard, member, None, depth, mode_ceiling, attempts + 1)
                 .await?;
         }
         Ok(())
@@ -837,7 +873,7 @@ impl RunCoordinator {
     /// coordinator turn finishes first and then picks it up.
     pub(crate) async fn notify_worker_ended_silently(
         &self,
-        active: &mut HashMap<Uuid, ActiveRun>,
+        guard: &ThreadGuard,
         thread_id: Uuid,
         run_id: Uuid,
         run_started_at: DateTime<Utc>,
@@ -888,8 +924,11 @@ impl RunCoordinator {
         // The ended run is still registered, so a coordinator that keeps re-waking a
         // silent worker accumulates depth even though it is idle between its turns.
         let coordinator = board.coordinator_thread_id;
-        let depth = wake_depth(active, thread_id).max(wake_depth(active, coordinator));
-        self.post_locked(active, coordinator, Some("system"), text, depth)
+        let depth = self
+            .wake_depth(thread_id)
+            .await
+            .max(self.wake_depth(coordinator).await);
+        self.post_locked(guard, coordinator, Some("system"), text, depth)
             .await?;
         Ok(())
     }
@@ -940,8 +979,9 @@ impl RunCoordinator {
         from_agent: bool,
     ) -> CoreResult<SwarmBoardSnapshot> {
         let done = {
-            let mut active = self.0.active.lock().await;
-            self.kill_worker_locked(&mut active, caller_id, name, from_agent)
+            let _board = self.lock_board(caller_id).await?;
+            let guard = self.lock_thread(caller_id).await;
+            self.kill_worker_locked(&guard, caller_id, name, from_agent)
                 .await?
         };
         if let Some(mut done) = done {
@@ -952,7 +992,7 @@ impl RunCoordinator {
 
     async fn kill_worker_locked(
         &self,
-        active: &mut HashMap<Uuid, ActiveRun>,
+        guard: &ThreadGuard,
         caller_id: Uuid,
         name: &str,
         from_agent: bool,
@@ -965,7 +1005,7 @@ impl RunCoordinator {
             .ok_or_else(|| CoreError::NotFound("swarm worker".into()))?;
         if from_agent {
             let caller = live_member(&board, caller_id)?;
-            let actor = self.effective_thread(active, caller_id).await?;
+            let actor = self.effective_thread(caller_id).await?;
             let target = self.0.store.get_thread(member.thread_id).await?;
             if caller.role != "coordinator" || !can_dispatch(&actor, &target) {
                 return Err(CoreError::InvalidArgument(
@@ -974,8 +1014,15 @@ impl RunCoordinator {
             }
         }
         let thread_id = member.thread_id;
+        let target;
+        let guard = if guard.id == thread_id {
+            guard
+        } else {
+            target = self.lock_thread(thread_id).await;
+            &target
+        };
         self.swarm_state(thread_id, "killed").await?;
-        let done = self.interrupt_locked(active, thread_id).await?;
+        let done = self.interrupt_locked(guard).await?;
         self.0
             .store
             .update_thread_status(thread_id, ThreadStatus::Interrupted)
@@ -1024,6 +1071,7 @@ impl RunCoordinator {
             if let Some(mut done) = done {
                 let _ = done.wait_for(|completed| *completed).await;
             }
+            let _thread = coordinator.lock_thread(thread_id).await;
             let note = coordinator.remove_worker_worktree(project_id, &path).await;
             if let Some(text) = note {
                 let posted = coordinator
@@ -1066,7 +1114,7 @@ impl RunCoordinator {
 
     pub(crate) async fn apply_swarm_actions(
         &self,
-        active: &mut HashMap<Uuid, ActiveRun>,
+        guard: &ThreadGuard,
         thread_id: Uuid,
         actions: Vec<Action>,
     ) -> CoreResult<()> {
@@ -1077,22 +1125,22 @@ impl RunCoordinator {
             let (label, result) = match action {
                 Action::Add(spec) => (
                     format!("swarm_add_worker {}", spec.name),
-                    self.add_worker_locked(active, thread_id, spec)
+                    self.add_worker_locked(guard, thread_id, spec)
                         .await
                         .map(drop),
                 ),
                 Action::Post { text } => {
-                    let depth = wake_depth(active, thread_id);
+                    let depth = self.wake_depth(thread_id).await;
                     (
                         "swarm_post_message".to_owned(),
-                        self.post_locked(active, thread_id, None, text, depth)
+                        self.post_locked(guard, thread_id, None, text, depth)
                             .await
                             .map(drop),
                     )
                 }
                 Action::Kill { name } => (
                     format!("swarm_kill_worker {name}"),
-                    self.kill_worker_locked(active, thread_id, &name, true)
+                    self.kill_worker_locked(guard, thread_id, &name, true)
                         .await
                         .map(drop),
                 ),
@@ -1108,8 +1156,8 @@ impl RunCoordinator {
         let text = format!(
             "@coordinator Swarm action(s) from your last turn failed:\n{failures}Fix the action and emit it again."
         );
-        let depth = wake_depth(active, thread_id);
-        self.post_locked(active, thread_id, Some("system"), text, depth)
+        let depth = self.wake_depth(thread_id).await;
+        self.post_locked(guard, thread_id, Some("system"), text, depth)
             .await
             .map(drop)
     }
@@ -1181,10 +1229,6 @@ fn held_wake_text(seq: i64, targets: &[&SwarmMember]) -> String {
     format!(
         "[system] wake depth limit {MAX_WAKE_DEPTH} reached at post #{seq}; not woken: {names}. A user message resumes the swarm."
     )
-}
-
-fn wake_depth(active: &HashMap<Uuid, ActiveRun>, id: Uuid) -> u8 {
-    active.get(&id).map_or(0, |run| run.wake_depth)
 }
 
 fn stricter_mode_ceiling(

@@ -1,7 +1,10 @@
+mod locks;
 use crate::auth::{ActiveMcpToken, McpTokens, RunMcpToken};
 use crate::provider_hold::{ProviderHold, ProviderHolds, limited_until, model_scoped};
 use crate::swarm::{SwarmTurn, is_swarm_command};
 use chrono::Utc;
+use locks::KeyedLocks;
+pub(crate) use locks::ThreadGuard;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -33,6 +36,10 @@ pub(crate) struct Coordinator {
     pub(crate) git: GitManager,
     pub(crate) providers: ProviderRegistry,
     pub(crate) events: broadcast::Sender<WsServerMessage>,
+    thread_locks: KeyedLocks,
+    pub(crate) project_locks: KeyedLocks,
+    pub(crate) board_locks: KeyedLocks,
+    // Only hold this map to inspect or update in-memory run metadata.
     pub(crate) active: Mutex<HashMap<Uuid, ActiveRun>>,
     pub(crate) latest_context: Mutex<HashMap<Uuid, LiveContextUsage>>,
     pub(crate) live_streams: Mutex<HashMap<Uuid, LiveStreamSnapshot>>,
@@ -220,6 +227,9 @@ impl RunCoordinator {
             wake_deliveries: Default::default(),
             thread_status_deduper: ThreadStatusDeduper::default(),
             events,
+            thread_locks: KeyedLocks::default(),
+            project_locks: KeyedLocks::default(),
+            board_locks: KeyedLocks::default(),
             active: Mutex::new(HashMap::new()),
             latest_context: Mutex::new(HashMap::new()),
             live_streams: Mutex::new(HashMap::new()),
@@ -261,8 +271,8 @@ impl RunCoordinator {
     }
 
     pub async fn rollback_run(&self, thread_id: Uuid, run_id: Uuid) -> CoreResult<()> {
-        let active = self.0.active.lock().await;
-        if active.contains_key(&thread_id) {
+        let _thread = self.lock_thread(thread_id).await;
+        if self.0.active.lock().await.contains_key(&thread_id) {
             return Err(CoreError::InvalidArgument(
                 "cannot rollback while thread has an active run".into(),
             ));
@@ -288,8 +298,8 @@ impl RunCoordinator {
     }
 
     pub async fn git_discard(&self, thread_id: Uuid, rel_path: &str) -> CoreResult<()> {
-        let active = self.0.active.lock().await;
-        if active.contains_key(&thread_id) {
+        let _thread = self.lock_thread(thread_id).await;
+        if self.0.active.lock().await.contains_key(&thread_id) {
             return Err(CoreError::InvalidArgument(
                 "cannot discard files while thread has an active run".into(),
             ));
@@ -300,8 +310,8 @@ impl RunCoordinator {
     }
 
     pub async fn git_commit(&self, thread_id: Uuid, message: &str) -> CoreResult<String> {
-        let active = self.0.active.lock().await;
-        if active.contains_key(&thread_id) {
+        let _thread = self.lock_thread(thread_id).await;
+        if self.0.active.lock().await.contains_key(&thread_id) {
             return Err(CoreError::InvalidArgument(
                 "cannot commit while thread has an active run".into(),
             ));
@@ -312,16 +322,17 @@ impl RunCoordinator {
     }
 
     pub async fn cancel_queued_run(&self, thread_id: Uuid, run_id: Uuid) -> CoreResult<bool> {
-        let _active = self.0.active.lock().await;
-        self.cancel_queued_locked(thread_id, run_id).await
+        let guard = self.lock_thread(thread_id).await;
+        self.cancel_queued_locked(&guard, run_id).await
     }
 
-    /// Cancels a queued run. The caller holds the `active` lock, so the run cannot start meanwhile.
+    /// Cancels a queued run. The caller holds the thread lock, so the run cannot start meanwhile.
     pub(crate) async fn cancel_queued_locked(
         &self,
-        thread_id: Uuid,
+        guard: &ThreadGuard,
         run_id: Uuid,
     ) -> CoreResult<bool> {
+        let thread_id = guard.id;
         let cancelled = self.0.store.cancel_queued_run(thread_id, run_id).await?;
         if cancelled {
             self.clear_user_run(run_id);
@@ -586,15 +597,15 @@ impl RunCoordinator {
         message: Message,
         user_requested: bool,
     ) -> CoreResult<Uuid> {
-        let mut active = self.0.active.lock().await;
+        let guard = self.lock_thread(id).await;
         let thread = self.0.store.get_thread(id).await?;
-        self.send_locked(&mut active, thread, message, 0, user_requested)
+        self.send_locked(&guard, thread, message, 0, user_requested)
             .await
     }
 
     pub(crate) async fn send_locked(
         &self,
-        active: &mut HashMap<Uuid, ActiveRun>,
+        guard: &ThreadGuard,
         thread: Thread,
         message: Message,
         wake_depth: u8,
@@ -602,33 +613,38 @@ impl RunCoordinator {
     ) -> CoreResult<Uuid> {
         self.ensure_accepting_runs()?;
         self.validate_message(&thread, &message).await?;
-        let id = thread.id;
+        let id = guard.id;
+        debug_assert_eq!(id, thread.id);
         let swarm_command = is_swarm_command(&message.prompt);
         if swarm_command {
             self.ensure_board(&thread).await?;
         }
-        if !swarm_command
-            && let Some(run) = active.get(&id)
-            && message
-                .behavior
-                .unwrap_or(self.0.settings.get().follow_up_behavior)
-                == FollowUpBehavior::Steer
-            && message.attachment_ids.is_empty()
-            && message
-                .model_selection
-                .as_ref()
-                .is_none_or(|model| *model == run.model)
-            && !*run.cancel.borrow()
-            && run
-                .driver
-                .send_steer(run.id, message.prompt.clone())
-                .await?
+        let (busy, steer) = {
+            let active = self.0.active.lock().await;
+            let run = active.get(&id);
+            let steer = run
+                .filter(|run| {
+                    !swarm_command
+                        && message
+                            .behavior
+                            .unwrap_or(self.0.settings.get().follow_up_behavior)
+                            == FollowUpBehavior::Steer
+                        && message.attachment_ids.is_empty()
+                        && message
+                            .model_selection
+                            .as_ref()
+                            .is_none_or(|model| *model == run.model)
+                        && !*run.cancel.borrow()
+                })
+                .map(|run| (run.id, run.driver.clone()));
+            (run.is_some(), steer)
+        };
+        if let Some((run_id, driver)) = steer
+            && driver.send_steer(run_id, message.prompt.clone()).await?
         {
-            self.append(prompt_item(id, run.id, &message)).await?;
-            return Ok(run.id);
+            self.append(prompt_item(id, run_id, &message)).await?;
+            return Ok(run_id);
         }
-
-        let busy = active.contains_key(&id);
         let run_id = self
             .enqueue(&thread, message, false, wake_depth, busy)
             .await?;
@@ -639,7 +655,7 @@ impl RunCoordinator {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(run_id);
         }
-        if !busy && let Some((_, turn)) = self.start_next(active, &thread, Some(run_id)).await? {
+        if !busy && let Some((_, turn)) = self.start_next(guard, &thread, Some(run_id)).await? {
             self.spawn(turn);
         }
         Ok(run_id)
@@ -647,7 +663,7 @@ impl RunCoordinator {
 
     pub(crate) async fn start_delegated(
         &self,
-        active: &mut HashMap<Uuid, ActiveRun>,
+        guard: &ThreadGuard,
         thread: Thread,
         message: Message,
     ) -> CoreResult<RunTicket> {
@@ -673,7 +689,7 @@ impl RunCoordinator {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, done);
-        match self.start_next(active, &thread, Some(id)).await {
+        match self.start_next(guard, &thread, Some(id)).await {
             Ok(Some((_, turn))) => self.spawn(turn),
             Ok(None) => {}
             Err(error) => {
@@ -825,15 +841,25 @@ impl RunCoordinator {
         &self,
         excluded_threads: &std::collections::HashSet<Uuid>,
     ) -> CoreResult<()> {
-        let mut active = self.0.active.lock().await;
         self.ensure_accepting_runs()?;
-        for id in self.0.store.queued_threads().await? {
-            if !excluded_threads.contains(&id) && !active.contains_key(&id) {
-                let thread = self.0.store.get_thread(id).await?;
-                if let Some((_, turn)) = self.start_next(&mut active, &thread, None).await? {
-                    self.spawn(turn);
+        let ids = self.0.store.queued_threads().await?;
+        let resumes = ids
+            .into_iter()
+            .filter(|id| !excluded_threads.contains(id))
+            .map(|id| async move {
+                let guard = self.lock_thread(id).await;
+                self.ensure_accepting_runs()?;
+                if !self.0.active.lock().await.contains_key(&id) {
+                    let thread = self.0.store.get_thread(id).await?;
+                    if let Some((_, turn)) = self.start_next(&guard, &thread, None).await? {
+                        self.spawn(turn);
+                    }
                 }
-            }
+                CoreResult::Ok(())
+            });
+        // Finish all submitted starts even if one thread fails.
+        for result in futures_util::future::join_all(resumes).await {
+            result?;
         }
         Ok(())
     }
@@ -862,13 +888,12 @@ impl RunCoordinator {
 
     async fn start_next(
         &self,
-        active: &mut HashMap<Uuid, ActiveRun>,
+        guard: &ThreadGuard,
         thread: &Thread,
         submitted_id: Option<Uuid>,
     ) -> CoreResult<Option<(RunTicket, RunningTurn)>> {
-        if self.0.shutting_down.load(Ordering::Relaxed) {
-            return Ok(None);
-        }
+        // Admission was checked under this thread guard. Shutdown waits for
+        // admitted starts before collecting their completion receivers.
         let store = &self.0.store;
         let mut next = store.next_queued_run(thread.id).await?;
         if self.0.holds.is_paused()
@@ -904,7 +929,7 @@ impl RunCoordinator {
                 return Ok(None);
             }
             self.clear_user_run(run_id);
-            match self.start(active, thread.clone(), queued).await {
+            match self.start(guard, thread.clone(), queued).await {
                 Ok(Some(started)) => return Ok(Some(started)),
                 Ok(None) => self.complete_queued_ticket(run_id),
                 Err(error) => {
@@ -953,11 +978,17 @@ impl RunCoordinator {
 
     async fn start(
         &self,
-        active: &mut HashMap<Uuid, ActiveRun>,
+        guard: &ThreadGuard,
         mut thread: Thread,
         queued: QueuedRun,
     ) -> CoreResult<Option<(RunTicket, RunningTurn)>> {
-        self.ensure_accepting_runs()?;
+        debug_assert_eq!(guard.id, thread.id);
+        let _project = self
+            .0
+            .project_locks
+            .get(thread.project_id)
+            .read_owned()
+            .await;
         if thread.archived {
             return Err(CoreError::InvalidArgument("thread is archived".into()));
         }
@@ -1135,7 +1166,7 @@ impl RunCoordinator {
             })
             .unwrap_or_else(|| watch::channel(false));
         let chained_dones = self.take_deferred_dones(run_id);
-        active.insert(
+        self.0.active.lock().await.insert(
             thread.id,
             ActiveRun {
                 project_id: thread.project_id,
@@ -1252,9 +1283,9 @@ impl RunCoordinator {
 
     pub async fn interrupt(&self, id: Uuid) -> CoreResult<()> {
         let done = {
-            let mut active = self.0.active.lock().await;
+            let guard = self.lock_thread(id).await;
             self.0.store.get_thread(id).await?;
-            self.interrupt_locked(&mut active, id).await?
+            self.interrupt_locked(&guard).await?
         };
         if let Some(mut done) = done {
             let _ = done.wait_for(|completed| *completed).await;
@@ -1264,10 +1295,10 @@ impl RunCoordinator {
 
     pub(crate) async fn interrupt_locked(
         &self,
-        active: &mut HashMap<Uuid, ActiveRun>,
-        id: Uuid,
+        guard: &ThreadGuard,
     ) -> CoreResult<Option<watch::Receiver<bool>>> {
-        let done = active.get_mut(&id).map(|run| {
+        let id = guard.id;
+        let done = self.0.active.lock().await.get_mut(&id).map(|run| {
             run.stop_requested = true;
             self.cancel(run)
         });
@@ -1292,39 +1323,55 @@ impl RunCoordinator {
     }
 
     pub(crate) fn ensure_accepting_runs(&self) -> CoreResult<()> {
-        if self.0.shutting_down.load(Ordering::Relaxed) {
+        if self.0.shutting_down.load(Ordering::SeqCst) {
             return Err(CoreError::Provider("server is shutting down".into()));
         }
         Ok(())
     }
 
     pub async fn interrupt_all(&self) {
-        let completions = {
-            let mut active = self.0.active.lock().await;
-            self.0.shutting_down.store(true, Ordering::Relaxed);
-            active
-                .values_mut()
-                .map(|run| self.cancel(run))
-                .collect::<Vec<_>>()
-        };
-        for mut done in completions {
-            let _ = done.wait_for(|completed| *completed).await;
-        }
+        self.0.shutting_down.store(true, Ordering::SeqCst);
+        // In-flight starts already own a thread guard, even before they enter
+        // the active map. Later starts observe the shutdown flag under that guard.
+        let mut ids: HashSet<_> = self.0.thread_locks.live_keys().into_iter().collect();
+        ids.extend(self.0.active.lock().await.keys().copied());
+        futures_util::future::join_all(ids.into_iter().map(|id| async move {
+            let done = {
+                let _thread = self.lock_thread(id).await;
+                self.0
+                    .active
+                    .lock()
+                    .await
+                    .get_mut(&id)
+                    .map(|run| self.cancel(run))
+            };
+            if let Some(mut done) = done {
+                let _ = done.wait_for(|completed| *completed).await;
+            }
+        }))
+        .await;
     }
 
     pub async fn respond_request(&self, id: Uuid, response: PendingResponse) -> CoreResult<()> {
-        let mut active = self.0.active.lock().await;
-        let run = active
-            .get_mut(&id)
+        let _thread = self.lock_thread(id).await;
+        let (run_id, driver) = self
+            .0
+            .active
+            .lock()
+            .await
+            .get(&id)
             .filter(|run| run.pending.contains_key(&response.request_id))
+            .map(|run| (run.id, run.driver.clone()))
             .ok_or_else(|| CoreError::NotFound("pending request".into()))?;
         let request_id = response.request_id;
-        if !run.driver.respond_request(run.id, response).await? {
+        if !driver.respond_request(run_id, response).await? {
             return Err(CoreError::Provider(
                 "provider did not accept the response".into(),
             ));
         }
-        run.pending.remove(&request_id);
+        if let Some(run) = self.0.active.lock().await.get_mut(&id) {
+            run.pending.remove(&request_id);
+        }
         Ok(())
     }
 
@@ -1604,12 +1651,38 @@ impl RunCoordinator {
             }
         }
 
-        let mut active = self.0.active.lock().await;
+        let actions = swarm
+            .as_ref()
+            .map(|turn| turn.actions(&outcome.assistant))
+            .unwrap_or_default();
+        // Only multi-member actions and silent-worker notifications need board
+        // serialization. Take the board before a member so reciprocal wakes
+        // cannot deadlock. An existing post for this run cannot disappear.
+        let mut board_guard = None;
+        let mut may_notify = false;
+        if let Some(turn) = &swarm {
+            if let Some(name) = &turn.worker_name {
+                may_notify = !self
+                    .0
+                    .store
+                    .worker_posted_for_run(turn.board_id, name, run_id, run_started_at)
+                    .await
+                    .unwrap_or(false);
+            }
+            if may_notify || !actions.is_empty() {
+                board_guard = Some(self.0.board_locks.get(turn.board_id).write_owned().await);
+            }
+        }
+        let guard = self.lock_thread(thread_id).await;
         let cancelled = *cancellation.borrow() || verify_cancelled;
         // A server shutdown leaves the run in flight, as a crash would, so that
         // `recover_interrupted_runs` resumes it on the next start.
         if cancelled
-            && active
+            && self
+                .0
+                .active
+                .lock()
+                .await
                 .get(&thread_id)
                 .is_some_and(|run| !run.stop_requested)
         {
@@ -1618,7 +1691,7 @@ impl RunCoordinator {
             }
             self.settle_live_state(thread_id, run_id, outcome.session)
                 .await;
-            active.remove(&thread_id);
+            self.0.active.lock().await.remove(&thread_id);
             done.send_replace(true);
             for waiter in chained_dones {
                 waiter.send_replace(true);
@@ -1820,14 +1893,15 @@ impl RunCoordinator {
 
         if status == RunStatus::Completed
             && verify_passed
-            && let Some(swarm) = &swarm
-            && let Err(failure) = self
-                .apply_swarm_actions(&mut active, thread_id, swarm.actions(&outcome.assistant))
-                .await
+            && !actions.is_empty()
+            && let Err(failure) = self.apply_swarm_actions(&guard, thread_id, actions).await
         {
             status = RunStatus::Failed;
             error = Some(failure.to_string());
             error_class = Some(FailureClass::HarnessError);
+        }
+        if !may_notify {
+            drop(board_guard.take());
         }
         if let Err(failure) = self.flush_output(thread_id, run_id, &mut outcome).await {
             status = RunStatus::Failed;
@@ -1975,7 +2049,8 @@ impl RunCoordinator {
                 }
             }
         }
-        let defer_completion = enqueued_followup && !self.0.shutting_down.load(Ordering::Relaxed);
+        let accepting_runs = !self.0.shutting_down.load(Ordering::SeqCst);
+        let defer_completion = enqueued_followup && accepting_runs;
         if defer_completion && let Some(followup_id) = followup_run_id {
             let mut dones = Vec::with_capacity(chained_dones.len() + 1);
             dones.push(done.clone());
@@ -2003,10 +2078,7 @@ impl RunCoordinator {
         if let Err(error) = store.update_thread_status(thread_id, thread_status).await {
             tracing::error!(%error, %run_id, "Could not persist thread status");
         }
-        if let Err(error) = self
-            .settle_wake(&mut active, thread_id, run_id, status)
-            .await
-        {
+        if let Err(error) = self.settle_wake(&guard, thread_id, run_id, status).await {
             tracing::error!(%error, %run_id, "Could not acknowledge swarm wake posts");
         }
         if !defer_completion
@@ -2016,12 +2088,12 @@ impl RunCoordinator {
             tracing::error!(%error, %run_id, "Could not persist swarm member state");
         }
         if !defer_completion
-            && (swarm.is_some() || thread.relationship.as_deref() == Some("swarm-worker"))
+            && may_notify
             && !(thread.model_selection.provider == ProviderId::Mock
                 && status == RunStatus::Completed)
             && let Err(error) = self
                 .notify_worker_ended_silently(
-                    &mut active,
+                    &guard,
                     thread_id,
                     run_id,
                     run_started_at,
@@ -2032,6 +2104,7 @@ impl RunCoordinator {
         {
             tracing::error!(%error, %run_id, "Could not notify coordinator of silent worker exit");
         }
+        drop(board_guard);
         self.emit(WsServerMessage::RunStatusChanged {
             thread_id,
             run_id,
@@ -2053,12 +2126,19 @@ impl RunCoordinator {
                 status: thread_status,
             });
         }
-        active.remove(&thread_id);
+        // Keep the old entry until the successor is installed, so a project
+        // deletion cannot slip between the two runs.
         let next = async {
+            if !accepting_runs {
+                return Ok(None);
+            }
             let thread = store.get_thread(thread_id).await?;
-            self.start_next(&mut active, &thread, None).await
+            self.start_next(&guard, &thread, None).await
         }
         .await;
+        if !matches!(&next, Ok(Some(_))) {
+            self.0.active.lock().await.remove(&thread_id);
+        }
         match next {
             Ok(Some((_, next_turn))) => {
                 if !defer_completion {
@@ -2160,11 +2240,18 @@ impl RunCoordinator {
                     out.terminal = None;
                     self.thread_status(thread_id, ThreadStatus::Running).await?;
                 }
-                let active = self.0.active.lock().await;
+                let _thread = self.lock_thread(thread_id).await;
                 let current = self.0.store.get_thread(thread_id).await?.model_selection;
-                if active.get(&thread_id).is_some_and(|run| {
-                    run.model.provider == current.provider && run.model.model == current.model
-                }) {
+                if self
+                    .0
+                    .active
+                    .lock()
+                    .await
+                    .get(&thread_id)
+                    .is_some_and(|run| {
+                        run.model.provider == current.provider && run.model.model == current.model
+                    })
+                {
                     self.0
                         .store
                         .update_thread_session_id(thread_id, provider_session_id.clone())

@@ -85,34 +85,26 @@ impl RunCoordinator {
         cleanup: bool,
     ) -> CoreResult<TaskMergeResult> {
         let ctx = self.resolve_child_worktree(parent_id, child_id).await?;
-        let (active_plan, child_active) = {
-            let active = self.0.active.lock().await;
-            (
-                active
-                    .get(&ctx.parent.id)
-                    .is_some_and(|run| run.interaction_mode == InteractionMode::Plan),
-                active.contains_key(&ctx.child.id),
-            )
+        let active_plan = {
+            let _parent = self.lock_thread(parent_id).await;
+            self.0
+                .active
+                .lock()
+                .await
+                .get(&parent_id)
+                .is_some_and(|run| run.interaction_mode == InteractionMode::Plan)
         };
         if ctx.parent.interaction_mode == InteractionMode::Plan || active_plan {
             return Err(CoreError::InvalidArgument(
                 "cannot merge a child worktree in plan mode".into(),
             ));
         }
-        if child_active {
-            return Err(CoreError::InvalidArgument(
-                "cannot merge while child thread has an active run".into(),
-            ));
-        }
 
+        self.ensure_child_idle(child_id).await?;
         let merge_lock = workspace_merge_lock(&ctx.canonical_parent);
         let _merge_guard = merge_lock.lock().await;
 
-        if self.0.active.lock().await.contains_key(&ctx.child.id) {
-            return Err(CoreError::InvalidArgument(
-                "cannot merge while child thread has an active run".into(),
-            ));
-        }
+        self.ensure_child_idle(child_id).await?;
 
         if GitManager::has_merge_in_progress(&ctx.parent_workspace).await? {
             return Err(CoreError::InvalidArgument(
@@ -152,8 +144,8 @@ impl RunCoordinator {
                 };
                 let mut cleaned_up = false;
                 if cleanup {
-                    let active = self.0.active.lock().await;
-                    if active.contains_key(&ctx.child.id) {
+                    let _child = self.lock_thread(ctx.child.id).await;
+                    if self.0.active.lock().await.contains_key(&ctx.child.id) {
                         result_summary
                             .push_str(" (cleanup skipped: child thread has an active run)");
                     } else {
@@ -222,6 +214,16 @@ impl RunCoordinator {
                 })
             }
         }
+    }
+
+    async fn ensure_child_idle(&self, child_id: Uuid) -> CoreResult<()> {
+        let _child = self.lock_thread(child_id).await;
+        if self.0.active.lock().await.contains_key(&child_id) {
+            return Err(CoreError::InvalidArgument(
+                "cannot merge while child thread has an active run".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn resolve_child_worktree(

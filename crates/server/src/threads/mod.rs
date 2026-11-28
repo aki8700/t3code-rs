@@ -48,12 +48,11 @@ pub struct PatchThread {
 
 impl RunCoordinator {
     pub async fn create_thread(&self, input: CreateThread) -> CoreResult<Thread> {
-        let _guard = self.0.active.lock().await;
         self.new_thread(input, None).await
     }
 
     pub async fn patch_thread(&self, id: Uuid, patch: PatchThread) -> CoreResult<Thread> {
-        let _guard = self.0.active.lock().await;
+        let _guard = self.lock_thread(id).await;
         let store = &self.0.store;
         let thread = store.get_thread(id).await?;
         if let Some(title) = &patch.title {
@@ -124,8 +123,15 @@ impl RunCoordinator {
     }
 
     pub async fn delete_project(&self, id: Uuid) -> CoreResult<()> {
-        let guard = self.0.active.lock().await;
-        if guard.values().any(|run| run.project_id == id) {
+        let _project = self.0.project_locks.get(id).write_owned().await;
+        if self
+            .0
+            .active
+            .lock()
+            .await
+            .values()
+            .any(|run| run.project_id == id)
+        {
             return Err(CoreError::InvalidArgument("project has active runs".into()));
         }
         self.0.store.delete_project(id).await
@@ -136,6 +142,22 @@ impl RunCoordinator {
         input: CreateThread,
         parent: Option<(&Thread, &str)>,
     ) -> CoreResult<Thread> {
+        let guard = self.lock_thread(Uuid::new_v4()).await;
+        self.new_thread_locked(&guard, input, parent).await
+    }
+
+    pub(crate) async fn new_thread_locked(
+        &self,
+        guard: &crate::coordinator::ThreadGuard,
+        input: CreateThread,
+        parent: Option<(&Thread, &str)>,
+    ) -> CoreResult<Thread> {
+        let _project = self
+            .0
+            .project_locks
+            .get(input.project_id)
+            .read_owned()
+            .await;
         validate_title(&input.title)?;
         let store = &self.0.store;
         let project = store.get_project(input.project_id).await?;
@@ -169,7 +191,7 @@ impl RunCoordinator {
         let now = Utc::now();
         let result = store
             .create_thread(Thread {
-                id: Uuid::new_v4(),
+                id: guard.id,
                 project_id: project.id,
                 parent_thread_id: parent.map(|(parent, _)| parent.id),
                 relationship: parent.map(|(_, relationship)| relationship.to_owned()),
@@ -203,12 +225,14 @@ impl RunCoordinator {
         if spec.task.trim().is_empty() {
             return Err(CoreError::InvalidArgument("task is required".into()));
         }
-        let mut active = self.0.active.lock().await;
+        let _parent = self.lock_thread(spec.parent_thread_id).await;
+        let child = self.lock_thread(Uuid::new_v4()).await;
         self.ensure_accepting_runs()?;
         let parent = self.0.store.get_thread(spec.parent_thread_id).await?;
         spec.validate_permissions(&parent)?;
         let thread = self
-            .new_thread(
+            .new_thread_locked(
+                &child,
                 CreateThread {
                     project_id: parent.project_id,
                     title: spec.title,
@@ -223,7 +247,7 @@ impl RunCoordinator {
             .await?;
         let ticket = self
             .start_delegated(
-                &mut active,
+                &child,
                 thread.clone(),
                 Message {
                     prompt: spec.task,
@@ -254,7 +278,7 @@ impl RunCoordinator {
     }
 
     pub async fn fork_thread(&self, id: Uuid, options: ForkOptions) -> CoreResult<Thread> {
-        let _guard = self.0.active.lock().await;
+        let _guard = self.lock_thread(id).await;
         let store = &self.0.store;
         let source = store.get_thread(id).await?;
         let summary = match options
@@ -264,8 +288,10 @@ impl RunCoordinator {
             Some(summary) => compact(&summary, 4000),
             None => self.handoff_summary(&source).await?,
         };
+        let child = self.lock_thread(Uuid::new_v4()).await;
         let target = self
-            .new_thread(
+            .new_thread_locked(
+                &child,
                 CreateThread {
                     project_id: source.project_id,
                     title: options
@@ -318,6 +344,7 @@ impl RunCoordinator {
     /// Compacts a Codex thread's own session instead of forking it. Other providers either
     /// compact natively through `/compact` (Claude, Antigravity) or fall back to `fork_thread`.
     pub async fn compact_thread(&self, id: Uuid) -> CoreResult<()> {
+        let _guard = self.lock_thread(id).await;
         let thread = self.0.store.get_thread(id).await?;
         if thread.model_selection.provider != ProviderId::Codex {
             return Err(CoreError::InvalidArgument(
@@ -399,11 +426,18 @@ impl RunCoordinator {
         let Some(parent_id) = child.parent_thread_id else {
             return Ok(());
         };
-        let store = &self.0.store;
-        let parent = store.get_thread(parent_id).await?;
-        let parent_run = match store.list_runs(parent_id).await?.last() {
-            Some(run) => run.id,
-            None => self.metadata_run(&parent).await?,
+        let parent_run = {
+            // Sibling completions can arrive together on a parent with no
+            // runs yet. Choose or create the parent's metadata run only once.
+            let _parent = self.lock_thread(parent_id).await;
+            let store = &self.0.store;
+            match store.list_runs(parent_id).await?.last() {
+                Some(run) => run.id,
+                None => {
+                    self.metadata_run(&store.get_thread(parent_id).await?)
+                        .await?
+                }
+            }
         };
         let summary = match error {
             Some(error) => Some(compact(error, 1000)),

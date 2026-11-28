@@ -481,3 +481,84 @@ async fn task_merge_blocks_no_undo_for_agents_while_human_merge_succeeds() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[tokio::test]
+async fn unrelated_run_finishes_while_git_commit_is_pending() {
+    use std::time::Duration;
+
+    let (root, repo, coordinator, project) = test_coordinator().await;
+    let create = |title: &str| CreateThread {
+        project_id: project.id,
+        title: title.into(),
+        model_selection: None,
+        runtime_mode: RuntimeMode::FullAccess,
+        interaction_mode: InteractionMode::Default,
+        isolation: IsolationMode::Shared,
+        base_ref: None,
+    };
+    let writer = coordinator.create_thread(create("Writer")).await.unwrap();
+    let reader = coordinator.create_thread(create("Reader")).await.unwrap();
+    std::fs::write(repo.join("base.txt"), "updated\n").unwrap();
+    coordinator.git_stage(writer.id, "base.txt").await.unwrap();
+
+    // Poll the commit up to its first pending I/O, then leave it suspended. This
+    // models an arbitrarily slow operation without a sleep or a timing race.
+    let commit = coordinator.git_commit(writer.id, "update");
+    tokio::pin!(commit);
+    tokio::select! {
+        biased;
+        result = &mut commit => panic!("commit did not suspend: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    let mut events = coordinator.subscribe();
+    let unrelated = tokio::time::timeout(Duration::from_secs(3), async {
+        let run = coordinator
+            .send(
+                reader.id,
+                Message {
+                    prompt: "hello".into(),
+                    ..Default::default()
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        loop {
+            if let WsServerMessage::RunStatusChanged { run_id, status, .. } =
+                events.recv().await.unwrap()
+                && run_id == run
+                && status == RunStatus::Completed
+            {
+                break;
+            }
+        }
+
+        let slow_run = coordinator
+            .send(
+                reader.id,
+                Message {
+                    prompt: "[slow]".into(),
+                    ..Default::default()
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        let deletion = coordinator.delete_project(project.id).await.unwrap_err();
+        assert!(deletion.to_string().contains("project has active runs"));
+        coordinator.interrupt(reader.id).await.unwrap();
+        let runs = coordinator.0.store.list_runs(reader.id).await.unwrap();
+        assert!(
+            runs.iter()
+                .any(|run| run.id == slow_run && run.status == RunStatus::Cancelled)
+        );
+    });
+    let completion = tokio::select! {
+        biased;
+        result = coordinator.interrupt(writer.id) => panic!("same-thread interrupt overtook commit: {result:?}"),
+        result = unrelated => result,
+    };
+    commit.await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    completion.expect("an unrelated run must finish while the commit is suspended");
+}
