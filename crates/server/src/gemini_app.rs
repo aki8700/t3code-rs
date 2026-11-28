@@ -311,14 +311,19 @@ impl Desktop<'_> {
         query: &str,
         ready: impl Fn(&[&Value]) -> bool,
     ) -> CoreResult<Value> {
+        let mut last = String::new();
         for _ in 0..4 {
             let state = self.snapshot_query(Some(query)).await?;
-            if ready(&nodes(&state)) {
+            let controls = nodes(&state);
+            if ready(&controls) {
                 return Ok(state);
             }
+            last = describe(&state, &controls);
             sleep(Duration::from_millis(250)).await;
         }
-        Err(failure("Gemini の入力欄または操作ボタンを確認できません"))
+        Err(failure(&format!(
+            "Gemini の入力欄または操作ボタンを確認できません（待機: {query}、最後の画面: {last}）"
+        )))
     }
 
     async fn sidebar(&self, open: bool) -> CoreResult<Value> {
@@ -700,7 +705,12 @@ async fn empty_composer(desktop: &Desktop<'_>) -> CoreResult<u64> {
         return Err(failure("別の回答を生成中です"));
     }
     let state = desktop.snapshot_query(Some("AXTextArea")).await?;
-    let field = composer(&state).ok_or_else(|| failure("入力欄が見つかりません"))?;
+    let field = composer(&state).ok_or_else(|| {
+        failure(&format!(
+            "入力欄が見つかりません（最後の画面: {}）",
+            describe(&state, &nodes(&state))
+        ))
+    })?;
     if !empty_field(field) {
         return Err(failure("入力欄に下書きが残っています"));
     }
@@ -842,6 +852,23 @@ async fn wait_for_answer(
 
 // Only inspect the current question's response. Earlier error cards can remain
 // in the conversation after a later turn succeeds.
+/// One-line summary of a snapshot for failure messages.
+fn describe(state: &Value, controls: &[&Value]) -> String {
+    let has = |id: &str| controls.iter().any(|n| n["identifier"] == id);
+    format!(
+        "要素{} 打ち切り{} サイドバー{} 入力欄{} 送信{} 停止{}",
+        controls.len(),
+        state
+            .pointer("/state/accessibility/truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        has("sidebar_header_search"),
+        controls.iter().any(|n| n["role"] == "AXTextArea"),
+        has("send_button"),
+        has("stop_button"),
+    )
+}
+
 /// Finds the element matching `node` (role, identifier, description) in a fresh snapshot.
 fn same_element<'a>(nodes: &[&'a Value], node: &Value) -> Option<&'a Value> {
     nodes.iter().copied().find(|candidate| {
