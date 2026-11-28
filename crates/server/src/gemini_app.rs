@@ -242,11 +242,14 @@ impl Desktop<'_> {
         self.snapshot_query(Some("AXButton")).await
     }
 
-    async fn snapshot_query(&self, query: Option<&str>) -> CoreResult<Value> {
+    async fn snapshot_query(&self, _query: Option<&str>) -> CoreResult<Value> {
+        // The real SwiftCUA `query` filter does not match role names such as
+        // "AXTextArea" (it returned 0 nodes while the composer was on screen), so
+        // the composer was never found. Always read the full tree.
         let state = self
             .call(
                 "getAppState",
-                json!({"includeScreenshot":false, "disableDiff":true, "limit":6000, "query":query}),
+                json!({"includeScreenshot":false, "disableDiff":true, "limit":6000}),
             )
             .await?;
         let window = state
