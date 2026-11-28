@@ -220,7 +220,9 @@ impl Desktop<'_> {
                 .strip_prefix('[')
                 .and_then(|s| s.split_once(']'))
                 .and_then(|(n, _)| n.parse::<i32>().ok());
-            if code == Some(1007)
+            // 1007: the app is busy (AX -25204). 1006: SwiftUI briefly retracts the
+            // window from the accessibility tree while it changes views.
+            if (code == Some(1007) || (code == Some(1006) && method == "getAppState"))
                 && matches!(method, "click" | "getAppState")
                 && let Some(delay) = delays.next()
             {
