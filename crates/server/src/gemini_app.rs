@@ -292,7 +292,7 @@ impl Desktop<'_> {
                 && button(&controls, "sidebar_header_search").is_some()
             {
                 // An expanded history can exhaust SwiftCUA's snapshot deadline.
-                self.press(index(sidebar)?).await?;
+                self.press_node(sidebar).await?;
                 return self.wait_for(chat_controls).await;
             }
         }
@@ -326,7 +326,7 @@ impl Desktop<'_> {
         }
         let toggle = button(&controls, "sidebar_toggle")
             .ok_or_else(|| failure("サイドバーを操作できません"))?;
-        self.press(index(toggle)?).await?;
+        self.press_node(toggle).await?;
         self.wait_for(|controls| button(controls, "sidebar_header_search").is_some() == open)
             .await
     }
@@ -338,7 +338,7 @@ impl Desktop<'_> {
             .ok_or_else(|| failure("モデル選択が見つかりません"))?;
         // A SwiftUI popover can open even when AXPress returns an error. Verify its state.
         if model_option(&controls, model).is_none() {
-            let _ = self.press(index(selector)?).await;
+            let _ = self.press_node(selector).await;
         }
         let menu = self
             .wait_for(|controls| controls.iter().any(|node| node["role"] == "AXPopover"))
@@ -347,7 +347,7 @@ impl Desktop<'_> {
         let choice = model_option(&menu_controls, model)
             .ok_or_else(|| failure("指定モデルはこの Gemini アカウントで選べません"))?;
         if !has_state(choice, "selected") {
-            self.press(index(choice)?).await?;
+            self.press_node(choice).await?;
             let selected = self
                 .wait_for(|controls| {
                     button(controls, "tab_stop_model_selector")
@@ -360,9 +360,9 @@ impl Desktop<'_> {
             if effort == "app" {
                 return Ok(());
             }
-            let _ = self.press(index(selector)?).await;
+            let _ = self.press_node(selector).await;
         } else if effort == "app" {
-            return self.press(index(choice)?).await;
+            return self.press_node(choice).await;
         }
         let effort_menu = self
             .wait_for(|controls| effort_entry(controls).is_some())
@@ -370,7 +370,7 @@ impl Desktop<'_> {
         let effort_controls = nodes(&effort_menu);
         let entry = effort_entry(&effort_controls)
             .ok_or_else(|| failure("このモデルでは思考レベルを変更できません"))?;
-        let _ = self.press(index(entry)?).await;
+        let _ = self.press_node(entry).await;
         let level_menu = self
             .wait_for(|controls| {
                 effort_option(controls, "low").is_some()
@@ -380,7 +380,7 @@ impl Desktop<'_> {
         let level_controls = nodes(&level_menu);
         let level = effort_option(&level_controls, effort)
             .ok_or_else(|| failure("指定した思考レベルは選べません"))?;
-        self.press(index(level)?).await?;
+        self.press_node(level).await?;
         self.wait_for(|controls| !controls.iter().any(|node| node["role"] == "AXPopover"))
             .await?;
         Ok(())
@@ -397,6 +397,27 @@ impl Desktop<'_> {
     async fn press(&self, index: u64) -> CoreResult<()> {
         self.action("click", json!({"elementIndex":index,"strategy":"ax"}))
             .await
+    }
+
+    /// Presses `node`, re-resolving it from a fresh snapshot when SwiftCUA reports
+    /// a stale element index (`[1005]`, AX error -25202) because the UI changed.
+    async fn press_node(&self, node: &Value) -> CoreResult<()> {
+        let mut target = index(node)?;
+        for _ in 0..2 {
+            match self.press(target).await {
+                Err(error) if error.to_string().contains("(エラー 1005)") => {
+                    sleep(Duration::from_millis(500)).await;
+                    let fresh = self.snapshot_query(None).await?;
+                    let nodes = nodes(&fresh);
+                    let Some(found) = same_element(&nodes, node) else {
+                        return Err(error);
+                    };
+                    target = index(found)?;
+                }
+                result => return result,
+            }
+        }
+        self.press(target).await
     }
 }
 
@@ -707,7 +728,7 @@ async fn send(
         let rows = nodes(&sidebar);
         if selected_conversation(&rows) != Some(conversation) {
             let target = button(&rows, conversation).ok_or_else(|| failure("このスレッドの Gemini 会話を履歴で特定できません。Gemini でその会話を開くか /gemini --new を使ってください"))?;
-            let _ = desktop.press(index(target)?).await;
+            let _ = desktop.press_node(target).await;
             desktop
                 .wait_for(|rows| selected_conversation(rows) == Some(conversation))
                 .await?;
@@ -718,7 +739,7 @@ async fn send(
         if button(&controls, "tempChat_button").is_none() {
             let new = button(&controls, "newChat_button")
                 .ok_or_else(|| failure("新規チャットのボタンが見つかりません"))?;
-            desktop.press(index(new)?).await?;
+            desktop.press_node(new).await?;
             desktop
                 .wait_for(|controls| button(controls, "tempChat_button").is_some())
                 .await?;
@@ -751,7 +772,7 @@ async fn send(
     let drafted_nodes = nodes(&drafted);
     let submit = button(&drafted_nodes, "send_button")
         .ok_or_else(|| failure("送信ボタンが見つかりません"))?;
-    desktop.press(index(submit)?).await?;
+    desktop.press_node(submit).await?;
 
     if let Some(conversation) = resume {
         return Ok((conversation.to_owned(), prior_matches));
@@ -791,7 +812,7 @@ async fn wait_for_answer(
                 }
                 let retry =
                     retry.ok_or_else(|| failure("Gemini のエラーに再試行ボタンがありません"))?;
-                desktop.press(index(retry)?).await?;
+                desktop.press_node(retry).await?;
                 retries += 1;
                 sleep(Duration::from_secs(2)).await;
                 continue;
@@ -814,6 +835,15 @@ async fn wait_for_answer(
 
 // Only inspect the current question's response. Earlier error cards can remain
 // in the conversation after a later turn succeeds.
+/// Finds the element matching `node` (role, identifier, description) in a fresh snapshot.
+fn same_element<'a>(nodes: &[&'a Value], node: &Value) -> Option<&'a Value> {
+    nodes.iter().copied().find(|candidate| {
+        candidate["role"] == node["role"]
+            && candidate["identifier"] == node["identifier"]
+            && candidate["description"] == node["description"]
+    })
+}
+
 fn retry_card<'a>(reply: &[&'a Value]) -> Option<Option<&'a Value>> {
     let retry = reply.iter().rev().copied().find(|n| {
         n["role"] == "AXButton" && matches!(n["description"].as_str(), Some("再試行" | "Retry"))
@@ -924,6 +954,15 @@ mod tests {
         assert!(effort_option(&refs, "low").is_some());
         assert!(effort_option(&refs, "standard").is_some());
         assert!(effort_option(&refs, "high").is_some());
+    }
+
+    #[test]
+    fn same_element_finds_a_moved_button_by_role_identifier_and_description() {
+        let old = json!({"index": 37, "role": "AXButton", "identifier": "sidebar_toggle", "description": "サイドバーを切り替え"});
+        let moved = json!({"index": 52, "role": "AXButton", "identifier": "sidebar_toggle", "description": "サイドバーを切り替え"});
+        let other = json!({"index": 37, "role": "AXButton", "identifier": "newChat_button", "description": "新しいチャット"});
+        assert_eq!(same_element(&[&other, &moved], &old), Some(&moved));
+        assert_eq!(same_element(&[&other], &old), None);
     }
 
     #[test]
