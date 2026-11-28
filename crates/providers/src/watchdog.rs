@@ -14,14 +14,14 @@ const TOOL_LOOP_REPEATS: usize = 8;
 // consume several minutes. The full call and normalized error must still match.
 const FAILED_TOOL_WARN_REPEATS: usize = 2;
 const FAILED_TOOL_STOP_REPEATS: usize = 4;
-const DEFAULT_SOFT_TOOL_BUDGET: usize = 40;
-const DEFAULT_HARD_TOOL_BUDGET: usize = 80;
-const DEFAULT_SOFT_TOKEN_BUDGET: u64 = 4_000_000;
-const DEFAULT_HARD_TOKEN_BUDGET: u64 = 8_000_000;
-const WORKER_SOFT_TOOL_BUDGET: usize = 25;
-const WORKER_HARD_TOOL_BUDGET: usize = 50;
-const WORKER_SOFT_TOKEN_BUDGET: u64 = 2_500_000;
-const WORKER_HARD_TOKEN_BUDGET: u64 = 5_000_000;
+const DEFAULT_SOFT_TOOL_BUDGET: usize = 200;
+const DEFAULT_HARD_TOOL_BUDGET: usize = 400;
+const DEFAULT_SOFT_TOKEN_BUDGET: u64 = 20_000_000;
+const DEFAULT_HARD_TOKEN_BUDGET: u64 = 40_000_000;
+const WORKER_SOFT_TOOL_BUDGET: usize = 125;
+const WORKER_HARD_TOOL_BUDGET: usize = 250;
+const WORKER_SOFT_TOKEN_BUDGET: u64 = 12_500_000;
+const WORKER_HARD_TOKEN_BUDGET: u64 = 25_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BudgetAction {
@@ -933,7 +933,7 @@ mod tests {
         assert_eq!(full.soft_tool_calls, DEFAULT_SOFT_TOOL_BUDGET);
         assert_eq!(full.hard_tool_calls, DEFAULT_HARD_TOOL_BUDGET);
 
-        for _ in 0..24 {
+        for _ in 1..WORKER_SOFT_TOOL_BUDGET {
             assert_eq!(worker.on_tool_call(), BudgetAction::None);
             assert_eq!(full.on_tool_call(), BudgetAction::None);
         }
@@ -943,12 +943,15 @@ mod tests {
         let mut worker_tok = TurnBudgetWatchdog::for_profile(McpToolProfile::Worker);
         let mut full_tok = TurnBudgetWatchdog::for_profile(McpToolProfile::Full);
         assert!(matches!(
-            worker_tok.on_usage(2_000_000, 500_000, 0),
+            worker_tok.on_usage(WORKER_SOFT_TOKEN_BUDGET, 0, 0),
             BudgetAction::Warn(_)
         ));
-        assert_eq!(full_tok.on_usage(2_000_000, 500_000, 0), BudgetAction::None);
+        assert_eq!(
+            full_tok.on_usage(WORKER_SOFT_TOKEN_BUDGET, 0, 0),
+            BudgetAction::None
+        );
         assert!(matches!(
-            worker_tok.on_usage(4_000_000, 1_000_000, 0),
+            worker_tok.on_usage(WORKER_HARD_TOKEN_BUDGET, 0, 0),
             BudgetAction::Stop(_)
         ));
     }
