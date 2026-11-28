@@ -87,10 +87,7 @@ impl RunCoordinator {
         let ctx = self.resolve_child_worktree(parent_id, child_id).await?;
         let active_plan = {
             let _parent = self.lock_thread(parent_id).await;
-            self.0
-                .active
-                .lock()
-                .await
+            self.active()
                 .get(&parent_id)
                 .is_some_and(|run| run.interaction_mode == InteractionMode::Plan)
         };
@@ -100,11 +97,11 @@ impl RunCoordinator {
             ));
         }
 
-        self.ensure_child_idle(child_id).await?;
+        drop(self.lock_idle_child(child_id).await?);
         let merge_lock = workspace_merge_lock(&ctx.canonical_parent);
         let _merge_guard = merge_lock.lock().await;
 
-        self.ensure_child_idle(child_id).await?;
+        let _child = self.lock_idle_child(child_id).await?;
 
         if GitManager::has_merge_in_progress(&ctx.parent_workspace).await? {
             return Err(CoreError::InvalidArgument(
@@ -144,33 +141,27 @@ impl RunCoordinator {
                 };
                 let mut cleaned_up = false;
                 if cleanup {
-                    let _child = self.lock_thread(ctx.child.id).await;
-                    if self.0.active.lock().await.contains_key(&ctx.child.id) {
-                        result_summary
-                            .push_str(" (cleanup skipped: child thread has an active run)");
+                    let remove_res = self
+                        .0
+                        .git
+                        .remove_worktree(&ctx.parent_workspace, &ctx.child_worktree)
+                        .await;
+                    // A dirty child is snapshotted on top of its merged head before removal.
+                    let remove_res = remove_res.map(drop);
+                    let branch_res = if remove_res.is_ok() && ctx.child_branch.starts_with("t3rs/")
+                    {
+                        GitManager::delete_branch(&ctx.parent_workspace, &ctx.child_branch).await
                     } else {
-                        let remove_res = self
-                            .0
-                            .git
-                            .remove_worktree(&ctx.parent_workspace, &ctx.child_worktree)
-                            .await;
-                        // A dirty child is snapshotted on top of its merged head before removal.
-                        let remove_res = remove_res.map(drop);
-                        let branch_res =
-                            if remove_res.is_ok() && ctx.child_branch.starts_with("t3rs/") {
-                                GitManager::delete_branch(&ctx.parent_workspace, &ctx.child_branch)
-                                    .await
-                            } else {
-                                Ok(())
-                            };
-                        let prune_res = self.0.git.prune_worktrees(&ctx.parent_workspace).await;
-                        match (remove_res, branch_res, prune_res) {
-                            (Ok(()), Ok(()), Ok(())) => {
-                                cleaned_up = true;
-                                let cid = ctx.child.id.to_string();
-                                let now =
-                                    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-                                if let Err(error) = self
+                        Ok(())
+                    };
+                    let prune_res = self.0.git.prune_worktrees(&ctx.parent_workspace).await;
+                    match (remove_res, branch_res, prune_res) {
+                        (Ok(()), Ok(()), Ok(())) => {
+                            cleaned_up = true;
+                            let cid = ctx.child.id.to_string();
+                            let now =
+                                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                            if let Err(error) = self
                                     .sql(move |db| {
                                         db.execute(
                                             "UPDATE threads SET worktree_path = NULL, branch = NULL, updated_at = ?2 WHERE id = ?1",
@@ -181,26 +172,23 @@ impl RunCoordinator {
                                 {
                                     tracing::warn!(%error, child_id = %ctx.child.id, "Could not clear merged child worktree metadata");
                                 }
+                        }
+                        (r, b, p) => {
+                            let mut errs = Vec::new();
+                            if let Err(error) = r {
+                                tracing::warn!(%error, child_id = %ctx.child.id, "Could not remove merged child worktree");
+                                errs.push(error.to_string());
                             }
-                            (r, b, p) => {
-                                let mut errs = Vec::new();
-                                if let Err(error) = r {
-                                    tracing::warn!(%error, child_id = %ctx.child.id, "Could not remove merged child worktree");
-                                    errs.push(error.to_string());
-                                }
-                                if let Err(error) = b {
-                                    tracing::warn!(%error, branch = %ctx.child_branch, "Could not delete merged child branch");
-                                    errs.push(error.to_string());
-                                }
-                                if let Err(error) = p {
-                                    tracing::warn!(%error, "Could not prune worktrees after merge");
-                                    errs.push(error.to_string());
-                                }
-                                result_summary.push_str(&format!(
-                                    " (cleanup incomplete: {})",
-                                    errs.join("; ")
-                                ));
+                            if let Err(error) = b {
+                                tracing::warn!(%error, branch = %ctx.child_branch, "Could not delete merged child branch");
+                                errs.push(error.to_string());
                             }
+                            if let Err(error) = p {
+                                tracing::warn!(%error, "Could not prune worktrees after merge");
+                                errs.push(error.to_string());
+                            }
+                            result_summary
+                                .push_str(&format!(" (cleanup incomplete: {})", errs.join("; ")));
                         }
                     }
                 }
@@ -216,14 +204,14 @@ impl RunCoordinator {
         }
     }
 
-    async fn ensure_child_idle(&self, child_id: Uuid) -> CoreResult<()> {
-        let _child = self.lock_thread(child_id).await;
-        if self.0.active.lock().await.contains_key(&child_id) {
+    async fn lock_idle_child(&self, child_id: Uuid) -> CoreResult<crate::coordinator::ThreadGuard> {
+        let child = self.lock_thread(child_id).await;
+        if self.active().contains_key(&child_id) {
             return Err(CoreError::InvalidArgument(
                 "cannot merge while child thread has an active run".into(),
             ));
         }
-        Ok(())
+        Ok(child)
     }
 
     async fn resolve_child_worktree(

@@ -193,13 +193,8 @@ impl RunCoordinator {
         Ok(self.0.board_locks.get(board.board_id).write_owned().await)
     }
 
-    async fn wake_depth(&self, id: Uuid) -> u8 {
-        self.0
-            .active
-            .lock()
-            .await
-            .get(&id)
-            .map_or(0, |run| run.wake_depth)
+    fn wake_depth(&self, id: Uuid) -> u8 {
+        self.active().get(&id).map_or(0, |run| run.wake_depth)
     }
 
     pub(crate) async fn ensure_board(&self, thread: &Thread) -> CoreResult<()> {
@@ -231,7 +226,7 @@ impl RunCoordinator {
 
     async fn effective_thread(&self, id: Uuid) -> CoreResult<Thread> {
         let mut thread = self.0.store.get_thread(id).await?;
-        if let Some(run) = self.0.active.lock().await.get(&id) {
+        if let Some(run) = self.active().get(&id) {
             thread.runtime_mode = thread.runtime_mode.min(run.runtime_mode);
             if run.interaction_mode == InteractionMode::Plan {
                 thread.interaction_mode = InteractionMode::Plan;
@@ -281,7 +276,7 @@ impl RunCoordinator {
                 "swarm allows at most {MAX_ACTIVE_WORKERS} active workers"
             )));
         }
-        let depth = self.wake_depth(caller_id).await;
+        let depth = self.wake_depth(caller_id);
         if depth >= MAX_WAKE_DEPTH {
             return Err(CoreError::InvalidArgument(
                 "maximum swarm wake depth reached".into(),
@@ -375,7 +370,7 @@ impl RunCoordinator {
         }
         .await;
         if let Err(error) = result {
-            if !self.0.active.lock().await.contains_key(&worker.id) {
+            if !self.active().contains_key(&worker.id) {
                 self.discard_thread(&worker).await;
                 if spec.isolation == IsolationMode::Worktree
                     && let Some(path) = &worker.worktree_path
@@ -419,7 +414,7 @@ impl RunCoordinator {
     ) -> CoreResult<(SwarmBoardSnapshot, SwarmPostResult)> {
         let _board = self.lock_board(caller_id).await?;
         let guard = self.lock_thread(caller_id).await;
-        let depth = self.wake_depth(caller_id).await;
+        let depth = self.wake_depth(caller_id);
         self.post_locked(&guard, caller_id, sender_override, text, depth)
             .await
     }
@@ -447,7 +442,7 @@ impl RunCoordinator {
         };
         let mentions = mentions_in(&text);
         let sender_run_id = if sender_override.is_none() {
-            self.0.active.lock().await.get(&caller_id).map(|run| run.id)
+            self.active().get(&caller_id).map(|run| run.id)
         } else {
             None
         };
@@ -712,7 +707,7 @@ impl RunCoordinator {
         thread_id: Uuid,
     ) -> CoreResult<((i64, i64), Vec<WakeDelivery>)> {
         self.ensure_deliveries_loaded(thread_id).await?;
-        let running = self.0.active.lock().await.get(&thread_id).map(|run| run.id);
+        let running = self.active().get(&thread_id).map(|run| run.id);
         let (running_range, preserved, remaining_rows) = {
             let mut deliveries = self.deliveries();
             let Some(list) = deliveries.get_mut(&thread_id) else {
@@ -924,10 +919,7 @@ impl RunCoordinator {
         // The ended run is still registered, so a coordinator that keeps re-waking a
         // silent worker accumulates depth even though it is idle between its turns.
         let coordinator = board.coordinator_thread_id;
-        let depth = self
-            .wake_depth(thread_id)
-            .await
-            .max(self.wake_depth(coordinator).await);
+        let depth = self.wake_depth(thread_id).max(self.wake_depth(coordinator));
         self.post_locked(guard, coordinator, Some("system"), text, depth)
             .await?;
         Ok(())
@@ -1071,8 +1063,14 @@ impl RunCoordinator {
             if let Some(mut done) = done {
                 let _ = done.wait_for(|completed| *completed).await;
             }
-            let _thread = coordinator.lock_thread(thread_id).await;
-            let note = coordinator.remove_worker_worktree(project_id, &path).await;
+            let note = {
+                let _thread = coordinator.lock_thread(thread_id).await;
+                if coordinator.active().contains_key(&thread_id) {
+                    Some("Kept worker worktree: worker is running again".into())
+                } else {
+                    coordinator.remove_worker_worktree(project_id, &path).await
+                }
+            };
             if let Some(text) = note {
                 let posted = coordinator
                     .0
@@ -1130,7 +1128,7 @@ impl RunCoordinator {
                         .map(drop),
                 ),
                 Action::Post { text } => {
-                    let depth = self.wake_depth(thread_id).await;
+                    let depth = self.wake_depth(thread_id);
                     (
                         "swarm_post_message".to_owned(),
                         self.post_locked(guard, thread_id, None, text, depth)
@@ -1156,7 +1154,7 @@ impl RunCoordinator {
         let text = format!(
             "@coordinator Swarm action(s) from your last turn failed:\n{failures}Fix the action and emit it again."
         );
-        let depth = self.wake_depth(thread_id).await;
+        let depth = self.wake_depth(thread_id);
         self.post_locked(guard, thread_id, Some("system"), text, depth)
             .await
             .map(drop)

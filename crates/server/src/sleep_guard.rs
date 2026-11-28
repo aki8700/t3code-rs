@@ -75,7 +75,7 @@ pub(crate) fn spawn(coordinator: RunCoordinator) -> JoinSet<()> {
         tasks.spawn(async move {
             let mut guard = SleepGuard::new(caffeinate);
             loop {
-                let active_runs = coordinator.0.active.lock().await.len();
+                let active_runs = coordinator.active().len();
                 guard.update(active_runs);
                 tokio::time::sleep(POLL).await;
             }

@@ -1,3 +1,5 @@
+mod run_lifecycle;
+
 use super::{
     handoff::{
         HANDOFF_SUMMARY_MAX_BYTES, cap_handoff_summary, format_handoff, handoff_excerpt,

@@ -124,14 +124,7 @@ impl RunCoordinator {
 
     pub async fn delete_project(&self, id: Uuid) -> CoreResult<()> {
         let _project = self.0.project_locks.get(id).write_owned().await;
-        if self
-            .0
-            .active
-            .lock()
-            .await
-            .values()
-            .any(|run| run.project_id == id)
-        {
+        if self.active().values().any(|run| run.project_id == id) {
             return Err(CoreError::InvalidArgument("project has active runs".into()));
         }
         self.0.store.delete_project(id).await
@@ -354,7 +347,7 @@ impl RunCoordinator {
         let session_id = thread.provider_session_id.clone().ok_or_else(|| {
             CoreError::InvalidArgument("thread has no Codex session to compact yet".into())
         })?;
-        if self.0.active.lock().await.contains_key(&id) {
+        if self.active().contains_key(&id) {
             return Err(CoreError::InvalidArgument(
                 "thread has a running turn; wait for it to finish".into(),
             ));
