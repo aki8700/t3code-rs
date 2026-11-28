@@ -725,6 +725,9 @@ async fn send(
     effort: &str,
 ) -> CoreResult<(String, usize)> {
     desktop.chat_window().await?;
+    // An open history sidebar makes SwiftCUA's snapshot hit its deadline before the
+    // chat pane (122 nodes, truncated, no composer; closed: 47 nodes in 0.2 s).
+    desktop.sidebar(false).await?;
     empty_composer(desktop).await?;
     if let Some(conversation) = resume {
         let sidebar = desktop.sidebar(true).await?;
@@ -736,6 +739,7 @@ async fn send(
                 .wait_for(|rows| selected_conversation(rows) == Some(conversation))
                 .await?;
         }
+        desktop.sidebar(false).await?;
     } else {
         let current = desktop.sidebar(false).await?;
         let controls = nodes(&current);
