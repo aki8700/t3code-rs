@@ -214,7 +214,11 @@ async fn copy_answer(desktop: &Desktop<'_>) -> Option<String> {
 }
 
 async fn clipboard() -> Option<String> {
-    let out = Command::new("pbpaste").output().await.ok()?;
+    let out = Command::new("pbpaste")
+        .env("LANG", "en_US.UTF-8")
+        .output()
+        .await
+        .ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -222,7 +226,9 @@ async fn clipboard() -> Option<String> {
 
 async fn set_clipboard(text: &str) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
+    // launchd starts t3d without LANG; pbcopy/pbpaste then mangle non-ASCII text.
     let mut child = Command::new("pbcopy")
+        .env("LANG", "en_US.UTF-8")
         .stdin(std::process::Stdio::piped())
         .spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
