@@ -5531,3 +5531,84 @@ async fn gemini_app_workers_queue_and_report_full_thread_answers() {
     assert_eq!(ax["submitted"], json!([brief, brief, followup]));
     coordinator.interrupt_all().await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn swarm_quota_reset_resumes_the_coordinator_or_yields_to_a_manual_run() {
+    let (automatic, manual) =
+        tokio::join!(quota_coordinator_runs(false), quota_coordinator_runs(true));
+    assert!(
+        automatic[1]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("swarm_read_board")
+    );
+    assert!(
+        automatic[1]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("split the work")
+    );
+    assert_eq!(manual[1]["prompt"], "manual continuation");
+}
+
+#[cfg(unix)]
+async fn quota_coordinator_runs(manual: bool) -> Vec<Value> {
+    let tmp = TempDir::new();
+    let (app, id, mut events) = swarm_fixture_with_events(&tmp, r#"#!/bin/sh
+IFS= read -r prompt
+if test -e limited-once; then
+    printf '%s\n' '{"type":"result","subtype":"success","result":"done"}'
+else
+    touch limited-once
+    reset=$(( $(date +%s) + 3 ))
+    printf '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":%s,"rateLimitType":"five_hour"}}\n' "$reset"
+fi
+"#).await;
+    json_req(
+        &app,
+        Method::PATCH,
+        "/api/settings",
+        Some(json!({"rate_limit_max_retries":0})),
+    )
+    .await;
+    start_swarm(&app, id).await;
+    wait_for_runs(&app, id, 1).await;
+    if manual {
+        json_req(
+            &app,
+            Method::POST,
+            &format!("/api/threads/{id}/messages"),
+            Some(json!({"prompt":"manual continuation"})),
+        )
+        .await;
+    }
+    wait_for_thread_timeout(
+        &mut events,
+        id,
+        ThreadStatus::Completed,
+        Duration::from_secs(15),
+    )
+    .await;
+    let detail = json_req(&app, Method::GET, &format!("/api/threads/{id}"), None).await;
+    let runs = detail["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["status"], "rate-limited");
+    assert_eq!(runs[1]["status"], "completed");
+    let started = runs[1]["started_at"]
+        .as_str()
+        .unwrap()
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap();
+    let reset = runs[0]["error_message"]
+        .as_str()
+        .unwrap()
+        .rsplit_once("reset_at: ")
+        .unwrap()
+        .1
+        .trim_end_matches(')')
+        .parse::<i64>()
+        .unwrap();
+    assert!(started.timestamp() >= reset);
+    runs.clone()
+}

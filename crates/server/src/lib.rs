@@ -237,6 +237,7 @@ async fn resume_queued_runs_after_orphan_cleanup(
         .await?
         .into_iter()
         .collect();
+    coordinator.restore_quota_resumes(&pending_threads).await?;
     coordinator
         .resume_queued_runs_excluding(&pending_threads)
         .await

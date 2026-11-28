@@ -1,4 +1,5 @@
 mod locks;
+mod quota_resume;
 use crate::auth::{ActiveMcpToken, McpTokens, RunMcpToken};
 use crate::provider_hold::{ProviderHold, ProviderHolds, limited_until, model_scoped};
 use crate::swarm::{SwarmTurn, is_swarm_command};
@@ -50,6 +51,7 @@ pub(crate) struct Coordinator {
     tokens: McpTokens,
     limits: Arc<crate::limits::UsageLimitsCache>,
     pub(crate) holds: ProviderHolds,
+    quota_timers: quota_resume::Timers,
     user_runs: StdMutex<HashSet<Uuid>>,
     queued_tickets: StdMutex<HashMap<Uuid, watch::Sender<bool>>>,
     queued_chained_dones: StdMutex<HashMap<Uuid, Vec<watch::Sender<bool>>>>,
@@ -232,6 +234,7 @@ impl RunCoordinator {
             tokens,
             limits,
             holds: ProviderHolds::default(),
+            quota_timers: Default::default(),
             user_runs: StdMutex::default(),
             queued_tickets: StdMutex::default(),
             queued_chained_dones: StdMutex::default(),
@@ -828,6 +831,7 @@ impl RunCoordinator {
                 },
             )
             .await?;
+        self.cancel_quota_timer(thread.id);
         if busy {
             self.emit(WsServerMessage::RunStatusChanged {
                 thread_id: thread.id,
@@ -1505,7 +1509,7 @@ impl RunCoordinator {
                 })
             };
             tokio::pin!(worker);
-            loop {
+            let mut result = loop {
                 tokio::select! {
                     biased;
                     _ = async { let _ = cancellation.wait_for(|cancelled| *cancelled).await; } => {
@@ -1526,18 +1530,17 @@ impl RunCoordinator {
                             break Err(error);
                         }
                     }
-                    result = &mut worker => {
-                        let mut result = result;
-                        while let Ok(event) = rx.try_recv() {
-                            if let Err(error) = self.event(thread_id, run_id, event, &mut outcome).await {
-                                result = Err(error);
-                                break;
-                            }
-                        }
-                        break result;
-                    }
+                    result = &mut worker => break result,
+                }
+            };
+            // A terminal event may already be queued when the shutdown signal wins.
+            while let Ok(event) = rx.try_recv() {
+                if let Err(error) = self.event(thread_id, run_id, event, &mut outcome).await {
+                    result = Err(error);
+                    break;
                 }
             }
+            result
         };
         drop(mcp_token);
         // The provider worker has returned, so its attempt groups have gone through the
@@ -1707,14 +1710,17 @@ impl RunCoordinator {
         };
         let guard = self.lock_thread(thread_id).await;
         let cancelled = *cancellation.borrow() || verify_cancelled;
-        // A server shutdown leaves the run in flight, as a crash would, so that
-        // `recover_interrupted_runs` resumes it on the next start.
-        if cancelled
+        let shutting_down_run = cancelled
             && self
                 .active()
                 .get(&thread_id)
-                .is_some_and(|run| !run.stop_requested)
-        {
+                .is_some_and(|r| !r.stop_requested);
+        // Persist a provider-reported terminal limit even if shutdown races finalization.
+        // Other in-flight turns keep their session and inputs for crash recovery.
+        let terminal_limit = matches!(outcome.terminal, Some((RunStatus::RateLimited, _)))
+            || (matches!(outcome.terminal, Some((RunStatus::Failed, _)))
+                && outcome.failure_class == Some(FailureClass::UsageLimit));
+        if shutting_down_run && !terminal_limit {
             if let Err(error) = self.flush_output(thread_id, run_id, &mut outcome).await {
                 tracing::error!(%error, %run_id, "Could not keep the interrupted output");
             }
@@ -1728,9 +1734,11 @@ impl RunCoordinator {
             return None;
         }
         let mut error_class = None;
-        let (mut status, mut error) = if cancelled {
+        let (mut status, mut error) = if cancelled && !shutting_down_run {
             (RunStatus::Cancelled, Some("Interrupted".into()))
-        } else if let Err(error) = result {
+        } else if let Err(error) = result
+            && !shutting_down_run
+        {
             let message = error.to_string();
             error_class = Some(classify_harness_failure(
                 current_selection.provider,
@@ -1901,7 +1909,7 @@ impl RunCoordinator {
                 Message {
                     prompt: original_prompt,
                     behavior: None,
-                    attachment_ids,
+                    attachment_ids: attachment_ids.clone(),
                     model_selection: Some(fallback_model),
                     auto_wake: false,
                     mode_ceiling: None,
@@ -1937,6 +1945,7 @@ impl RunCoordinator {
         if !may_notify {
             drop(board_guard.take());
         }
+        let mut swarm_reset = None;
         if matches!(status, RunStatus::Failed | RunStatus::RateLimited)
             && let Some(message) = error.as_deref()
         {
@@ -1947,6 +1956,43 @@ impl RunCoordinator {
                     classify_provider_failure(outcome.provider, message, None)
                 }
             });
+            if (status == RunStatus::RateLimited || class == FailureClass::UsageLimit)
+                && (swarm.is_some() || thread.relationship.as_deref() == Some("swarm-worker"))
+            {
+                let now = Utc::now();
+                let until = self.quota_reset_time(&current_selection, message, &outcome, now);
+                if outcome
+                    .reset_at
+                    .as_deref()
+                    .and_then(crate::provider_hold::parse_reset_at)
+                    != Some(until)
+                {
+                    outcome.reset_at = Some(until.to_rfc3339());
+                }
+                // Preserve the effective modes and delivery depth even when coalescing
+                // rewrote the original queued prompt or the daemon restarts before reset.
+                if let Err(failure) = self
+                    .append(NewTurnItem {
+                        thread_id,
+                        run_id,
+                        kind: TurnItemKind::SystemNotice,
+                        summary: Some(quota_resume::CONTEXT_NOTICE.into()),
+                        payload: json!({
+                            "message": quota_resume::CONTEXT_NOTICE,
+                            "reset_at": until,
+                            "attachment_ids": attachment_ids,
+                            "wake_depth": wake_depth,
+                            "mode_ceiling": (thread.runtime_mode, thread.interaction_mode),
+                            "model_selection": current_selection,
+                        }),
+                        searchable_text: None,
+                    })
+                    .await
+                {
+                    tracing::error!(%failure,%run_id,"Could not persist quota resume context");
+                }
+                swarm_reset = Some((now, until));
+            }
             error = Some(format_run_error(
                 class,
                 message,
@@ -2132,6 +2178,41 @@ impl RunCoordinator {
                 .await
         {
             tracing::error!(%error, %run_id, "Could not notify coordinator of silent worker exit");
+        }
+        if let Some((ended, until)) = swarm_reset {
+            match self.get_board(thread_id).await {
+                Ok(Some(board)) => {
+                    if let Some(member) = board
+                        .members
+                        .iter()
+                        .find(|m| m.thread_id == thread_id && m.state != "killed")
+                    {
+                        if let Err(error) = self
+                            .ensure_quota_notice(
+                                member.board_id,
+                                &member.name,
+                                run_id,
+                                status,
+                                ended,
+                                until,
+                            )
+                            .await
+                        {
+                            tracing::warn!(%error, %run_id, "Could not record swarm quota notice");
+                        }
+                        self.emit(WsServerMessage::Resync {
+                            thread_id: Some(board.coordinator_thread_id),
+                        });
+                        if !followup {
+                            self.schedule_quota_resume(thread_id, run_id, until);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, %run_id, "Could not check quota-limited swarm membership")
+                }
+            }
         }
         drop(board_guard);
         self.emit(WsServerMessage::RunStatusChanged {

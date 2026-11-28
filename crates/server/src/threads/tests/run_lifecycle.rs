@@ -180,3 +180,126 @@ async fn silent_worker_uses_membership_registered_after_start() {
         "{posts:?}"
     );
 }
+
+#[tokio::test]
+async fn startup_resumes_latest_limited_member_once_and_repairs_its_notice() {
+    let (root, _, coordinator, project) = test_coordinator().await;
+    let store = &coordinator.0.store;
+    let parent = coordinator
+        .create_thread(shared_thread(project.id, "Coordinator"))
+        .await
+        .unwrap();
+    let board = store.ensure_swarm_board(parent.clone()).await.unwrap();
+    let worker = coordinator
+        .new_thread(
+            shared_thread(project.id, "Worker"),
+            Some((&parent, "swarm-worker")),
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_swarm_member(SwarmMember {
+            name: "review".into(),
+            role: "worker".into(),
+            thread_id: worker.id,
+            ..board.members[0].clone()
+        })
+        .await
+        .unwrap();
+    let id = Uuid::new_v4();
+    let ended = Utc::now() - chrono::Duration::hours(1);
+    store
+        .create_run(Run {
+            id,
+            thread_id: worker.id,
+            ordinal: 1,
+            provider: ProviderId::Mock,
+            model: "override-model".into(),
+            effort: None,
+            status: RunStatus::RateLimited,
+            prompt: "Review the pending changes".into(),
+            provider_session_id: Some("interrupted-session".into()),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            reasoning_tokens: None,
+            duration_ms: Some(1),
+            error_message: Some("usage_limit: no reset supplied".into()),
+            started_at: ended,
+            completed_at: Some(ended),
+        })
+        .await
+        .unwrap();
+    // Pending orphan cleanup must hold back the run while still repairing its board notice.
+    let cfg = coordinator.0.cfg.clone();
+    drop(coordinator);
+    let state = crate::ServerState::new(cfg.clone(), "http://127.0.0.1:0".into()).unwrap();
+    state
+        .coordinator
+        .restore_quota_resumes(&std::collections::HashSet::from([worker.id]))
+        .await
+        .unwrap();
+    let posts = state
+        .store
+        .list_swarm_messages(board.board_id, 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        posts.len(),
+        1,
+        "startup must repair the notice even while cleanup is pending"
+    );
+    assert_eq!(state.store.list_runs(worker.id).await.unwrap().len(), 1);
+    drop(state);
+
+    let state = crate::ServerState::new(cfg, "http://127.0.0.1:0".into()).unwrap();
+    let coordinator = &state.coordinator;
+    let store = &state.store;
+    let mut events = coordinator.subscribe();
+    for _ in 0..2 {
+        crate::resume_queued_runs_after_orphan_cleanup(coordinator, store)
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), WsServerMessage::RunStatusChanged {
+                thread_id, status:RunStatus::Completed, ..} if thread_id == worker.id)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("overdue worker must resume after restart");
+    crate::resume_queued_runs_after_orphan_cleanup(coordinator, store)
+        .await
+        .unwrap();
+    let runs = store.list_runs(worker.id).await.unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1].model, "override-model");
+    assert_eq!(
+        runs[1].provider_session_id.as_deref(),
+        Some("interrupted-session")
+    );
+    assert!(
+        runs[1].prompt.contains("[system]")
+            && runs[1].prompt.contains("Review the pending changes")
+    );
+    let posts = store
+        .list_swarm_messages(board.board_id, 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        posts
+            .iter()
+            .filter(|post| post.sender == "system"
+                && post.text.contains("review")
+                && post.text.contains("RateLimited"))
+            .count(),
+        1
+    );
+    coordinator.interrupt_all().await;
+    std::fs::remove_dir_all(root).unwrap();
+}

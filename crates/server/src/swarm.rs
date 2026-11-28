@@ -437,8 +437,14 @@ impl RunCoordinator {
         let _board = self.lock_board(caller_id).await?;
         let guard = self.lock_thread(caller_id).await;
         let depth = self.wake_depth(caller_id);
-        self.post_locked(&guard, caller_id, sender_override, text, depth)
-            .await
+        self.post_locked(
+            &guard,
+            caller_id,
+            sender_override.map(|sender| (sender, None)),
+            text,
+            depth,
+        )
+        .await
     }
 
     /// `depth` is the wake depth of the run that caused the post. System notices pass the
@@ -447,27 +453,23 @@ impl RunCoordinator {
         &self,
         guard: &ThreadGuard,
         caller_id: Uuid,
-        sender_override: Option<&str>,
+        sender_override: Option<(&str, Option<Uuid>)>,
         text: String,
         depth: u8,
     ) -> CoreResult<(SwarmBoardSnapshot, SwarmPostResult)> {
         validate_text(&text)?;
         let board = self.require_board(caller_id).await?;
-        let (sender, caller) = if let Some(sender) = sender_override {
-            (sender.to_owned(), None)
+        let (sender, caller, sender_run_id) = if let Some((sender, run_id)) = sender_override {
+            (sender.to_owned(), None, run_id)
         } else {
             let member = live_member(&board, caller_id)?;
             (
                 member.name.clone(),
                 Some(self.effective_thread(caller_id).await?),
+                self.active().get(&caller_id).map(|run| run.id),
             )
         };
         let mentions = mentions_in(&text);
-        let sender_run_id = if sender_override.is_none() {
-            self.active().get(&caller_id).map(|run| run.id)
-        } else {
-            None
-        };
         let post = self
             .0
             .store
@@ -956,8 +958,14 @@ impl RunCoordinator {
         // silent worker accumulates depth even though it is idle between its turns.
         let coordinator = board.coordinator_thread_id;
         let depth = self.wake_depth(thread_id).max(self.wake_depth(coordinator));
-        self.post_locked(guard, coordinator, Some("system"), text, depth)
-            .await?;
+        self.post_locked(
+            guard,
+            coordinator,
+            Some(("system", Some(run_id))),
+            text,
+            depth,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1191,7 +1199,7 @@ impl RunCoordinator {
             "@coordinator Swarm action(s) from your last turn failed:\n{failures}Fix the action and emit it again."
         );
         let depth = self.wake_depth(thread_id);
-        self.post_locked(guard, thread_id, Some("system"), text, depth)
+        self.post_locked(guard, thread_id, Some(("system", None)), text, depth)
             .await
             .map(drop)
     }
