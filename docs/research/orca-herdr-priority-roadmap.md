@@ -127,3 +127,9 @@
 - **保留／未着手**:
   - **DeepSeek**（`opencode/deepseek-v4.1-flash-free`）は OpenCode 無料枠上限（`AI_APICallError: Free usage limit reached`）のため、該当実装はすべて Gemini Mac アプリへフォールバック済み。
   - **未着手（大改修枠）**: **G-1**（`coordinator.rs` `active` ロック縮小）、**G-9 残り**（`coordinator.rs` / `process.rs` / `threads.rs` / `store/lib.rs` 分割）。
+- **2026-11-28 残りの実装（Codex + Claude 直接修正）反映済み**:
+  - **G-9 完了**: `threads.rs`（0fff3c5）、`store/lib.rs`（9ac2696）、`process.rs`（fa88e2e）、`coordinator.rs`（6104baf、2,976 行 → 506 行 + `coordinator/{execute,queue,start,state,stream}.rs`。`execute` 本体 886 行は分割せず 890 行の 1 ファイル）。
+  - **G-1 完了**（5ba6c7c）: 全スレッド共通の `active` ロック保持を撤廃し、スレッド単位（`KeyedLocks`）・プロジェクト単位・ボード単位のロックへ。`active` は `std::sync::Mutex`。Gemini レビューで見つかった「削除済みスレッドで run が始まる」競合ほか A〜E を修正。
+  - **F 完了**: swarm ワーカー上限撤廃（F-1）、`gemini-app` ワーカー（F-2、343967b）、Gemini ブリッジ安定化（F-3 + 実機回帰で 1/12 → 12/12、113f3c3・1169ed3・98baf34）、利用枠切れからの自動再開（F-4、7cced84）。
+  - **ハーネス**: ターン予算を 5 倍（0ad8cde）、キャッシュ読みを予算から除外（a5bc07f）。
+  - **方針変更**: Gemini の画面操作自動化はやめ、Google Drive（T3-Gemini）＋ Gemini のスキル／スケジュールでの委譲に移行。Antigravity（agy）は規約上、自動化の経路から撤去。
