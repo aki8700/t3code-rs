@@ -14,7 +14,6 @@ use uuid::Uuid;
 
 const MAX_WAKE_DEPTH: u8 = 8;
 const MAX_MESSAGE_BYTES: usize = 4096;
-const MAX_ACTIVE_WORKERS: usize = 8;
 const WAKE_BATCH: usize = 16;
 const MAX_WAKE_REDELIVERIES: u8 = 1;
 const ENDED_ERROR_CHARS: usize = 200;
@@ -96,6 +95,7 @@ pub(crate) enum Action {
 
 pub(crate) struct SwarmTurn {
     pub(crate) board_id: Uuid,
+    gemini_worker: bool,
     pub(crate) worker_name: Option<String>,
     marker: Option<String>,
 }
@@ -109,13 +109,17 @@ impl SwarmTurn {
         prompt: &mut String,
     ) -> CoreResult<Self> {
         let member = live_member(board, thread_id)?;
-        let marker =
-            (provider != ProviderId::Mock).then(|| format!("T3_SWARM_ACTION {}", board.board_id));
+        let marker = (!matches!(provider, ProviderId::Mock | ProviderId::GeminiApp))
+            .then(|| format!("T3_SWARM_ACTION {}", board.board_id));
         let turn = Self {
             board_id: board.board_id,
+            gemini_worker: provider == ProviderId::GeminiApp && member.role == "worker",
             worker_name: (member.role != "coordinator").then(|| member.name.clone()),
             marker,
         };
+        if provider == ProviderId::GeminiApp {
+            return Ok(turn);
+        }
         if resumed {
             let mut instructions = format!("Swarm board {} ({}).\n", board.board_id, member.name);
             if turn.marker.is_some() {
@@ -155,6 +159,13 @@ impl SwarmTurn {
     }
 
     pub(crate) fn actions(&self, output: &str) -> Vec<Action> {
+        if self.gemini_worker {
+            // Only the coordinator is addressed. The verbatim answer is kept on the thread.
+            let report = format!("@coordinator [done] {}", output.replace('@', "＠"));
+            return vec![Action::Post {
+                text: t3_maki::cap_section_utf8(&report, MAX_MESSAGE_BYTES).0,
+            }];
+        }
         let Some(marker) = &self.marker else {
             return Vec::new();
         };
@@ -261,8 +272,7 @@ impl RunCoordinator {
         if spec.brief.trim().is_empty() {
             return Err(CoreError::InvalidArgument("swarm brief is required".into()));
         }
-        let text = format!("@{} {}", spec.name, spec.brief);
-        validate_text(&text)?;
+
         let store = &self.0.store;
         let board = self.require_board(caller_id).await?;
         let actor = live_member(&board, caller_id)?;
@@ -270,11 +280,6 @@ impl RunCoordinator {
             return Err(CoreError::InvalidArgument(
                 "swarm name is already in use".into(),
             ));
-        }
-        if live_worker_count(&board) >= MAX_ACTIVE_WORKERS {
-            return Err(CoreError::InvalidArgument(format!(
-                "swarm allows at most {MAX_ACTIVE_WORKERS} active workers"
-            )));
         }
         let depth = self.wake_depth(caller_id);
         if depth >= MAX_WAKE_DEPTH {
@@ -289,14 +294,27 @@ impl RunCoordinator {
                 "swarm coordinator exceeds caller permissions or is archived".into(),
             ));
         }
-        if parent.interaction_mode == InteractionMode::Plan
-            && spec.isolation == IsolationMode::Worktree
+        let model_selection = worker_model(&parent.model_selection, &spec);
+        let desktop = model_selection.provider == ProviderId::GeminiApp;
+        let isolation = if desktop {
+            IsolationMode::Shared
+        } else {
+            spec.isolation
+        };
+        let text = format!("@{} {}", spec.name, spec.brief);
+        let text = if desktop {
+            crate::gemini_app::validate_prompt(&spec.brief)?;
+            t3_maki::cap_section_utf8(&text, MAX_MESSAGE_BYTES).0
+        } else {
+            validate_text(&text)?;
+            text
+        };
+        if parent.interaction_mode == InteractionMode::Plan && isolation == IsolationMode::Worktree
         {
             return Err(CoreError::InvalidArgument(
                 "a plan thread cannot delegate to a worktree".into(),
             ));
         }
-        let model_selection = worker_model(&parent.model_selection, &spec);
         if let Some((hold, _)) = self.0.holds.blocking(&model_selection, None) {
             return Err(CoreError::Provider(t3_providers::format_worker_error(
                 t3_providers::FailureClass::UsageLimit,
@@ -316,7 +334,7 @@ impl RunCoordinator {
                     model_selection: Some(model_selection.clone()),
                     runtime_mode: parent.runtime_mode,
                     interaction_mode: parent.interaction_mode,
-                    isolation: spec.isolation,
+                    isolation,
                     base_ref: None,
                 },
                 Some((&parent, "swarm-worker")),
@@ -344,7 +362,11 @@ impl RunCoordinator {
                     vec![member.name.clone()],
                 )
                 .await?;
-            let prompt = format!("Your swarm brief from {}:\n{}", actor.name, spec.brief);
+            let prompt = if desktop {
+                spec.brief
+            } else {
+                format!("Your swarm brief from {}:\n{}", actor.name, spec.brief)
+            };
             let run_id = self
                 .send_locked(
                     &worker_guard,
@@ -372,7 +394,7 @@ impl RunCoordinator {
         if let Err(error) = result {
             if !self.active().contains_key(&worker.id) {
                 self.discard_thread(&worker).await;
-                if spec.isolation == IsolationMode::Worktree
+                if isolation == IsolationMode::Worktree
                     && let Some(path) = &worker.worktree_path
                     && let Ok(workspace) = self.workspace(&parent).await
                 {
@@ -546,10 +568,12 @@ impl RunCoordinator {
         // cost one turn instead of one turn each. Only the running run's posts are skipped.
         let (running_range, mut preserved) = self.supersede_queued_wakes(target.id).await?;
         let mut cursor = skip_contiguous_running_range(member.last_read_seq, running_range);
+        let desktop = member.provider == ProviderId::GeminiApp;
+        let batch = if desktop { 1 } else { WAKE_BATCH };
         let mut woken = false;
         loop {
             let messages = store
-                .list_swarm_messages(member.board_id, cursor, WAKE_BATCH)
+                .list_swarm_messages(member.board_id, cursor, batch)
                 .await?;
             let Some(last) = messages.last() else {
                 self.cancel_trailing_wakes(guard, preserved).await?;
@@ -557,18 +581,30 @@ impl RunCoordinator {
             };
             let unread = messages
                 .iter()
-                .filter(|message| message.sender != member.name)
+                .filter(|message| {
+                    message.sender != member.name
+                        && (!desktop
+                            || message
+                                .mentions
+                                .iter()
+                                .any(|m| m == &member.name || m == "all"))
+                })
                 .collect::<Vec<_>>();
             if !unread.is_empty() {
-                let mut prompt = format!("Unread swarm board posts for @{}:\n", member.name);
-                for message in unread {
-                    writeln!(
-                        prompt,
-                        "#{} {}: {}",
-                        message.seq, message.sender, message.text
-                    )
-                    .expect("write to String");
-                }
+                let prompt = if desktop {
+                    unread[0].text.clone()
+                } else {
+                    let mut prompt = format!("Unread swarm board posts for @{}:\n", member.name);
+                    for message in unread {
+                        writeln!(
+                            prompt,
+                            "#{} {}: {}",
+                            message.seq, message.sender, message.text
+                        )
+                        .expect("write to String");
+                    }
+                    prompt
+                };
                 let queued = if preserved.is_empty() {
                     None
                 } else {
@@ -644,7 +680,7 @@ impl RunCoordinator {
                     .await?;
             }
             cursor = last.seq;
-            if messages.len() < WAKE_BATCH {
+            if messages.len() < batch {
                 self.cancel_trailing_wakes(guard, preserved).await?;
                 return Ok(woken);
             }
@@ -1269,14 +1305,6 @@ fn next_wake_depth(depth: u8) -> u8 {
     depth.saturating_add(1)
 }
 
-fn live_worker_count(board: &SwarmBoardSnapshot) -> usize {
-    board
-        .members
-        .iter()
-        .filter(|member| member.role != "coordinator" && member.state != "killed")
-        .count()
-}
-
 #[cfg(test)]
 fn posted_since(messages: &[SwarmMessage], sender: &str, since: DateTime<Utc>) -> bool {
     messages
@@ -1619,23 +1647,6 @@ mod tests {
             mentions: Vec::new(),
             created_at,
         }
-    }
-
-    #[test]
-    fn active_worker_limit_ignores_coordinator_and_killed_members() {
-        let mut members = vec![member("coordinator", "coordinator", "working")];
-        members
-            .extend((0..MAX_ACTIVE_WORKERS).map(|i| member(&format!("w{i}"), "worker", "working")));
-        members.push(member("old", "worker", "killed"));
-        let board = SwarmBoardSnapshot {
-            board_id: Uuid::nil(),
-            coordinator_thread_id: Uuid::nil(),
-            title: "test".into(),
-            members,
-            messages: Vec::new(),
-            head_seq: 0,
-        };
-        assert_eq!(live_worker_count(&board), MAX_ACTIVE_WORKERS);
     }
 
     #[test]

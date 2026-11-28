@@ -29,6 +29,11 @@ pub(crate) fn default_models(provider: ProviderId) -> Vec<ModelSpec> {
             ("win10-ds4p/ds4p-9b-heretic", Tier0FreeLocal),
             ("local-uncensored/uncensored-4b", Tier0FreeLocal),
         ],
+        GeminiApp => &[
+            ("hydrogen", Tier1Fast),
+            ("argon", Tier2Review),
+            ("neon", Tier3Arch),
+        ],
         Mock => &[("mock-fast", Tier0FreeLocal)],
     };
     entries
@@ -77,6 +82,7 @@ pub fn context_window_for(provider: ProviderId, model: &str) -> u64 {
                 128_000
             }
         }
+        ProviderId::GeminiApp => 0, // The app does not expose a context limit.
         ProviderId::Mock => 200_000,
     }
 }
@@ -86,6 +92,7 @@ fn model(provider: ProviderId, id: &str, tier: ModelTier) -> ModelSpec {
         ProviderId::Claude | ProviderId::Antigravity => &["low", "medium", "high", "xhigh", "max"],
         ProviderId::Codex => &["low", "medium", "high", "xhigh"],
         ProviderId::OpenCode => &["low", "medium", "high", "max"],
+        ProviderId::GeminiApp => &["low", "standard", "high", "app"],
         ProviderId::Mock => &[],
     };
     ModelSpec {

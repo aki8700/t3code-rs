@@ -227,6 +227,7 @@ fn provider_key(provider: ProviderId) -> &'static str {
         ProviderId::Codex => "codex",
         ProviderId::Antigravity => "antigravity",
         ProviderId::OpenCode => "open-code",
+        ProviderId::GeminiApp => "gemini-app",
         ProviderId::Mock => "mock",
     }
 }
@@ -247,6 +248,7 @@ fn provider_label(provider: ProviderId) -> &'static str {
         ProviderId::Codex => "Codex",
         ProviderId::Antigravity => "Antigravity",
         ProviderId::OpenCode => "OpenCode",
+        ProviderId::GeminiApp => "Gemini for Mac",
         ProviderId::Mock => "Mock",
     }
 }

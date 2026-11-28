@@ -123,7 +123,7 @@ impl Parser {
                 first_string(event, &["conversation_id", "session_id", "conversationId"])
             }
             ProviderId::OpenCode => first_string(event, &["sessionID", "session_id"]),
-            ProviderId::Mock => None,
+            ProviderId::GeminiApp | ProviderId::Mock => None,
         };
         if let Some(session) = session.filter(|session| !session.is_empty())
             && self.session.as_deref() != Some(session)
@@ -139,7 +139,7 @@ impl Parser {
             ProviderId::Codex => self.codex(event, &mut out),
             ProviderId::Antigravity => self.antigravity(event, &mut out),
             ProviderId::OpenCode => self.opencode(event, &mut out),
-            ProviderId::Mock => {}
+            ProviderId::GeminiApp | ProviderId::Mock => {}
         }
         out
     }

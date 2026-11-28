@@ -968,7 +968,7 @@ fn build_tools() -> Vec<Value> {
         make(
             "swarm_add_worker",
             "Start a named worker and return its member record with brief_chars (not the brief text). The brief states the objective, expected output, boundaries, effort budget and stop condition.",
-            json!({"thread_id": uuid, "name": string, "brief": string, "provider": provider,
+            json!({"thread_id": uuid, "name": string, "brief": string, "provider": {"enum":["claude","codex","antigravity","open-code","opencode","mock","gemini-app"]},
                 "model": string, "effort": string, "isolation": {"enum": ["shared", "worktree"]}}),
             &["name", "brief"],
         ),

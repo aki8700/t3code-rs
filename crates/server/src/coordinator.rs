@@ -215,9 +215,16 @@ impl RunCoordinator {
         settings: crate::settings::SettingsStore,
     ) -> Self {
         let (events, _) = broadcast::channel(512);
+        let mut providers = ProviderRegistry::from_config(&cfg);
+        if cfg.computer_use_enabled {
+            providers.register(Arc::new(crate::gemini_app::Driver::new(
+                &cfg,
+                store.clone(),
+            )));
+        }
         Self(Arc::new(Coordinator {
             git: GitManager::new(cfg.worktrees_dir()),
-            providers: ProviderRegistry::from_config(&cfg),
+            providers,
             cfg,
             settings,
             store,
@@ -985,6 +992,9 @@ impl RunCoordinator {
     }
 
     pub(crate) fn driver(&self, model: &ModelSelection) -> CoreResult<Arc<dyn ProviderDriver>> {
+        if model.provider == ProviderId::GeminiApp {
+            crate::gemini_app::validate_selection(model)?;
+        }
         if model.model.trim().is_empty() {
             return Err(CoreError::InvalidArgument("model is required".into()));
         }
@@ -1063,7 +1073,8 @@ impl RunCoordinator {
                                     .all(|c| c.is_ascii_alphanumeric() || c == b'-')
                         })
                 });
-        let handoff = if restarted {
+        let desktop = selection.provider == ProviderId::GeminiApp;
+        let handoff = if restarted || desktop {
             None
         } else if previous_run.is_some() && resume_session_id.is_none() {
             let handoff = self.handoff_summary(&thread).await?;
@@ -1089,7 +1100,8 @@ impl RunCoordinator {
         } else {
             request_prompt.clone()
         };
-        if resume_session_id.is_none()
+        if !desktop
+            && resume_session_id.is_none()
             && let Some(instructions) = project
                 .instructions
                 .as_deref()
@@ -1428,7 +1440,9 @@ impl RunCoordinator {
 
         // Capture pre-run Git tree snapshot outside the global `active` lock (Astra B1)
         // so slow git subprocesses never block unrelated threads.
-        let pre_tree = if thread.interaction_mode != InteractionMode::Plan {
+        let writes_workspace = thread.interaction_mode != InteractionMode::Plan
+            && current_selection.provider != ProviderId::GeminiApp;
+        let pre_tree = if writes_workspace {
             match GitManager::snapshot_tree(&workspace_dir).await {
                 Ok(Some(tree)) => match self
                     .0
@@ -1547,7 +1561,7 @@ impl RunCoordinator {
         if !*cancellation.borrow()
             && result.is_ok()
             && matches!(outcome.terminal, Some((RunStatus::Completed, _)))
-            && thread.interaction_mode != InteractionMode::Plan
+            && writes_workspace
             && let Some(cmd) = verify_command
                 .as_deref()
                 .map(str::trim)
@@ -1906,6 +1920,11 @@ impl RunCoordinator {
             ));
         }
 
+        if let Err(failure) = self.flush_output(thread_id, run_id, &mut outcome).await {
+            status = RunStatus::Failed;
+            error = Some(failure.to_string());
+            error_class = Some(FailureClass::HarnessError);
+        }
         if status == RunStatus::Completed
             && verify_passed
             && !actions.is_empty()
@@ -1917,11 +1936,6 @@ impl RunCoordinator {
         }
         if !may_notify {
             drop(board_guard.take());
-        }
-        if let Err(failure) = self.flush_output(thread_id, run_id, &mut outcome).await {
-            status = RunStatus::Failed;
-            error = Some(failure.to_string());
-            error_class = Some(FailureClass::HarnessError);
         }
         if matches!(status, RunStatus::Failed | RunStatus::RateLimited)
             && let Some(message) = error.as_deref()
@@ -2484,7 +2498,11 @@ impl RunCoordinator {
                             && item.kind == TurnItemKind::AssistantMessage
                             && text_value(&item.payload) == Some(&text)
                     }) {
-                        push_capped(&mut out.assistant, &text, out.reasoning.len());
+                        if out.provider == ProviderId::GeminiApp {
+                            out.assistant = text;
+                        } else {
+                            push_capped(&mut out.assistant, &text, out.reasoning.len());
+                        }
                     }
                 }
                 out.terminal = Some((RunStatus::Completed, None));

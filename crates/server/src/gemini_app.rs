@@ -4,7 +4,11 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
-use t3_core::{CoreError, CoreResult, Store};
+use t3_core::{
+    CoreError, CoreResult, ModelSelection, ProviderDriver, ProviderHealth, ProviderId,
+    ServerConfig, Store, StreamEvent, TurnRequest,
+};
+use t3_store::SqliteStore;
 use tokio::{
     process::Command,
     sync::Mutex,
@@ -31,23 +35,112 @@ pub(crate) async fn ask(
     if thread.archived {
         return Err(CoreError::InvalidArgument("thread is archived".into()));
     }
-    if !state.config.computer_use_enabled {
-        return Err(failure("T3 の computer_use_enabled を有効にしてください"));
-    }
-    let bin = state
-        .config
-        .resolved_cua_bin()
-        .ok_or_else(|| failure("SwiftCUA をインストールしてください"))?;
-    let _guard = SESSION
-        .try_lock()
-        .map_err(|_| failure("Gemini アプリは別の質問を処理中です"))?;
     let started_at = Utc::now();
     let started = Instant::now();
-    let mut desktop = Desktop {
-        bin: &bin,
-        window: None,
+    let (answer, selection) = ask_app(&state.config, &state.store, id, options).await?;
+    let model = &selection.model;
+    let effort = selection.effort.as_deref().unwrap_or("app");
+    let mut result = shell::ShellExecOutput {
+        command: format!("/gemini --model {model} --effort {effort} {prompt}"),
+        cwd: String::new(),
+        exit_code: Some(0),
+        stdout: answer,
+        stderr: String::new(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        timed_out: false,
+        cancelled: false,
+        truncated: false,
+        item_id: None,
     };
-    let saved = state.store.gemini_app_session(id).await?;
+    shell::persist_thread_command_result(
+        state,
+        &thread,
+        started_at,
+        Utc::now(),
+        &mut result,
+        Some(&selection),
+    )
+    .await?;
+    Ok(result)
+}
+
+pub(crate) struct Driver {
+    config: ServerConfig,
+    store: SqliteStore,
+}
+
+impl Driver {
+    pub(crate) fn new(config: &ServerConfig, store: SqliteStore) -> Self {
+        Self {
+            config: config.clone(),
+            store,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ProviderDriver for Driver {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::GeminiApp
+    }
+    async fn health_check(&self) -> ProviderHealth {
+        let bin = self.config.resolved_cua_bin();
+        ProviderHealth {
+            provider: self.provider_id(),
+            available: bin.as_ref().is_some_and(|p| p.is_file()),
+            binary_path: bin,
+            version: None,
+            models: t3_providers::ProviderRegistry::default_models(self.provider_id()),
+            error: None,
+        }
+    }
+    async fn run_turn(
+        &self,
+        req: TurnRequest,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    ) -> CoreResult<()> {
+        if !req.attachments.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "Gemini app accepts text only".into(),
+            ));
+        }
+        validate_prompt(&req.prompt)?;
+        let options = Options {
+            prompt: &req.prompt,
+            model: Some(&req.model_selection.model),
+            effort: req.model_selection.effort.as_deref(),
+            new: false,
+        };
+        let (answer, _) = ask_app(&self.config, &self.store, req.thread_id, options).await?;
+        let _ = tx.send(StreamEvent::Completed {
+            final_text: Some(answer),
+        });
+        Ok(())
+    }
+    // The coordinator drops run_turn (including its session lock and CUA child)
+    // on interruption. Never press Stop on a different conversation.
+    async fn interrupt(&self, _: Uuid) -> CoreResult<()> {
+        Ok(())
+    }
+}
+
+async fn ask_app(
+    cfg: &ServerConfig,
+    store: &SqliteStore,
+    id: Uuid,
+    options: Options<'_>,
+) -> CoreResult<(String, ModelSelection)> {
+    if !cfg.computer_use_enabled {
+        return Err(failure("T3 の computer_use_enabled を有効にしてください"));
+    }
+    let bin = cfg
+        .resolved_cua_bin()
+        .ok_or_else(|| failure("SwiftCUA をインストールしてください"))?;
+    let _guard = SESSION.lock().await;
+    let bin = bin.as_path();
+    let prompt = options.prompt;
+    let mut desktop = Desktop { bin, window: None };
+    let saved = store.gemini_app_session(id).await?;
     let model = options
         .model
         .or_else(|| saved.as_ref().map(|entry| entry.1.as_str()))
@@ -67,36 +160,27 @@ pub(crate) async fn ask(
         .filter(|_| !options.new)
         .map(|entry| entry.0.as_str());
     let (conversation, prior_matches) = send(&mut desktop, prompt, resume, model, effort).await?;
-    state
-        .store
+    store
         .bind_gemini_app_session(id, conversation, model.into(), effort.into())
         .await?;
     if resume.is_none() {
         desktop.sidebar(false).await?;
     }
-    let answer = wait_for_answer(&desktop, prompt, prior_matches).await?;
-    let mut result = shell::ShellExecOutput {
-        command: format!("/gemini --model {model} --effort {effort} {prompt}"),
-        cwd: String::new(),
-        exit_code: Some(0),
-        stdout: answer,
-        stderr: String::new(),
-        duration_ms: started.elapsed().as_millis() as u64,
-        timed_out: false,
-        cancelled: false,
-        truncated: false,
-        item_id: None,
-    };
-    shell::persist_thread_command_result(
-        state,
-        &thread,
-        started_at,
-        Utc::now(),
-        &mut result,
-        "gemini_app",
+    let answer = timeout(
+        Duration::from_secs(15 * 60),
+        wait_for_answer(&desktop, prompt, prior_matches),
     )
-    .await?;
-    Ok(result)
+    .await
+    .map_err(|_| failure("回答が15分以内に完了しませんでした"))??;
+    Ok((
+        answer,
+        ModelSelection {
+            provider: ProviderId::GeminiApp,
+            model: model.into(),
+            effort: Some(effort.into()),
+            agent: None,
+        },
+    ))
 }
 
 fn failure(message: &str) -> CoreError {
@@ -114,49 +198,55 @@ impl Desktop<'_> {
         if let Some(window) = self.window {
             params["windowId"] = json!(window);
         }
-        let output = timeout(
-            Duration::from_secs(8),
-            Command::new(self.bin)
-                .kill_on_drop(true)
-                .args(["call", method, &params.to_string()])
-                .output(),
-        )
-        .await
-        .map_err(|_| failure("SwiftCUA が応答しません"))?
-        .map_err(|_| failure("SwiftCUA を実行できません"))?;
-        if !output.status.success() {
+        let args = params.to_string();
+        let mut delays = [2, 5, 10].into_iter();
+        let output = loop {
+            let output = timeout(
+                Duration::from_secs(8),
+                Command::new(self.bin)
+                    .kill_on_drop(true)
+                    .args(["call", method, &args])
+                    .output(),
+            )
+            .await
+            .map_err(|_| failure("SwiftCUA が応答しません"))?
+            .map_err(|_| failure("SwiftCUA を実行できません"))?;
+            if output.status.success() {
+                break output;
+            }
             let error = String::from_utf8_lossy(&output.stderr);
             let code = error
+                .trim_start()
                 .strip_prefix('[')
-                .and_then(|line| line.split_once(']'))
-                .and_then(|(code, _)| code.parse::<i32>().ok());
+                .and_then(|s| s.split_once(']'))
+                .and_then(|(n, _)| n.parse::<i32>().ok());
+            if code == Some(1007)
+                && matches!(method, "click" | "getAppState")
+                && let Some(delay) = delays.next()
+            {
+                sleep(Duration::from_secs(delay)).await;
+                continue;
+            }
             let hint = code
                 .map(|code| format!(" (エラー {code})"))
                 .unwrap_or_default();
             return Err(failure(&format!(
                 "SwiftCUA の {method} が失敗しました{hint}"
             )));
-        }
+        };
         serde_json::from_slice(&output.stdout)
             .map_err(|_| failure("SwiftCUA の応答を読み取れません"))
     }
 
     async fn snapshot(&self) -> CoreResult<Value> {
-        // SwiftUI briefly retracts accessibility windows while changing views.
-        for _ in 0..3 {
-            if let Ok(state) = self.read_snapshot().await {
-                return Ok(state);
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
-        self.read_snapshot().await
+        self.snapshot_query(Some("AXButton")).await
     }
 
-    async fn read_snapshot(&self) -> CoreResult<Value> {
+    async fn snapshot_query(&self, query: Option<&str>) -> CoreResult<Value> {
         let state = self
             .call(
                 "getAppState",
-                json!({"includeScreenshot":false,"disableDiff":true,"limit":1600}),
+                json!({"includeScreenshot":false, "disableDiff":true, "limit":6000, "query":query}),
             )
             .await?;
         let window = state
@@ -210,8 +300,16 @@ impl Desktop<'_> {
     }
 
     async fn wait_for(&self, ready: impl Fn(&[&Value]) -> bool) -> CoreResult<Value> {
+        self.wait_for_query("AXButton", ready).await
+    }
+
+    async fn wait_for_query(
+        &self,
+        query: &str,
+        ready: impl Fn(&[&Value]) -> bool,
+    ) -> CoreResult<Value> {
         for _ in 0..4 {
-            let state = self.snapshot().await?;
+            let state = self.snapshot_query(Some(query)).await?;
             if ready(&nodes(&state)) {
                 return Ok(state);
             }
@@ -322,11 +420,20 @@ fn nodes(state: &Value) -> Vec<&Value> {
     out
 }
 
-fn composer<'a>(nodes: &[&'a Value]) -> Option<&'a Value> {
-    nodes
-        .iter()
-        .copied()
-        .find(|node| node["role"] == "AXTextArea")
+fn composer(state: &Value) -> Option<&Value> {
+    fn visit(nodes: &[Value]) -> Option<&Value> {
+        nodes.iter().rev().find_map(|node| {
+            // Answer rows can themselves contain code editors.
+            if node["role"] == "AXRow" {
+                return None;
+            }
+            if node["role"] == "AXTextArea" {
+                return Some(node);
+            }
+            visit(node["children"].as_array()?)
+        })
+    }
+    visit(state.pointer("/state/accessibility/nodes")?.as_array()?)
 }
 
 fn button<'a>(nodes: &[&'a Value], id: &str) -> Option<&'a Value> {
@@ -336,7 +443,7 @@ fn button<'a>(nodes: &[&'a Value], id: &str) -> Option<&'a Value> {
 }
 
 fn chat_controls(nodes: &[&Value]) -> bool {
-    composer(nodes).is_some() && button(nodes, "tab_stop_model_selector").is_some()
+    button(nodes, "tab_stop_model_selector").is_some()
 }
 
 fn temporary_chat(field: &Value) -> bool {
@@ -386,12 +493,6 @@ fn answer(nodes: &[&Value], prompt: &str) -> Option<String> {
         };
         let mut parts = Vec::new();
         walk(children, &mut parts);
-        if !parts
-            .iter()
-            .any(|node| node["identifier"] == "copy-button" && has_state(node, "enabled"))
-        {
-            continue;
-        }
         let text = parts
             .iter()
             .filter(|node| {
@@ -435,13 +536,14 @@ impl<'a> Options<'a> {
             new: false,
         };
         while options.prompt.starts_with("--") {
+            let body = options.prompt;
             let (flag, rest) = options
                 .prompt
                 .split_once(char::is_whitespace)
                 .unwrap_or((options.prompt, ""));
             options.prompt = rest.trim_start();
             match flag {
-                "--" => break,
+                "--" if rest.starts_with("--") => break,
                 "--new" if !options.new => options.new = true,
                 "--model" | "--effort" => {
                     let (value, rest) = options
@@ -472,23 +574,40 @@ impl<'a> Options<'a> {
                         }
                     }
                 }
+                "--new" => return Err(CoreError::InvalidArgument("duplicate --new".into())),
                 _ => {
-                    return Err(CoreError::InvalidArgument(format!(
-                        "未対応のオプション: {flag}"
-                    )));
+                    options.prompt = body;
+                    break;
                 }
             }
         }
-        if options.prompt.is_empty()
-            || options.prompt.len() > 16 * 1024
-            || options.prompt.contains('\0')
-        {
-            return Err(CoreError::InvalidArgument(
-                "Gemini の質問は 1〜16384 バイトで入力してください".into(),
-            ));
-        }
+        validate_prompt(options.prompt)?;
         Ok(options)
     }
+}
+
+pub(crate) fn validate_prompt(prompt: &str) -> CoreResult<()> {
+    if prompt.trim().is_empty() || prompt.len() > 16 * 1024 || prompt.contains('\0') {
+        return Err(CoreError::InvalidArgument(
+            "Gemini の質問は 1〜16384 バイトで入力してください".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_selection(selection: &ModelSelection) -> CoreResult<()> {
+    if !matches!(
+        selection.model.as_str(),
+        "auto" | "hydrogen" | "neon" | "carbon" | "argon"
+    ) || !matches!(
+        selection.effort.as_deref(),
+        None | Some("low" | "standard" | "high" | "app")
+    ) {
+        return Err(CoreError::InvalidArgument(
+            "invalid Gemini app model or effort".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn by_label<'a>(nodes: &[&'a Value], test: impl Fn(&str) -> bool) -> Option<&'a Value> {
@@ -547,18 +666,24 @@ fn selected_conversation<'a>(nodes: &[&'a Value]) -> Option<&'a str> {
         .and_then(|node| node["identifier"].as_str())
 }
 
-fn require_empty(controls: &[&Value]) -> CoreResult<()> {
-    if button(controls, "stop_button").is_some() {
+async fn empty_composer(desktop: &Desktop<'_>) -> CoreResult<u64> {
+    if button(
+        &nodes(&desktop.snapshot_query(Some("stop_button")).await?),
+        "stop_button",
+    )
+    .is_some()
+    {
         return Err(failure("別の回答を生成中です"));
     }
-    let field = composer(controls).ok_or_else(|| failure("入力欄が見つかりません"))?;
+    let state = desktop.snapshot_query(Some("AXTextArea")).await?;
+    let field = composer(&state).ok_or_else(|| failure("入力欄が見つかりません"))?;
     if !empty_field(field) {
         return Err(failure("入力欄に下書きが残っています"));
     }
     if temporary_chat(field) {
         return Err(failure("Gemini の一時チャットを閉じてください"));
     }
-    Ok(())
+    index(field)
 }
 
 fn prompt_count(controls: &[&Value], prompt: &str) -> usize {
@@ -575,8 +700,8 @@ async fn send(
     model: &str,
     effort: &str,
 ) -> CoreResult<(String, usize)> {
-    let initial = desktop.chat_window().await?;
-    require_empty(&nodes(&initial))?;
+    desktop.chat_window().await?;
+    empty_composer(desktop).await?;
     if let Some(conversation) = resume {
         let sidebar = desktop.sidebar(true).await?;
         let rows = nodes(&sidebar);
@@ -600,21 +725,27 @@ async fn send(
         }
     }
     desktop.choose_model(model, effort).await?;
-    let ready = desktop.snapshot().await?;
-    let ready_nodes = nodes(&ready);
-    require_empty(&ready_nodes)?;
-    let prior_matches = prompt_count(&ready_nodes, prompt);
-    let field = composer(&ready_nodes).ok_or_else(|| failure("Gemini の入力欄が見つかりません"))?;
+    let headings = desktop.snapshot_query(Some("AXHeading")).await?;
+    let prior_matches = prompt_count(&nodes(&headings), prompt);
+    let field = empty_composer(desktop).await?;
     desktop
-        .action(
-            "setValue",
-            json!({"elementIndex":index(field)?,"value":prompt}),
-        )
+        .action("setValue", json!({"elementIndex":field,"value":prompt}))
         .await?;
+    let mut drafted = false;
+    for _ in 0..4 {
+        let state = desktop.snapshot_query(Some("AXTextArea")).await?;
+        if composer(&state).is_some_and(|field| field["value"].as_str() == Some(prompt)) {
+            drafted = true;
+            break;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    if !drafted {
+        return Err(failure("入力した本文を確認できません"));
+    }
     let drafted = desktop
-        .wait_for(|controls| {
-            composer(controls).is_some_and(|field| field["value"].as_str() == Some(prompt))
-                && button(controls, "send_button").is_some()
+        .wait_for_query("send_button", |controls| {
+            button(controls, "send_button").is_some()
         })
         .await?;
     let drafted_nodes = nodes(&drafted);
@@ -640,21 +771,102 @@ async fn wait_for_answer(
     prompt: &str,
     prior_matches: usize,
 ) -> CoreResult<String> {
-    let deadline = Instant::now() + Duration::from_secs(240);
-    while Instant::now() < deadline {
-        if let Ok(snapshot) = desktop.snapshot().await {
-            let controls = nodes(&snapshot);
-            if prompt_count(&controls, prompt) > prior_matches
-                && let Some(response) = answer(&controls, prompt)
-            {
-                return Ok(response);
+    let mut stable = StableAnswer::default();
+    let mut retries = 0;
+    loop {
+        let snapshot = desktop.snapshot_query(None).await?;
+        let controls = nodes(&snapshot);
+        if prompt_count(&controls, prompt) > prior_matches {
+            let question = controls
+                .iter()
+                .rposition(|node| {
+                    node["role"] == "AXHeading" && matches_prompt(&node["description"], prompt)
+                })
+                .unwrap();
+            let reply = &controls[question + 1..];
+            if let Some(retry) = retry_card(reply) {
+                stable = StableAnswer::default();
+                if retries == 5 {
+                    return Err(failure("Gemini で回答の生成に5回再試行しても失敗しました"));
+                }
+                let retry =
+                    retry.ok_or_else(|| failure("Gemini のエラーに再試行ボタンがありません"))?;
+                desktop.press(index(retry)?).await?;
+                retries += 1;
+                sleep(Duration::from_secs(2)).await;
+                continue;
             }
+            let response = answer(&controls, prompt);
+            let stop = desktop.snapshot_query(Some("stop_button")).await?;
+            if let Some(done) = stable.observe(
+                response,
+                button(&nodes(&stop), "stop_button").is_some(),
+                Instant::now(),
+            ) {
+                return Ok(done);
+            }
+        } else {
+            stable = StableAnswer::default();
         }
         sleep(Duration::from_secs(1)).await;
     }
-    Err(failure(
-        "送信後に回答を取得できませんでした。再送前に Gemini のチャットを確認してください",
-    ))
+}
+
+// Only inspect the current question's response. Earlier error cards can remain
+// in the conversation after a later turn succeeds.
+fn retry_card<'a>(reply: &[&'a Value]) -> Option<Option<&'a Value>> {
+    let retry = reply.iter().rev().copied().find(|n| {
+        n["role"] == "AXButton" && matches!(n["description"].as_str(), Some("再試行" | "Retry"))
+    });
+    let error = reply.iter().any(|node| {
+        node["role"] == "AXStaticText"
+            && [node["value"].as_str(), node["description"].as_str()]
+                .into_iter()
+                .flatten()
+                .any(|text| {
+                    let text = text.trim().to_lowercase();
+                    [
+                        "エラーが発生しました",
+                        "コンテンツを生成できませんでした",
+                        "something went wrong",
+                        "an error occurred",
+                        "error",
+                    ]
+                    .iter()
+                    .filter_map(|label| text.strip_prefix(label))
+                    .any(|suffix| {
+                        let code = suffix.trim_matches(|c: char| {
+                            c.is_whitespace() || "（()）。.:：".contains(c)
+                        });
+                        code == "1213" || code.is_empty() || retry.is_some()
+                    })
+                })
+    });
+    error.then_some(retry)
+}
+
+#[derive(Default)]
+struct StableAnswer(Option<(String, Instant)>);
+
+impl StableAnswer {
+    fn observe(
+        &mut self,
+        response: Option<String>,
+        generating: bool,
+        now: Instant,
+    ) -> Option<String> {
+        let Some(text) = response.filter(|_| !generating) else {
+            self.0 = None;
+            return None;
+        };
+        if let Some((previous, since)) = &self.0
+            && previous == &text
+        {
+            return (now.duration_since(*since) >= Duration::from_secs(20)).then_some(text);
+        }
+        self.0 = Some((text, now));
+        None
+    }
 }
 
 #[cfg(test)]
@@ -668,6 +880,13 @@ mod tests {
         assert_eq!(opts.effort, Some("high"));
         assert!(!opts.new);
         assert_eq!(opts.prompt, "hello world");
+
+        let divider = Options::parse("--model neon ---\nreview").unwrap();
+        assert_eq!(divider.prompt, "---\nreview");
+        assert_eq!(
+            Options::parse("--literal text").unwrap().prompt,
+            "--literal text"
+        );
 
         let opts_new = Options::parse("--new --model auto hi").unwrap();
         assert!(opts_new.new);
@@ -705,6 +924,44 @@ mod tests {
         assert!(effort_option(&refs, "low").is_some());
         assert!(effort_option(&refs, "standard").is_some());
         assert!(effort_option(&refs, "high").is_some());
+    }
+
+    #[test]
+    fn retry_card_distinguishes_an_error_label_from_an_answer_about_errors() {
+        let discussion =
+            json!({"role":"AXStaticText","value":"The error 1213 comes from the app."});
+        let card = json!({"role":"AXStaticText","value":"エラーが発生しました（1213）"});
+        let button = json!({"role":"AXButton","description":"再試行"});
+        assert!(retry_card(&[&discussion]).is_none());
+        assert_eq!(retry_card(&[&card]), Some(None));
+        assert_eq!(retry_card(&[&card, &button]), Some(Some(&button)));
+    }
+
+    #[test]
+    fn changing_text_or_a_stop_button_resets_the_stability_window() {
+        let mut stable = StableAnswer::default();
+        let start = Instant::now();
+        for (second, text, generating) in [
+            (0, "a", false),
+            (19, "a", false),
+            (20, "ab", false),
+            (38, "ab", true),
+            (40, "ab", false),
+            (59, "ab", false),
+        ] {
+            assert_eq!(
+                stable.observe(
+                    Some(text.into()),
+                    generating,
+                    start + Duration::from_secs(second)
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            stable.observe(Some("ab".into()), false, start + Duration::from_secs(60)),
+            Some("ab".into())
+        );
     }
 
     #[test]

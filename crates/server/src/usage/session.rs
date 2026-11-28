@@ -97,7 +97,10 @@ pub(crate) fn provider_session_resumable(
         ProviderId::Codex => find_codex_session_file(home, session_id).is_some_and(|path| {
             has_session_line(&path, |line| line.kind.as_deref() == Some("session_meta"))
         }),
-        ProviderId::Antigravity | ProviderId::OpenCode | ProviderId::Mock => true,
+        ProviderId::Antigravity
+        | ProviderId::OpenCode
+        | ProviderId::GeminiApp
+        | ProviderId::Mock => true,
     }
 }
 

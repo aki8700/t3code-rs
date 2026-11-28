@@ -40,30 +40,35 @@ impl ProviderRegistry {
             order: Vec::new(),
         };
         for &id in &cfg.enabled_providers {
-            registry.drivers.entry(id).or_insert_with(|| {
-                registry.order.push(id);
-                match id {
-                    ProviderId::Claude => {
-                        Arc::new(ClaudeDriver::new(cfg.providers.claude_bin.clone()))
-                    }
-                    ProviderId::Codex => {
-                        Arc::new(CodexDriver::new(cfg.providers.codex_bin.clone()))
-                    }
-                    ProviderId::Antigravity => Arc::new(
-                        AntigravityDriver::with_data_dir(
-                            cfg.providers.antigravity_bin.clone(),
-                            cfg.antigravity_dir(),
-                        )
-                        .with_mcp(cfg.antigravity_mcp_enabled),
-                    ),
-                    ProviderId::OpenCode => {
-                        Arc::new(OpenCodeDriver::new(cfg.providers.opencode_bin.clone()))
-                    }
-                    ProviderId::Mock => Arc::new(MockDriver::new()),
+            if registry.drivers.contains_key(&id) {
+                continue;
+            }
+            let driver: Arc<dyn ProviderDriver> = match id {
+                ProviderId::GeminiApp => continue, // The desktop bridge is supplied by the server.
+                ProviderId::Claude => Arc::new(ClaudeDriver::new(cfg.providers.claude_bin.clone())),
+                ProviderId::Codex => Arc::new(CodexDriver::new(cfg.providers.codex_bin.clone())),
+                ProviderId::Antigravity => Arc::new(
+                    AntigravityDriver::with_data_dir(
+                        cfg.providers.antigravity_bin.clone(),
+                        cfg.antigravity_dir(),
+                    )
+                    .with_mcp(cfg.antigravity_mcp_enabled),
+                ),
+                ProviderId::OpenCode => {
+                    Arc::new(OpenCodeDriver::new(cfg.providers.opencode_bin.clone()))
                 }
-            });
+                ProviderId::Mock => Arc::new(MockDriver::new()),
+            };
+            registry.register(driver);
         }
         registry
+    }
+
+    pub fn register(&mut self, driver: Arc<dyn ProviderDriver>) {
+        let id = driver.provider_id();
+        if self.drivers.insert(id, driver).is_none() {
+            self.order.push(id);
+        }
     }
 
     pub fn get(&self, id: ProviderId) -> Option<Arc<dyn ProviderDriver>> {

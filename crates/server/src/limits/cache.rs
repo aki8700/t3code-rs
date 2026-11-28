@@ -267,7 +267,7 @@ async fn probe_all(
                 reset_credits: None,
                 windows: Vec::new(),
             },
-            ProviderId::Mock => continue,
+            ProviderId::GeminiApp | ProviderId::Mock => continue,
         };
         if item.windows.is_empty()
             && let Some(rt) = active_rt.get(&provider)

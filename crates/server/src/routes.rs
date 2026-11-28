@@ -76,6 +76,7 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/api/threads/{id}/delegate", post(delegate))
         .route("/api/threads/{id}/swarm", get(swarm_board))
+        .route("/api/threads/{id}/swarm/workers", post(swarm_add_worker))
         .route("/api/threads/{id}/swarm/messages", post(swarm_message))
         .route(
             "/api/threads/{id}/swarm/workers/{name}/kill",
@@ -688,6 +689,19 @@ async fn swarm_message(
             .post_message(id, Some("user"), input.text)
             .await?,
     ))
+}
+
+async fn swarm_add_worker(
+    State(state): State<ServerState>,
+    Path(id): Path<Uuid>,
+    Json(spec): Json<SwarmWorkerSpec>,
+) -> ApiResult<Json<SwarmMember>> {
+    let thread = state.store.get_thread(id).await?;
+    if thread.archived {
+        return Err(CoreError::InvalidArgument("thread is archived".into()).into());
+    }
+    state.coordinator.ensure_board(&thread).await?;
+    Ok(Json(state.coordinator.add_worker(id, spec).await?))
 }
 
 async fn swarm_kill(

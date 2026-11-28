@@ -311,15 +311,7 @@ async fn persist_thread_shell_result(
     completed_at: DateTime<Utc>,
     result: &mut ShellExecOutput,
 ) -> CoreResult<()> {
-    persist_thread_command_result(
-        state,
-        thread,
-        started_at,
-        completed_at,
-        result,
-        "user_shell",
-    )
-    .await
+    persist_thread_command_result(state, thread, started_at, completed_at, result, None).await
 }
 
 pub(crate) async fn persist_thread_command_result(
@@ -328,8 +320,13 @@ pub(crate) async fn persist_thread_command_result(
     started_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
     result: &mut ShellExecOutput,
-    source: &str,
+    selection: Option<&ModelSelection>,
 ) -> CoreResult<()> {
+    let source = if selection.is_some() {
+        "gemini_app"
+    } else {
+        "user_shell"
+    };
     let run_id = Uuid::new_v4();
     let ok = !result.timed_out && !result.cancelled && result.exit_code == Some(0);
     let status = if ok {
@@ -357,14 +354,9 @@ pub(crate) async fn persist_thread_command_result(
             id: run_id,
             thread_id: thread.id,
             ordinal: 0,
-            provider: thread.model_selection.provider,
-            model: if source == "user_shell" {
-                "shell"
-            } else {
-                source
-            }
-            .into(),
-            effort: None,
+            provider: selection.map_or(thread.model_selection.provider, |s| s.provider),
+            model: selection.map_or_else(|| "shell".into(), |s| s.model.clone()),
+            effort: selection.and_then(|s| s.effort.clone()),
             status,
             prompt: if source == "user_shell" {
                 format!("!{}", result.command)

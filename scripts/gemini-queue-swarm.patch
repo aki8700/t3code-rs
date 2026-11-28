@@ -1,0 +1,54 @@
+--- a/gemini-queue
++++ b/gemini-queue
+@@ -213,4 +213,21 @@
+     return text.encode()[:limit].decode("utf-8", "ignore")
+
++def worker_answer(thread_id, run_id=None):
++    # A desktop session may spend time waiting behind other workers.
++    while True:
++        with urllib.request.urlopen(f"{BASE}/api/threads/{thread_id}", timeout=30) as response:
++            detail = json.load(response)
++        runs = detail["runs"]
++        run = (next((r for r in runs if r["id"] == run_id), None) if run_id
++               else min(runs, key=lambda r: r["ordinal"], default=None))
++        if run and run["status"] == "completed":
++            for item in reversed(detail["items"]):
++                if item["run_id"] == run["id"] and item["kind"] == "assistant_message":
++                    return item["payload"]["text"]
++            raise RuntimeError("completed Gemini worker run has no answer")
++        if run and run["status"] not in ("running", "queued"):
++            raise RuntimeError(run.get("error_message") or run["status"])
++        time.sleep(2)
++
+ def converse(title, body, blobs, model, effort, part=PART):
+     global PART
+@@ -228,10 +245,10 @@
+     if len(parts) > MAX_PARTS:
+         raise RuntimeError(f"{len(parts)} parts > {MAX_PARTS}; split the task")
+-    tid = post("/api/threads", {"project_id": PROJECT, "title": f"gemini-queue {title}"})["id"]
++    parent = os.environ.get("T3_SWARM_THREAD_ID") or post(
++        "/api/threads", {"project_id": PROJECT, "title": f"gemini-queue {title}"})["id"]
++    name = "gemini-" + os.urandom(6).hex()
+     n, answer = len(parts), ""
+     for i, chunk in enumerate(parts, 1):
+-        if i > 1:
+-            time.sleep(5)  # the app is still settling after the previous reply (AX error 1007)
+-        text = f"--new --model {model} --effort {effort} {body}\n\n" if i == 1 else "続き。"
++        text = f"{body}\n\n" if i == 1 else "続き。"
+         if n > 1:
+             text += f"資料 {i}/{n}:\n```\n{chunk}```\n"
+@@ -242,5 +259,13 @@
+         if len(text.encode()) > 16384:
+             raise RuntimeError(f"message {i} is {len(text.encode())} bytes")
+-        answer = ask(tid, text)
++        if i == 1:
++            member = post(f"/api/threads/{parent}/swarm/workers", {
++                "name": name, "provider": "gemini-app", "model": model,
++                "effort": effort, "brief": text})
++            tid = member["thread_id"]
++            run_id = None
++        else:
++            run_id = post(f"/api/threads/{tid}/messages", {"prompt": text})["run_id"]
++        answer = worker_answer(tid, run_id)
+         log(f"  {title} part {i}/{n} -> {len(answer)} chars")
+     return answer

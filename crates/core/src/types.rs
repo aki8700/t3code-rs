@@ -12,6 +12,7 @@ pub enum ProviderId {
     Antigravity,
     #[serde(alias = "opencode")]
     OpenCode,
+    GeminiApp,
     Mock,
 }
 
@@ -22,6 +23,7 @@ impl ProviderId {
             Self::Codex => "codex",
             Self::Antigravity => "antigravity",
             Self::OpenCode => "opencode",
+            Self::GeminiApp => "gemini-app",
             Self::Mock => "mock",
         }
     }
@@ -32,6 +34,7 @@ impl ProviderId {
             Self::Codex => "Codex",
             Self::Antigravity => "Antigravity (Gemini)",
             Self::OpenCode => "OpenCode",
+            Self::GeminiApp => "Gemini for Mac",
             Self::Mock => "Mock (Test)",
         }
     }

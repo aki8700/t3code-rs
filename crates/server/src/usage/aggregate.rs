@@ -41,6 +41,7 @@ fn provider_info(provider: ProviderId) -> (&'static str, &'static str, &'static 
         ProviderId::Codex => ("codex", "Codex", "var(--text)"),
         ProviderId::Antigravity => ("antigravity", "Antigravity", "#8c7bd1"),
         ProviderId::OpenCode => ("open-code", "OpenCode", "#5b9bbd"),
+        ProviderId::GeminiApp => ("gemini-app", "Gemini for Mac", "#4285f4"),
         ProviderId::Mock => ("mock", "Mock", "#808080"),
     }
 }

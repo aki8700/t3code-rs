@@ -5431,3 +5431,103 @@ printf '{{"type":"turn.completed","usage":{{"input_tokens":%s,"cached_input_toke
         ]
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn gemini_app_workers_queue_and_report_full_thread_answers() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new();
+    let cua = tmp.0.join("fixture-cua.py");
+    std::fs::write(&cua, include_bytes!("fixtures/gemini_cua.py")).unwrap();
+    std::fs::set_permissions(&cua, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut cfg = ServerConfig {
+        data_dir: tmp.0.join("server"),
+        computer_use_enabled: true,
+        enabled_providers: vec![ProviderId::Mock],
+        ..Default::default()
+    };
+    cfg.providers.cua_bin = Some(cua.clone());
+    let state = ServerState::new(cfg, "http://127.0.0.1:3774".into()).unwrap();
+    let store = state.store.clone();
+    let coordinator = state.coordinator.clone();
+    let mut events = coordinator.subscribe();
+    let app = router(state);
+    let parent = create_parent(&app, &tmp.0).await;
+    let brief = format!("---\n{}", "長".repeat(4400));
+    let mut ids = Vec::new();
+    for name in ["one", "two"] {
+        let member = json_req(&app, Method::POST, &format!("/api/threads/{parent}/swarm/workers"),
+            Some(json!({"name":name,"brief":brief,"provider":"gemini-app","model":"hydrogen","effort":"app","isolation":"worktree"}))).await;
+        ids.push(serde_json::from_value::<Uuid>(member["thread_id"].clone()).unwrap());
+    }
+    let mut completed = std::collections::HashSet::new();
+    tokio::time::timeout(Duration::from_secs(110), async {
+        while completed.len() < ids.len() {
+            if let WsServerMessage::RunStatusChanged {
+                thread_id,
+                status,
+                error,
+                ..
+            } = events.recv().await.unwrap()
+                && ids.contains(&thread_id)
+                && status != RunStatus::Queued
+            {
+                assert_eq!(status, RunStatus::Completed, "{error:?}");
+                completed.insert(thread_id);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let board = store
+        .get_swarm_board_by_thread(parent)
+        .await
+        .unwrap()
+        .unwrap();
+    for (id, name) in ids.iter().copied().zip(["one", "two"]) {
+        let worker = store.get_thread(id).await.unwrap();
+        assert!(worker.worktree_path.is_none());
+        let runs = store.list_runs(id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].provider, ProviderId::GeminiApp);
+        let items = store.list_turn_items(id, 100, 0).await.unwrap();
+        assert!(
+            items
+                .iter()
+                .any(|item| item.payload["text"] == format!("{} @all", "回答".repeat(4000)))
+        );
+        let report = board.messages.iter().find(|m| m.sender == name).unwrap();
+        assert_eq!(report.mentions, ["coordinator"]);
+        assert!(report.text.len() <= 4096 && report.text.starts_with("@coordinator [done] 回答"));
+    }
+    let followup = "@two 次の資料を確認してください";
+    json_req(
+        &app,
+        Method::POST,
+        &format!("/api/threads/{parent}/swarm/messages"),
+        Some(json!({"text":followup})),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(65), async {
+        loop {
+            if let WsServerMessage::RunStatusChanged {
+                thread_id,
+                status,
+                error,
+                ..
+            } = events.recv().await.unwrap()
+                && thread_id == ids[1]
+                && status != RunStatus::Queued
+            {
+                assert_eq!(status, RunStatus::Completed, "{error:?}");
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let ax: Value =
+        serde_json::from_slice(&std::fs::read(cua.with_extension("json")).unwrap()).unwrap();
+    assert_eq!(ax["submitted"], json!([brief, brief, followup]));
+    coordinator.interrupt_all().await;
+}
