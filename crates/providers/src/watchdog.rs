@@ -126,9 +126,15 @@ impl TurnBudgetWatchdog {
         output_tokens: u64,
         cache_read_tokens: u64,
     ) -> BudgetAction {
-        let snapshot_total = input_tokens
-            .saturating_add(output_tokens)
-            .saturating_add(cache_read_tokens);
+        // Budget uncached work only. Codex reports `input_tokens` including the cached
+        // part, Claude reports them separately; cached reads are cheap and a long
+        // agentic turn re-reads its whole context on every call.
+        let uncached_input = if input_tokens >= cache_read_tokens {
+            input_tokens - cache_read_tokens
+        } else {
+            input_tokens
+        };
+        let snapshot_total = uncached_input.saturating_add(output_tokens);
         self.total_tokens = self.total_tokens.max(snapshot_total);
         if self.total_tokens >= self.hard_tokens {
             return BudgetAction::Stop(format!(
@@ -899,17 +905,32 @@ mod tests {
     #[test]
     fn token_budget_tracks_max_and_enforces_soft_and_hard_limits() {
         let mut watchdog = TurnBudgetWatchdog::with_limits(100, 200, 1_000, 2_500);
-        assert_eq!(watchdog.on_usage(500, 200, 100), BudgetAction::None);
+        assert_eq!(watchdog.on_usage(500, 200, 0), BudgetAction::None);
         assert!(matches!(
-            watchdog.on_usage(800, 200, 100),
+            watchdog.on_usage(800, 300, 0),
             BudgetAction::Warn(_)
         ));
-        assert_eq!(watchdog.on_usage(400, 100, 50), BudgetAction::None);
+        assert_eq!(watchdog.on_usage(400, 100, 0), BudgetAction::None);
         assert_eq!(watchdog.total_tokens, 1_100);
         assert!(matches!(
-            watchdog.on_usage(1_500, 500, 600),
+            watchdog.on_usage(2_000, 600, 0),
             BudgetAction::Stop(_)
         ));
+    }
+
+    #[test]
+    fn cached_reads_do_not_count_toward_the_token_budget() {
+        // Codex: input includes the cached part.
+        let mut codex = TurnBudgetWatchdog::with_limits(100, 200, 1_000, 2_500);
+        assert_eq!(
+            codex.on_usage(30_000_000, 100, 29_999_500),
+            BudgetAction::None
+        );
+        assert_eq!(codex.total_tokens, 600);
+        // Claude: cache reads are reported separately from input.
+        let mut claude = TurnBudgetWatchdog::with_limits(100, 200, 1_000, 2_500);
+        assert_eq!(claude.on_usage(300, 200, 9_000_000), BudgetAction::None);
+        assert_eq!(claude.total_tokens, 500);
     }
 
     #[test]
