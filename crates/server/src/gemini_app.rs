@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 const APP: &str = "com.google.GeminiMacOS";
 static SESSION: Mutex<()> = Mutex::const_new(());
+/// The last prompt this process typed, so a draft it left behind can be cleared.
+static LAST_TYPED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[derive(Deserialize)]
 pub(crate) struct Request {
@@ -222,8 +224,10 @@ impl Desktop<'_> {
                 .and_then(|(n, _)| n.parse::<i32>().ok());
             // 1007: the app is busy (AX -25204). 1006: SwiftUI briefly retracts the
             // window from the accessibility tree while it changes views.
-            if (code == Some(1007) || (code == Some(1006) && method == "getAppState"))
-                && matches!(method, "click" | "getAppState")
+            // A click that reports 1007 often took effect anyway; retrying a toggle
+            // flips it back, so only snapshots are retried here.
+            if matches!(code, Some(1006 | 1007))
+                && method == "getAppState"
                 && let Some(delay) = delays.next()
             {
                 sleep(Duration::from_secs(delay)).await;
@@ -415,6 +419,9 @@ impl Desktop<'_> {
         let mut target = index(node)?;
         for _ in 0..2 {
             match self.press(target).await {
+                // AX -25204: the press often lands while the app is busy animating.
+                // Callers confirm the outcome by waiting for the next state.
+                Err(error) if error.to_string().contains("(エラー 1007)") => return Ok(()),
                 Err(error) if error.to_string().contains("(エラー 1005)") => {
                     sleep(Duration::from_millis(500)).await;
                     let fresh = self.snapshot_query(None).await?;
@@ -714,7 +721,20 @@ async fn empty_composer(desktop: &Desktop<'_>) -> CoreResult<u64> {
         ))
     })?;
     if !empty_field(field) {
-        return Err(failure("入力欄に下書きが残っています"));
+        let own = field["value"].as_str().is_some_and(|draft| {
+            LAST_TYPED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref()
+                == Some(draft)
+        });
+        if !own {
+            return Err(failure("入力欄に下書きが残っています"));
+        }
+        // A previous bridge call typed this and failed before sending it.
+        desktop
+            .action("setValue", json!({"elementIndex":index(field)?,"value":""}))
+            .await?;
     }
     if temporary_chat(field) {
         return Err(failure("Gemini の一時チャットを閉じてください"));
@@ -771,6 +791,7 @@ async fn send(
     desktop
         .action("setValue", json!({"elementIndex":field,"value":prompt}))
         .await?;
+    *LAST_TYPED.lock().unwrap_or_else(|e| e.into_inner()) = Some(prompt.to_owned());
     let mut drafted = false;
     for _ in 0..4 {
         let state = desktop.snapshot_query(Some("AXTextArea")).await?;
